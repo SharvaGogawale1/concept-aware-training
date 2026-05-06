@@ -1,0 +1,41 @@
+slurm submission log: 2024-08-18 23:29:20.187491
+created following sbatch script: 
+
+###############################
+
+#!/bin/bash
+
+#SBATCH --account=nlp
+#SBATCH --cpus-per-task=64
+#SBATCH --gres=gpu:2
+#SBATCH --job-name=laya-job-4792457
+#SBATCH --mem=200G
+#SBATCH --nodelist=sphinx4
+#SBATCH --open-mode=append
+#SBATCH --output=laya-job-4792457.out
+#SBATCH --partition=sphinx
+#SBATCH --time=14-0
+
+# activate your desired anaconda environment
+
+
+# cd to working directory
+cd .
+
+# launch commands
+srun --unbuffered run_as_child_processes 'python run_clm.py  --model_name_or_path /juice2/scr2/laya/Meta-Llama-3-8B   --train_file /juice2/u/azguo/curis/final_data/context_syn_data.txt  --validation_file /juice2/u/laya/scripts/vanilla_data/valid_strings.txt  --save_total_limit 1 --gradient_accumulation_steps=4 --torch_dtype bfloat16  --bf16 True --block_size 128  --auto_find_batch_size True     --do_train     --do_eval     --output_dir ./context_syn_model'
+
+###############################
+
+submission to slurm complete!
+
+
+###############################
+slurm submission output
+
+Submitted batch job 8178770
+
+
+
+###############################
+
