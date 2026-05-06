@@ -7,9 +7,9 @@ class CustomTrainer(Trainer):
     def __init__(self, *args, completions_lookup=None, tokenizer=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.completions_lookup = completions_lookup or {}
-        self.tokenizer = tokenizer
+        self.processing_class = tokenizer
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         base_loss, outputs = super().compute_loss(model, inputs, return_outputs=True)
 
         input_ids = inputs["input_ids"]
@@ -23,8 +23,8 @@ class CustomTrainer(Trainer):
                 row = row[attention_mask[i] == 1]
 
             # Get BOS and EOS token indices
-            start_idx = (row == self.tokenizer.bos_token_id).nonzero(as_tuple=True)[0]
-            end_idx = (row == self.tokenizer.eos_token_id).nonzero(as_tuple=True)[0]
+            start_idx = (row == self.processing_class.bos_token_id).nonzero(as_tuple=True)[0]
+            end_idx = (row == self.processing_class.eos_token_id).nonzero(as_tuple=True)[0]
 
             for s_idx in start_idx:
                 possible_ends = end_idx[end_idx > s_idx]
@@ -42,7 +42,7 @@ class CustomTrainer(Trainer):
                 log_probs = []
 
                 for word in completions:
-                    token_ids = self.tokenizer(word, return_tensors="pt", add_special_tokens=False)["input_ids"]
+                    token_ids = self.processing_class(word, return_tensors="pt", add_special_tokens=False)["input_ids"]
                     if token_ids.size(1) > 1:
                         continue  # skip multi-token completions
 
@@ -89,7 +89,7 @@ class CustomTrainer(Trainer):
 # import torch.nn.functional as F
 
 # class CustomTrainer(Trainer):
-#     def compute_loss(self, model, inputs, return_outputs=False):
+#     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
 #         outputs = None
 #         base_loss, outputs = super().compute_loss(model, inputs, return_outputs=True)
 
@@ -121,7 +121,7 @@ class CustomTrainer(Trainer):
 #                 log_probs = []
 
 #                 for word in t_star:
-#                     token_ids = self.tokenizer(word, return_tensors="pt", add_special_tokens=False)["input_ids"]
+#                     token_ids = self.processing_class(word, return_tensors="pt", add_special_tokens=False)["input_ids"]
 #                     if token_ids.size(1) > 1:
 #                         continue  # Skip multi-token completions for now
 
@@ -153,7 +153,7 @@ class CustomTrainer(Trainer):
 
 
 # # class CustomTrainer(Trainer):
-# #    def compute_loss(self, model, inputs, return_outputs=False):
+# #    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
 # #        if return_outputs:
 # #            loss, outputs = super().compute_loss(model, inputs, return_outputs)
 # #        else:
