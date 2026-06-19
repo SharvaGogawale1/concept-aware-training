@@ -51,7 +51,7 @@ def eval_checkpoint(checkpoint_path: str, validation_file: str, block_size: int 
     # Tokenize then concatenate into fixed block_size chunks — matches run_clm.py's
     # group_texts so eval perplexity is computed the same way as during training.
     def tokenize_fn(examples):
-        return tokenizer(examples[col], add_special_tokens=False)
+        return {"input_ids": tokenizer(examples[col], add_special_tokens=False)["input_ids"]}
 
     tokenized_flat = raw.map(
         tokenize_fn, batched=True, remove_columns=raw["validation"].column_names
