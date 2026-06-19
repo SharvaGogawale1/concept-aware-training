@@ -23,7 +23,7 @@ from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    DataCollatorForLanguageModeling,
+    DefaultDataCollator,
     Trainer,
     TrainingArguments,
 )
@@ -48,18 +48,22 @@ def eval_checkpoint(checkpoint_path: str, validation_file: str, block_size: int 
 
     col = "text" if "text" in raw["validation"].column_names else raw["validation"].column_names[0]
 
-    def tokenize_fn(example):
-        ids = tokenizer(
-            str(example[col]),
-            add_special_tokens=False,
-            truncation=True,
-            max_length=block_size,
-        )["input_ids"]
-        if isinstance(ids, int):
-            ids = [ids]
-        return {"input_ids": ids}
+    # Tokenize then concatenate into fixed block_size chunks — matches run_clm.py's
+    # group_texts so eval perplexity is computed the same way as during training.
+    def tokenize_fn(examples):
+        return tokenizer(examples[col], add_special_tokens=False)
 
-    tokenized = raw.map(tokenize_fn, batched=False, remove_columns=raw["validation"].column_names)
+    tokenized_flat = raw.map(
+        tokenize_fn, batched=True, remove_columns=raw["validation"].column_names
+    )
+
+    def group_texts(examples):
+        concatenated = sum(examples["input_ids"], [])
+        total = (len(concatenated) // block_size) * block_size
+        chunks = [concatenated[i: i + block_size] for i in range(0, total, block_size)]
+        return {"input_ids": chunks, "labels": chunks.copy()}
+
+    tokenized = tokenized_flat.map(group_texts, batched=True)
 
     accuracy_metric = evaluate.load("accuracy")
 
@@ -91,7 +95,7 @@ def eval_checkpoint(checkpoint_path: str, validation_file: str, block_size: int 
         args=training_args,
         eval_dataset=tokenized["validation"],
         processing_class=tokenizer,
-        data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
+        data_collator=DefaultDataCollator(),
         compute_metrics=compute_metrics,
         preprocess_logits_for_metrics=preprocess_logits,
     )
