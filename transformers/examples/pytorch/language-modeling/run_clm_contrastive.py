@@ -163,6 +163,7 @@ def main():
     training_args.metric_for_best_model = "eval_loss"
     training_args.greater_is_better = False
     training_args.lr_scheduler_type = SchedulerType.COSINE
+    training_args.overwrite_output_dir = True
 
     send_example_telemetry("run_clm_contrastive", model_args, data_args)
 
