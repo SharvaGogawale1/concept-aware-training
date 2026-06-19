@@ -1,1 +1,30 @@
+# Experiment outputs
 wandb/
+output/
+outputs/
+checkpoints/
+runs/
+
+# Old notebooks with hardcoded tokens — never commit these
+prev_*_old.ipynb
+*_old.ipynb
+
+# Claude Code internal files
+CLAUDE.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+.venv
+venv/
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
