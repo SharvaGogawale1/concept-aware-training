@@ -23,7 +23,7 @@ from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    DataCollatorWithPadding,
+    DataCollatorForLanguageModeling,
     Trainer,
     TrainingArguments,
 )
@@ -36,7 +36,7 @@ def eval_checkpoint(checkpoint_path: str, validation_file: str, block_size: int 
 
     model = AutoModelForCausalLM.from_pretrained(
         checkpoint_path,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
     )
     if len(tokenizer) > model.get_input_embeddings().weight.shape[0]:
@@ -51,15 +51,13 @@ def eval_checkpoint(checkpoint_path: str, validation_file: str, block_size: int 
     def tokenize_fn(example):
         ids = tokenizer(
             str(example[col]),
-            return_tensors="pt",
             add_special_tokens=False,
-            padding="max_length",
             truncation=True,
             max_length=block_size,
-        )["input_ids"].squeeze().tolist()
+        )["input_ids"]
         if isinstance(ids, int):
             ids = [ids]
-        return {"input_ids": ids, "attention_mask": [1] * len(ids), "labels": ids.copy()}
+        return {"input_ids": ids}
 
     tokenized = raw.map(tokenize_fn, batched=False, remove_columns=raw["validation"].column_names)
 
@@ -92,8 +90,8 @@ def eval_checkpoint(checkpoint_path: str, validation_file: str, block_size: int 
         model=model,
         args=training_args,
         eval_dataset=tokenized["validation"],
-        tokenizer=tokenizer,
-        data_collator=DataCollatorWithPadding(tokenizer=tokenizer, return_tensors="pt"),
+        processing_class=tokenizer,
+        data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
         compute_metrics=compute_metrics,
         preprocess_logits_for_metrics=preprocess_logits,
     )
