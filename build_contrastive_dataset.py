@@ -62,22 +62,25 @@ def get_hard_negatives(
     positives: list,
     max_negatives: int = 10,
     pos_filter: bool = True,
+    strategy: str = "all",
 ) -> list:
     """
     Mine hard negatives for a list of positive concept words.
 
-    Strategy (in priority order):
-    1. Co-hyponyms: for each positive synset, find its hypernym, then collect
-       lemmas from OTHER hyponyms of that hypernym (siblings in the hierarchy).
-    2. Wrong-sense distractors: lemmas from synsets of a DIFFERENT sense of the
-       same POS (e.g., "bank" as financial vs. river).
-    3. Same-POS fallback: other words from WordNet with the same coarse POS.
+    Strategy (run in priority order unless a specific strategy is selected):
+    1. Co-hyponyms: siblings in the WordNet hierarchy (same parent, different subtree).
+    2. Wrong-sense distractors: other synsets of the same word (different semantic sense).
+       Chen's recommended safer option — co-hyponyms may still be valid in context.
+    3. Same-POS fallback: random same-POS words from WordNet.
 
     Args:
         positives: list of positive concept words (strings)
         max_negatives: cap on returned negatives
         pos_filter: if True, only return negatives with the same POS as at least
                     one positive (keeps distractors grammatically plausible)
+        strategy: one of "all" | "co_hyponym" | "wrong_sense" | "same_pos"
+                  "all" runs all three strategies in priority order (default).
+                  A named strategy runs ONLY that strategy — used for Task 8 ablations.
     """
     if not _WN_AVAILABLE:
         return []
@@ -85,7 +88,6 @@ def get_hard_negatives(
     positive_set = {p.strip().lower() for p in positives}
     positive_set.update({p.strip() for p in positives})
 
-    # Collect POS tags from positives for filtering
     positive_pos = set()
     positive_synsets = set()
     for word in positives:
@@ -97,31 +99,34 @@ def get_hard_negatives(
     seen = set(positive_set)
 
     # ── Strategy 1: co-hyponyms ──────────────────────────────────────────────
-    for ss in positive_synsets:
-        for hypernym in ss.hypernyms():
-            for sibling in hypernym.hyponyms():
-                if sibling == ss:
-                    continue
-                if pos_filter and sibling.pos() not in positive_pos:
-                    continue
-                for lemma in sibling.lemmas():
-                    word = lemma.name().replace("_", " ")
-                    if word.lower() not in seen and word not in seen:
-                        negatives.append(word)
-                        seen.add(word.lower())
-                        seen.add(word)
-                        if len(negatives) >= max_negatives * 2:
-                            break
+    if strategy in ("all", "co_hyponym"):
+        for ss in positive_synsets:
+            for hypernym in ss.hypernyms():
+                for sibling in hypernym.hyponyms():
+                    if sibling == ss:
+                        continue
+                    if pos_filter and sibling.pos() not in positive_pos:
+                        continue
+                    for lemma in sibling.lemmas():
+                        word = lemma.name().replace("_", " ")
+                        if word.lower() not in seen and word not in seen:
+                            negatives.append(word)
+                            seen.add(word.lower())
+                            seen.add(word)
+                            if len(negatives) >= max_negatives * 2:
+                                break
+                    if len(negatives) >= max_negatives * 2:
+                        break
                 if len(negatives) >= max_negatives * 2:
                     break
-            if len(negatives) >= max_negatives * 2:
-                break
 
     # ── Strategy 2: wrong-sense distractors ─────────────────────────────────
-    if len(negatives) < max_negatives:
+    run_wrong_sense = strategy in ("all", "wrong_sense") and (
+        strategy == "wrong_sense" or len(negatives) < max_negatives
+    )
+    if run_wrong_sense:
         for word in positives:
             all_synsets = _synsets_for_word(word)
-            # Only consider senses NOT in the positive synset group
             non_positive_senses = [s for s in all_synsets if s not in positive_synsets]
             for ss in non_positive_senses:
                 for lemma in ss.lemmas():
@@ -134,7 +139,10 @@ def get_hard_negatives(
                     break
 
     # ── Strategy 3: same-POS fallback (random sample from WordNet) ──────────
-    if len(negatives) < max_negatives // 2 and positive_pos:
+    run_same_pos = strategy in ("all", "same_pos") and (
+        strategy == "same_pos" or len(negatives) < max_negatives // 2
+    )
+    if run_same_pos and positive_pos:
         pos_tag = next(iter(positive_pos))
         all_synsets_pos = list(wn.all_synsets(pos=pos_tag))
         random.shuffle(all_synsets_pos)
@@ -149,14 +157,19 @@ def get_hard_negatives(
             if len(negatives) >= max_negatives:
                 break
 
-    # Shuffle and cap
     random.shuffle(negatives)
     return negatives[:max_negatives]
 
 
 # ── Dataset builder ──────────────────────────────────────────────────────────
 
-def build_contrastive_csv(input_csv: str, output_csv: str, max_negatives: int = 10, seed: int = 42):
+def build_contrastive_csv(
+    input_csv: str,
+    output_csv: str,
+    max_negatives: int = 10,
+    seed: int = 42,
+    strategy: str = "all",
+):
     """
     Build a contrastive CSV from a context_loss CSV.
 
@@ -165,6 +178,8 @@ def build_contrastive_csv(input_csv: str, output_csv: str, max_negatives: int = 
         output_csv: path where the contrastive CSV will be written
         max_negatives: max hard negatives per row
         seed: random seed for reproducibility
+        strategy: negative mining strategy — "all" | "co_hyponym" | "wrong_sense" | "same_pos"
+                  Pass a specific strategy for Task 8 ablation experiments.
     """
     random.seed(seed)
 
@@ -186,10 +201,9 @@ def build_contrastive_csv(input_csv: str, output_csv: str, max_negatives: int = 
         if not isinstance(positives, list) or len(positives) == 0:
             continue
 
-        # Clean up positives (strip whitespace, newline prefixes)
         positives = [str(p).strip().lstrip("\n") for p in positives if str(p).strip()]
 
-        negatives = get_hard_negatives(positives, max_negatives=max_negatives)
+        negatives = get_hard_negatives(positives, max_negatives=max_negatives, strategy=strategy)
 
         if negatives:
             n_with_negatives += 1
@@ -208,6 +222,7 @@ def build_contrastive_csv(input_csv: str, output_csv: str, max_negatives: int = 
 
     total = len(rows)
     coverage = n_with_negatives / total * 100 if total > 0 else 0
+    print(f"  Strategy: {strategy}")
     print(f"  Wrote {total} rows to {output_csv}")
     print(f"  WordNet coverage: {n_with_negatives}/{total} rows have ≥1 hard negative ({coverage:.1f}%)")
     print(f"  WordNet misses (no negatives found): {n_wordnet_miss}")
@@ -244,6 +259,16 @@ def main():
         "--source", choices=["syn", "hyp", "both"], default="both",
         help="Which concept type to use as source (synonym, hypernym, or both merged)"
     )
+    parser.add_argument(
+        "--strategy",
+        choices=["all", "co_hyponym", "wrong_sense", "same_pos"],
+        default="all",
+        help=(
+            "Negative mining strategy. 'all' runs all three in priority order (default). "
+            "Pass a specific strategy for Task 8 ablation experiments: "
+            "'co_hyponym' (siblings), 'wrong_sense' (other senses), 'same_pos' (POS fallback)."
+        ),
+    )
     args = parser.parse_args()
 
     if not _WN_AVAILABLE:
@@ -276,6 +301,7 @@ def main():
             os.path.join(args.output_dir, f"{source_name}_contrastive_train.csv"),
             args.max_negatives,
             args.seed,
+            strategy=args.strategy,
         )
         all_train_rows.append(train_df)
 
@@ -285,6 +311,7 @@ def main():
             os.path.join(args.output_dir, f"{source_name}_contrastive_val.csv"),
             args.max_negatives,
             args.seed,
+            strategy=args.strategy,
         )
         all_val_rows.append(val_df)
 

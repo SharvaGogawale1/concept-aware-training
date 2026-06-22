@@ -1,3 +1,6 @@
+# Paper PDFs (large binary files — reference locally, don't push)
+*.pdf
+
 # Experiment outputs
 wandb/
 output/
