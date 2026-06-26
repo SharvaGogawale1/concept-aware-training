@@ -255,6 +255,7 @@ def run_one_checkpoint(
         report_to="none",
         logging_steps=100,
         save_total_limit=1,
+        save_safetensors=False,
     )
 
     val_dataset = (
