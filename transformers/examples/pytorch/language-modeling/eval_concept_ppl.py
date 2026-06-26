@@ -214,7 +214,21 @@ def _eval_concept_ppl(model, tokenizer, concept_csv: str, block_size: int = 128)
 
 def eval_checkpoint(checkpoint_path: str, concept_csv: str, vanilla_val: str, block_size: int = 128) -> dict:
     print(f"  Loading tokenizer + model: {checkpoint_path}")
-    tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
+    except ValueError as e:
+        if "TokenizersBackend" in str(e):
+            # tokenizer_config.json has invalid tokenizer_class; patch it in memory.
+            import json as _json
+            cfg_path = os.path.join(checkpoint_path, "tokenizer_config.json")
+            with open(cfg_path) as _f:
+                cfg = _json.load(_f)
+            cfg.pop("tokenizer_class", None)
+            with open(cfg_path, "w") as _f:
+                _json.dump(cfg, _f, indent=2)
+            tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
+        else:
+            raise
     if tokenizer.pad_token is None:
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
