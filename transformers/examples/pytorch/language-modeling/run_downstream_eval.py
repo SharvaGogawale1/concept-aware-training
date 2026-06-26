@@ -38,6 +38,17 @@ import argparse
 import json
 import os
 
+# datasets' torch formatter unconditionally imports torchvision.io.VideoReader,
+# which is missing in some Colab torchvision builds. Stub it out before any
+# dataset formatting call triggers the import.
+try:
+    from torchvision.io import VideoReader  # noqa: F401
+except ImportError:
+    import torchvision.io as _tv_io
+    class _StubVideoReader:
+        pass
+    _tv_io.VideoReader = _StubVideoReader
+
 import torch
 import torch.nn as nn
 from datasets import load_dataset
