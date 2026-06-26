@@ -143,7 +143,6 @@ class CausalLMForClassification(nn.Module):
         return SequenceClassifierOutputWithPast(
             loss=loss,
             logits=logits,
-            hidden_states=outputs.hidden_states,
         )
 
 
@@ -243,8 +242,7 @@ def run_one_checkpoint(
         output_dir=run_dir,
         num_train_epochs=num_epochs,
         per_device_train_batch_size=16,
-        per_device_eval_batch_size=8,
-        eval_accumulation_steps=16,
+        per_device_eval_batch_size=32,
         learning_rate=lr,
         warmup_ratio=0.06,
         weight_decay=0.01,
