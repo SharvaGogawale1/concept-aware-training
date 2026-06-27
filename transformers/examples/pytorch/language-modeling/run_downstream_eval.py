@@ -8,7 +8,7 @@ decoder-only models (Llama, Pythia, GPT family).
 
 Supported tasks:
   snli  — Stanford NLI, stanfordnlp/snli (3-class: entailment/neutral/contradiction)
-  spam  — SpamAssassin email spam detection, talby/spamassassin "text" config (binary)
+  spam  — SMS spam detection, ucirvine/sms_spam (binary: ham=0, spam=1)
           Dataset has only a train split; we create an 80/20 train/val split automatically.
 
 Two evaluation modes:
@@ -78,14 +78,14 @@ TASK_CONFIG = {
         "f1_average": "macro",
     },
     "spam": {
-        # SpamAssassin public corpus — talby/spamassassin, "text" config
-        # Fields: label (ClassLabel: ham=0, spam=1), group, text
-        # Only has a "train" split (10.7k rows); we auto-split 80/20.
-        "hf_path": "talby/spamassassin",
-        "hf_config": "text",
+        # UCI SMS Spam Collection — ucirvine/sms_spam
+        # Fields: sms (text), label (ClassLabel: ham=0, spam=1)
+        # Only has a "train" split (5.5k rows); we auto-split 80/20.
+        "hf_path": "ucirvine/sms_spam",
+        "hf_config": None,
         "num_labels": 2,
         "label_col": "label",
-        "text_fn": lambda ex: ex["text"],
+        "text_fn": lambda ex: ex["sms"],
         "filter_fn": None,
         "val_split": "validation",          # created by auto_split
         "auto_split": True,                 # split train → 80% train / 20% val
@@ -151,11 +151,11 @@ class CausalLMForClassification(nn.Module):
 def load_task_data(task: str, tokenizer, max_train_samples: int = None, max_length: int = 128):
     cfg = TASK_CONFIG[task]
 
-    # Load — some datasets require a named config (e.g. "text" for spamassassin)
+    # Load — some datasets require a named config (e.g. SNLI)
     if cfg["hf_config"]:
-        raw = load_dataset(cfg["hf_path"], cfg["hf_config"], trust_remote_code=True)
+        raw = load_dataset(cfg["hf_path"], cfg["hf_config"])
     else:
-        raw = load_dataset(cfg["hf_path"], trust_remote_code=True)
+        raw = load_dataset(cfg["hf_path"])
 
     # SpamAssassin (and any dataset with only a "train" split): auto-split into train/val
     if cfg.get("auto_split") and "validation" not in raw and "test" not in raw:
