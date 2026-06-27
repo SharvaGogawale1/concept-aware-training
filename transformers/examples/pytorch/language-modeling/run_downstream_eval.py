@@ -153,9 +153,9 @@ def load_task_data(task: str, tokenizer, max_train_samples: int = None, max_leng
 
     # Load — some datasets require a named config (e.g. "text" for spamassassin)
     if cfg["hf_config"]:
-        raw = load_dataset(cfg["hf_path"], cfg["hf_config"])
+        raw = load_dataset(cfg["hf_path"], cfg["hf_config"], trust_remote_code=True)
     else:
-        raw = load_dataset(cfg["hf_path"])
+        raw = load_dataset(cfg["hf_path"], trust_remote_code=True)
 
     # SpamAssassin (and any dataset with only a "train" split): auto-split into train/val
     if cfg.get("auto_split") and "validation" not in raw and "test" not in raw:
