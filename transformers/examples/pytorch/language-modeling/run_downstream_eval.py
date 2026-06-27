@@ -253,7 +253,8 @@ def run_one_checkpoint(
         metric_for_best_model=cfg["metric_for_best"],
         greater_is_better=True,
         report_to="none",
-        logging_steps=100,
+        logging_steps=500,
+        disable_tqdm=True,
         save_total_limit=1,
         save_safetensors=False,
     )
