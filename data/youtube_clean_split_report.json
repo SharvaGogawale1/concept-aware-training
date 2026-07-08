@@ -1,0 +1,36 @@
+{
+  "seed": 42,
+  "val_frac": 0.12,
+  "before": {
+    "syn_val ∩ hyp_train": "220 / 222",
+    "syn_val ∩ syn_train": "0 / 222",
+    "hyp_val ∩ syn_train": "6 / 309",
+    "hyp_val ∩ hyp_train": "7 / 309"
+  },
+  "after": {
+    "hyp/context_loss_train": 2359,
+    "hyp/context_loss_val": 317,
+    "hyp/dict_loss_train": 2359,
+    "hyp/dict_loss_val": 317,
+    "syn/context_loss_train": 1795,
+    "syn/context_loss_val": 262,
+    "syn/dict_loss_train": 1795,
+    "syn/dict_loss_val": 262,
+    "hyp/context_syn_train.txt": 7999,
+    "hyp/context_syn_val.txt": 1055,
+    "hyp/vanilla_train.txt": 6280,
+    "hyp/vanilla_val.txt": 833,
+    "syn/context_syn_train.txt": 7807,
+    "syn/context_syn_val.txt": 1197,
+    "syn/vanilla_train.txt": 7859,
+    "syn/vanilla_val.txt": 1145,
+    "leak_audit": {
+      "val_ctx_in_train_ctx": 0,
+      "val_ctx_prefixing_train_txt": 0,
+      "mask_val_ctx_tail_in_train_txt": 0,
+      "txt_line_on_both_sides": 0
+    }
+  },
+  "n_groups": 636,
+  "largest_group_contexts": 204
+}

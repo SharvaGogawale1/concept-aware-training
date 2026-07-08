@@ -4,8 +4,10 @@ Task 3: Build a YouTube-only contrastive dataset with hard negatives.
 
 Reads the existing context_loss CSV files (synonym and hypernym), then for each
 context-prefix / positive-concept-set pair, uses WordNet to mine hard negatives:
-  - Co-hyponyms: siblings of a positive synset (same parent hypernym, different subtree)
-  - Wrong-sense distractors: words sharing POS but from a different semantic field
+  - Co-hyponyms: siblings of the INTENDED synset (same parent hypernym, different subtree)
+  - Wrong-sense distractors: lemmas of the positives' non-intended synsets
+    (July 2026 fix: the intended sense is now disambiguated via synonym
+    intersection — see _intended_synsets — so this tier actually yields negatives)
 
 Output:
     data/contrastive/youtube/contrastive_train.csv
@@ -58,49 +60,92 @@ def _lemma_names_from_synset(synset) -> list:
     return [l.name().replace("_", " ") for l in synset.lemmas()]
 
 
+def _intended_synsets(positives: list) -> tuple:
+    """
+    Disambiguate the intended sense(s) of a positive concept set.
+
+    July 2026 fix: the old code treated EVERY synset of every positive word as
+    "the intended sense", which made the wrong-sense negative set empty by
+    construction (0% mining coverage — the ablation silently degenerated to a
+    no-negatives run).
+
+    Key idea: the positives are (near-)synonyms, so they jointly disambiguate
+    the sense — the synset(s) whose lemmas contain >= 2 distinct positives
+    almost certainly denote the intended concept ({mom, mother, mommy} only
+    intersect in the MOTHER synset). Fallback for singleton/non-intersecting
+    sets: the most-frequent (first) sense of each word.
+
+    Returns (intended_synsets: set, via_intersection: bool).
+    """
+    norm = {p.strip().lower().replace(" ", "_") for p in positives if p.strip()}
+    intended = set()
+    for word in positives:
+        for ss in _synsets_for_word(word):
+            lemmas = {l.name().lower() for l in ss.lemmas()}
+            if len(lemmas & norm) >= 2:
+                intended.add(ss)
+    if intended:
+        return intended, True
+    for word in positives:
+        synsets = _synsets_for_word(word)
+        if synsets:
+            intended.add(synsets[0])  # most-frequent sense
+    return intended, False
+
+
 def get_hard_negatives(
     positives: list,
     max_negatives: int = 10,
     pos_filter: bool = True,
     strategy: str = "all",
+    stats: dict = None,
 ) -> list:
     """
     Mine hard negatives for a list of positive concept words.
 
     Strategy (run in priority order unless a specific strategy is selected):
-    1. Co-hyponyms: siblings in the WordNet hierarchy (same parent, different subtree).
-    2. Wrong-sense distractors: other synsets of the same word (different semantic sense).
+    1. Co-hyponyms: siblings of the INTENDED sense(s) in the WordNet hierarchy.
+    2. Wrong-sense distractors: lemmas of the positives' NON-intended synsets
+       (July 2026 fix — previously empty by construction; see _intended_synsets).
        Chen's recommended safer option — co-hyponyms may still be valid in context.
     3. Same-POS fallback: random same-POS words from WordNet.
 
     Args:
         positives: list of positive concept words (strings)
         max_negatives: cap on returned negatives
-        pos_filter: if True, only return negatives with the same POS as at least
-                    one positive (keeps distractors grammatically plausible)
-        strategy: one of "all" | "co_hyponym" | "wrong_sense" | "same_pos"
-                  "all" runs all three strategies in priority order (default).
-                  A named strategy runs ONLY that strategy — used for Task 8 ablations.
+        pos_filter: if True, only return negatives with the same POS as the
+                    intended sense(s) (keeps distractors grammatically plausible)
+        strategy: "all" | "co_hyponym" | "wrong_sense" | "same_pos" | "none"
+                  "all" runs strategies 1-3 in priority order (default).
+                  A named strategy runs ONLY that strategy — Task 8 ablations.
+                  "none" returns [] — the no-negatives control (loss reduces to
+                  CLM + positive NCP).
+        stats: optional dict; increments "sense_via_intersection" /
+               "sense_via_fallback" counters for the coverage report.
     """
-    if not _WN_AVAILABLE:
+    if not _WN_AVAILABLE or strategy == "none":
         return []
 
     positive_set = {p.strip().lower() for p in positives}
     positive_set.update({p.strip() for p in positives})
 
-    positive_pos = set()
-    positive_synsets = set()
-    for word in positives:
-        for ss in _synsets_for_word(word):
-            positive_pos.add(ss.pos())
-            positive_synsets.add(ss)
+    intended_synsets, via_intersection = _intended_synsets(positives)
+    if stats is not None:
+        key = "sense_via_intersection" if via_intersection else "sense_via_fallback"
+        stats[key] = stats.get(key, 0) + 1
+
+    positive_pos = {ss.pos() for ss in intended_synsets}
+    if not positive_pos:  # word not in WordNet at all
+        for word in positives:
+            for ss in _synsets_for_word(word):
+                positive_pos.add(ss.pos())
 
     negatives = []
     seen = set(positive_set)
 
-    # ── Strategy 1: co-hyponyms ──────────────────────────────────────────────
+    # ── Strategy 1: co-hyponyms (siblings of the intended sense only) ────────
     if strategy in ("all", "co_hyponym"):
-        for ss in positive_synsets:
+        for ss in intended_synsets:
             for hypernym in ss.hypernyms():
                 for sibling in hypernym.hyponyms():
                     if sibling == ss:
@@ -121,14 +166,34 @@ def get_hard_negatives(
                     break
 
     # ── Strategy 2: wrong-sense distractors ─────────────────────────────────
+    # Lemmas of the positives' NON-intended synsets. With the old definition
+    # ("every synset of every positive is intended") this list was always
+    # empty; intended_synsets now comes from synonym-intersection WSD.
     run_wrong_sense = strategy in ("all", "wrong_sense") and (
         strategy == "wrong_sense" or len(negatives) < max_negatives
     )
     if run_wrong_sense:
+        def _hierarchy_related(ss):
+            # A "wrong sense" that is an ancestor or descendant of an intended
+            # synset is NOT a safe negative (e.g. mother.n.01 "female parent"
+            # is the direct hypernym of ma.n.01 {mom, mommy, ...}).
+            hypernym_closure = lambda s: s.hypernyms()
+            for it in intended_synsets:
+                if ss == it:
+                    return True
+                if it in ss.closure(hypernym_closure) or ss in it.closure(hypernym_closure):
+                    return True
+            return False
+
         for word in positives:
             all_synsets = _synsets_for_word(word)
-            non_positive_senses = [s for s in all_synsets if s not in positive_synsets]
-            for ss in non_positive_senses:
+            wrong_senses = [
+                s for s in all_synsets
+                if s not in intended_synsets and not _hierarchy_related(s)
+            ]
+            for ss in wrong_senses:
+                if pos_filter and positive_pos and ss.pos() not in positive_pos:
+                    continue
                 for lemma in ss.lemmas():
                     cand = lemma.name().replace("_", " ")
                     if cand.lower() not in seen and cand not in seen:
@@ -190,6 +255,8 @@ def build_contrastive_csv(
     rows = []
     n_with_negatives = 0
     n_wordnet_miss = 0
+    n_negatives_total = 0
+    sense_stats = {}
 
     for _, row in df.iterrows():
         text = row["text"]
@@ -203,10 +270,13 @@ def build_contrastive_csv(
 
         positives = [str(p).strip().lstrip("\n") for p in positives if str(p).strip()]
 
-        negatives = get_hard_negatives(positives, max_negatives=max_negatives, strategy=strategy)
+        negatives = get_hard_negatives(
+            positives, max_negatives=max_negatives, strategy=strategy, stats=sense_stats
+        )
 
         if negatives:
             n_with_negatives += 1
+            n_negatives_total += len(negatives)
         else:
             n_wordnet_miss += 1
 
@@ -220,12 +290,20 @@ def build_contrastive_csv(
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
     out_df.to_csv(output_csv, index=False)
 
+    # NOTE: "negative-mining coverage" (rows with >=1 mined negative) is a
+    # different statistic from the "eval slot coverage" printed by the concept
+    # eval scripts (rows with a scoreable concept). Report them separately.
     total = len(rows)
     coverage = n_with_negatives / total * 100 if total > 0 else 0
+    avg_neg = n_negatives_total / n_with_negatives if n_with_negatives else 0.0
     print(f"  Strategy: {strategy}")
     print(f"  Wrote {total} rows to {output_csv}")
-    print(f"  WordNet coverage: {n_with_negatives}/{total} rows have ≥1 hard negative ({coverage:.1f}%)")
-    print(f"  WordNet misses (no negatives found): {n_wordnet_miss}")
+    print(f"  Negative-mining coverage: {n_with_negatives}/{total} rows have ≥1 hard negative ({coverage:.1f}%)")
+    print(f"  Avg negatives per covered row: {avg_neg:.1f}")
+    print(f"  Rows with no negatives mined: {n_wordnet_miss}")
+    if strategy != "none" and sense_stats:
+        print(f"  Sense disambiguation: {sense_stats.get('sense_via_intersection', 0)} via synonym "
+              f"intersection, {sense_stats.get('sense_via_fallback', 0)} via first-sense fallback")
     return out_df
 
 
@@ -261,12 +339,14 @@ def main():
     )
     parser.add_argument(
         "--strategy",
-        choices=["all", "co_hyponym", "wrong_sense", "same_pos"],
+        choices=["all", "co_hyponym", "wrong_sense", "same_pos", "none"],
         default="all",
         help=(
             "Negative mining strategy. 'all' runs all three in priority order (default). "
             "Pass a specific strategy for Task 8 ablation experiments: "
-            "'co_hyponym' (siblings), 'wrong_sense' (other senses), 'same_pos' (POS fallback)."
+            "'co_hyponym' (siblings of the intended sense), 'wrong_sense' (non-intended senses), "
+            "'same_pos' (POS fallback), 'none' (no negatives — control run: loss reduces to "
+            "CLM + positive NCP)."
         ),
     )
     args = parser.parse_args()
