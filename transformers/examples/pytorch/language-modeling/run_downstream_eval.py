@@ -37,6 +37,7 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 
 # datasets' torch formatter unconditionally imports torchvision.io.VideoReader,
 # which is missing in some Colab torchvision builds. Stub it out before any
@@ -236,7 +237,8 @@ def run_one_checkpoint(
 
     mode = "probe" if freeze_base else "finetune"
     ckpt_name = os.path.basename(checkpoint_path.rstrip("/"))
-    run_dir = os.path.join(output_dir, f"{ckpt_name}_{task}_{mode}")
+    n_tag = f"_n{max_train_samples}" if max_train_samples else ""
+    run_dir = os.path.join(output_dir, f"{ckpt_name}_{task}_{mode}{n_tag}")
 
     training_args = TrainingArguments(
         output_dir=run_dir,
@@ -257,6 +259,12 @@ def run_one_checkpoint(
         disable_tqdm=True,
         save_total_limit=1,
         save_safetensors=False,
+        # These checkpoints are never reloaded after the run — only the
+        # metrics dict returned below is kept. save_only_model drops
+        # optimizer.pt/scheduler.pt (the ~8GB AdamW state for a 1B model)
+        # which is what was crashing mid-write on the Drive-mounted output
+        # dir; the run_dir itself is cleaned up after training finishes.
+        save_only_model=True,
     )
 
     val_dataset = (
@@ -279,15 +287,24 @@ def run_one_checkpoint(
     trainer.train()
     metrics = trainer.evaluate()
 
-    return {
+    result = {
         "checkpoint": checkpoint_path,
         "task": task,
         "mode": mode,
         "accuracy": round(metrics.get("eval_accuracy", float("nan")), 4),
         "f1": round(metrics.get("eval_f1", float("nan")), 4),
         "eval_loss": round(metrics.get("eval_loss", float("nan")), 4),
-        "run_dir": run_dir,
     }
+
+    # Metrics are captured above; the checkpoint itself is never reloaded.
+    # Delete it immediately so these throwaway fine-tune runs don't
+    # accumulate on Drive across checkpoints/tasks/n-shot settings.
+    del trainer, model, base
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    shutil.rmtree(run_dir, ignore_errors=True)
+
+    return result
 
 
 def main():
