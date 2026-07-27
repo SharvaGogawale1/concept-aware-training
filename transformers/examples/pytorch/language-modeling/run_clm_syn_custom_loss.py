@@ -562,10 +562,16 @@ def main():
                 " before being passed to the model."
             )
 
+        # Mask pad positions: attention 0 (do not attend to pads) and label -100
+        # (do not train to predict pad). input_ids are left unchanged so the
+        # concept-lookup key str([BOS]+padded+[EOS]) still matches in the trainer.
+        pad_id = tokenizer.pad_token_id
+        attn = [0 if t == pad_id else 1 for t in ids]
+        labels = [-100 if t == pad_id else t for t in ids]
         return {
             "input_ids": ids,
-            "attention_mask": [1]*len(ids),
-            "labels": ids.copy()
+            "attention_mask": attn,
+            "labels": labels,
         }
         # return {
         #     "input_ids": output["input_ids"],

@@ -45,14 +45,23 @@ class ContrastiveTrainer(Trainer):
         self.beta = beta     # weight for the InfoNCE contrastive term
         self._token_id_cache: dict = {}
 
-    def _get_single_token_id(self, word: str):
+    def _get_concept_first_token_id(self, word: str):
+        # Score the concept in the convention it actually occurs in mid-sentence:
+        # the leading-space form " word". "cat" and " cat" are different BPE ids;
+        # the trainer previously used the bare id (no leading space), which the
+        # model never emits in running text. Multi-token concepts are supervised
+        # on their first continuation token (documented approximation that keeps
+        # the zero-extra-forward-pass property). Mirrors eval_concept_ppl_v2.
         if word not in self._token_id_cache:
-            enc = self.processing_class(word, return_tensors="pt", add_special_tokens=False)["input_ids"]
-            self._token_id_cache[word] = enc[0][0].item() if enc.size(1) == 1 else None
+            enc = self.processing_class(" " + word.strip(), add_special_tokens=False)["input_ids"]
+            self._token_id_cache[word] = enc[0] if len(enc) > 0 else None
         return self._token_id_cache[word]
 
     def _resolve_concept_ids(self, words: list) -> list:
-        return [tid for w in words if (tid := self._get_single_token_id(w)) is not None]
+        # Dedupe: distinct set members often share a first token (" nap"/" napping");
+        # duplicates would double-count mass under logsumexp.
+        ids = [tid for w in words if (tid := self._get_concept_first_token_id(w)) is not None]
+        return list(dict.fromkeys(ids))
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         # Single forward pass — outputs.logits retains the full gradient graph

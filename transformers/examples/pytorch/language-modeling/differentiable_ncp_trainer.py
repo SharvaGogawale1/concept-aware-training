@@ -27,10 +27,16 @@ class DifferentiableNCPTrainer(Trainer):
         self.alpha = alpha
         self._token_id_cache: dict = {}
 
-    def _get_single_token_id(self, word: str):
+    def _get_concept_first_token_id(self, word: str):
+        # Score the concept in the convention it actually occurs in mid-sentence:
+        # the leading-space form " word". "cat" and " cat" are different BPE ids;
+        # the trainer previously used the bare id (no leading space), which the
+        # model never emits in running text. Multi-token concepts are supervised
+        # on their first continuation token (documented approximation that keeps
+        # the zero-extra-forward-pass property). Mirrors eval_concept_ppl_v2.
         if word not in self._token_id_cache:
-            enc = self.processing_class(word, return_tensors="pt", add_special_tokens=False)["input_ids"]
-            self._token_id_cache[word] = enc[0][0].item() if enc.size(1) == 1 else None
+            enc = self.processing_class(" " + word.strip(), add_special_tokens=False)["input_ids"]
+            self._token_id_cache[word] = enc[0] if len(enc) > 0 else None
         return self._token_id_cache[word]
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
@@ -85,10 +91,12 @@ class DifferentiableNCPTrainer(Trainer):
                 concept_logit = logits[i, concept_pred_pos]  # [V]
                 log_probs = F.log_softmax(concept_logit, dim=-1)
 
-                concept_ids = [
+                # Leading-space first-token ids, deduped (shared first tokens would
+                # double-count mass under logsumexp).
+                concept_ids = list(dict.fromkeys(
                     tid for c in completions
-                    if (tid := self._get_single_token_id(c)) is not None
-                ]
+                    if (tid := self._get_concept_first_token_id(c)) is not None
+                ))
                 if not concept_ids:
                     continue
 
