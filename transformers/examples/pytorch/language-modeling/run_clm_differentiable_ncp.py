@@ -404,7 +404,10 @@ def main():
             preds, labels = eval_preds
             labels = labels[:, 1:].reshape(-1)
             preds = preds[:, :-1].reshape(-1)
-            return metric.compute(predictions=preds, references=labels)
+            # Drop masked (pad) positions: labels == -100 are not real tokens, so counting them
+            # would deflate accuracy by the pad fraction (~88% here). HF loss already ignores them.
+            mask = labels != -100
+            return metric.compute(predictions=preds[mask], references=labels[mask])
 
     # ── Trainer ─────────────────────────────────────────────────────────────
     trainer = DifferentiableNCPTrainer(

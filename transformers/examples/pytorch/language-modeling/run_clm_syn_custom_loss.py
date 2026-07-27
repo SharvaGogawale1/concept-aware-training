@@ -777,7 +777,10 @@ def main():
             # by preprocess_logits_for_metrics but we need to shift the labels
             labels = labels[:, 1:].reshape(-1)
             preds = preds[:, :-1].reshape(-1)
-            return metric.compute(predictions=preds, references=labels)
+            # Drop masked (pad) positions: labels == -100 are not real tokens, so counting them
+            # would deflate accuracy by the pad fraction (~88% here). HF loss already ignores them.
+            mask = labels != -100
+            return metric.compute(predictions=preds[mask], references=labels[mask])
 
     # df["t_star"] = df["t_star"].astype(str)
     # df.to_csv("/juice2/u/laya/t_star.csv", mode="a")
