@@ -49,6 +49,7 @@ Usage:
 
 import argparse
 import ast
+import gc
 import json
 import math
 import os
@@ -124,11 +125,19 @@ def _eval_ntp(model, tokenizer, vanilla_val: str, block_size: int = 128) -> dict
     metrics = trainer.evaluate()
     loss = metrics.get("eval_loss", float("nan"))
     ppl = math.exp(loss) if loss < 300 else float("inf")
-    return {
+    result = {
         "ntp_loss": round(loss, 4),
         "ntp_ppl": round(ppl, 2),
         "ntp_acc": round(metrics.get("eval_accuracy", float("nan")), 4),
     }
+    # The Trainer holds references to the model (via accelerator wrapping) that
+    # form reference cycles; drop it and collect so GPU memory is actually freed
+    # between checkpoints rather than accumulating.
+    del trainer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return result
 
 
 # ── Set-marginal concept eval ────────────────────────────────────────────────
@@ -304,44 +313,54 @@ def eval_checkpoint(checkpoint_path: str, tokenizer, concept_csv: str,
                     vanilla_val: str, block_size: int,
                     n_bootstrap: int, seed: int) -> dict:
     print(f"  Loading model: {checkpoint_path}")
-    model = AutoModelForCausalLM.from_pretrained(
-        checkpoint_path,
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
-    )
-    n_embed = model.get_input_embeddings().weight.shape[0]
-    if len(tokenizer) > n_embed:
-        # NEVER resize at eval time — that injects random rows into a tied softmax.
-        raise ValueError(
-            f"Canonical tokenizer has {len(tokenizer)} tokens but model embedding "
-            f"has {n_embed} rows. Use a tokenizer the model can score."
+    model = None
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            checkpoint_path,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
         )
-    if n_embed > len(tokenizer):
-        print(f"  NOTE: model has {n_embed - len(tokenizer)} extra embedding rows "
-              f"(e.g. a [PAD] added at training time). They stay in the softmax "
-              f"denominator — that is the model as trained.")
+        n_embed = model.get_input_embeddings().weight.shape[0]
+        if len(tokenizer) > n_embed:
+            # NEVER resize at eval time — that injects random rows into a tied softmax.
+            raise ValueError(
+                f"Canonical tokenizer has {len(tokenizer)} tokens but model embedding "
+                f"has {n_embed} rows. Use a tokenizer the model can score."
+            )
+        if n_embed > len(tokenizer):
+            print(f"  NOTE: model has {n_embed - len(tokenizer)} extra embedding rows "
+                  f"(e.g. a [PAD] added at training time). They stay in the softmax "
+                  f"denominator — that is the model as trained.")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = model.to(device)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = model.to(device)
 
-    print("  [1/2] NTP eval on vanilla text ...")
-    ntp_metrics = _eval_ntp(model, tokenizer, vanilla_val, block_size)
+        print("  [1/2] NTP eval on vanilla text ...")
+        ntp_metrics = _eval_ntp(model, tokenizer, vanilla_val, block_size)
 
-    print("  [2/2] Set-marginal concept eval (in-context continuation scoring) ...")
-    concept_metrics = _eval_concept_v2(model, tokenizer, concept_csv, block_size,
-                                       n_bootstrap, seed)
+        print("  [2/2] Set-marginal concept eval (in-context continuation scoring) ...")
+        concept_metrics = _eval_concept_v2(model, tokenizer, concept_csv, block_size,
+                                           n_bootstrap, seed)
 
-    del model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    return {
-        "checkpoint": checkpoint_path,
-        "model_embedding_rows": n_embed,
-        "tokenizer_vocab": len(tokenizer),
-        **ntp_metrics,
-        **concept_metrics,
-    }
+        return {
+            "checkpoint": checkpoint_path,
+            "model_embedding_rows": n_embed,
+            "tokenizer_vocab": len(tokenizer),
+            **ntp_metrics,
+            **concept_metrics,
+        }
+    finally:
+        # Always free GPU memory — including when an eval OOMs — so one failed
+        # checkpoint does not leave a model resident and cascade OOMs onto the rest.
+        if model is not None:
+            try:
+                model.to("cpu")
+            except Exception:
+                pass
+            del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def main():
