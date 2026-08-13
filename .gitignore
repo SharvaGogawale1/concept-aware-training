@@ -20,9 +20,6 @@ prev_*_old.ipynb
 *.md
 !README.md
 
-# Stray dot-less copy of this file
-gitignore.txt
-
 # Python
 __pycache__/
 *.py[cod]
