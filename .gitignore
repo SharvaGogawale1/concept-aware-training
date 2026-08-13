@@ -12,8 +12,16 @@ runs/
 prev_*_old.ipynb
 *_old.ipynb
 
-# Claude Code internal files
-CLAUDE.md
+# Markdown: planning/working docs stay local (CLAUDE.md, AGENTS.md, PlanA.md,
+# future_directions.md, chen_email_draft.md, …). README.md is the one exception —
+# it is the repo's front page for collaborators.
+# NOTE: this rule does not affect files already tracked by git (e.g. the vendored
+# transformers/**/*.md docs); those stay tracked deliberately.
+*.md
+!README.md
+
+# Stray dot-less copy of this file
+gitignore.txt
 
 # Python
 __pycache__/
