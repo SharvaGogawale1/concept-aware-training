@@ -318,14 +318,33 @@ code(r"""SCHEDULE = [
     '--block_size', '128', '--per_device_train_batch_size', '1',
     '--per_device_eval_batch_size', '1', '--gradient_accumulation_steps', '16',
     '--logging_steps', '10', '--save_strategy', 'no', '--save_only_model',
-    '--bf16', '--gradient_checkpointing', '--overwrite_output_dir', '--do_train', '--do_eval',
-    '--report_to', 'none', '--candidate_microbatch_size', '2',
+    '--bf16', '--no-gradient_checkpointing', '--overwrite_output_dir', '--do_train', '--do_eval',
+    '--report_to', 'none', '--candidate_microbatch_size', '8',
     '--forbidden_output_root', DRIVE_ROOT, '--no-deduplicate_text_rows',
 ]
+# Both departures from the June schedule are numerics-preserving, so runs completed under either
+# setting are directly comparable and may be mixed within a seed:
+#   * gradient checkpointing only trades recompute for memory, and at batch 1 x 128 tokens a 1B
+#     model peaks near 11 GiB of the L4's 22 GiB, so it bought nothing and cost ~25%;
+#   * candidate microbatching is a pure forward-splitting loop, pinned by
+#     test_candidate_microbatching_matches_one_full_forward.
+# Raising the microbatch to 8 matters most for P1s, which is ~36% of the notebook and almost
+# entirely candidate scoring.
 
+# Stream the child's output into the cell. `subprocess.run` inherits the kernel's file
+# descriptors, which Colab does not forward into cell output, so the trainer's logging_steps
+# lines were invisible. PYTHONUNBUFFERED is the half that actually matters: without it the pipe
+# still arrives in 8 KB bursts.
 def run_command(parts):
     parts = [str(value) for value in parts]
-    print(' '.join(parts)); subprocess.run(parts, check=True)
+    print(' '.join(parts), flush=True)
+    process = subprocess.Popen(
+        parts, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        bufsize=1, env={**os.environ, 'PYTHONUNBUFFERED': '1'})
+    for line in process.stdout:
+        print(line, end='', flush=True)
+    if process.wait() != 0:
+        raise subprocess.CalledProcessError(process.returncode, parts)
 
 def evaluate(tag, checkpoint, model_key):
     output = RESULTS / f'eval__{tag}.json'
@@ -356,7 +375,10 @@ def train_and_eval(arm, model_key, seed):
                 '--validation_file', val, '--objective', spec['objective'],
                 '--ncp_alpha', spec['alpha'], '--base_loss_weight', spec['base_weight'],
                 '--contrast_beta', '0', '--required_coverage', '.99',
-                '--preprocessing_cache_dir', SCRATCH / f'cache_{model_key}_{arm}',
+                # Same cache directory the preprocessing gate used, so training reuses that
+                # tokenization instead of redoing it. The cache key already includes the row
+                # and tokenizer digests, so distinct arms cannot collide.
+                '--preprocessing_cache_dir', SCRATCH / f'cache_{arm}',
                 '--seed', seed, '--output_dir', output] + SCHEDULE
             if replay: command += ['--replay_file', replay]
             run_command(command)
@@ -375,24 +397,43 @@ def train_and_eval(arm, model_key, seed):
     finally:
         shutil.rmtree(output, ignore_errors=True)
         print('deleted ephemeral model:', output)
-"""),
-code(r"""RUNS = [train_and_eval('B0', PRIMARY_MODEL, 42)]
-for arm in [key for key in ARMS if key != 'B0']:
-    for seed in SEEDS:
-        RUNS.append(train_and_eval(arm, PRIMARY_MODEL, seed))
 
+# Resume: a run whose Drive record exists is loaded, not recomputed.
+#
+# Colab Pro has no background execution, so a multi-hour cell will not survive a closed laptop.
+# Every finished run writes run__{tag}.json to Drive before the next one starts, so the only work
+# a disconnect can destroy is the single run in flight; re-running this cell in a fresh session
+# picks up from there. Delete a run__*.json to force that one run to recompute.
+def load_or_run(arm, model_key, seed):
+    path = RESULTS / f'run__{model_key}_{arm}_s{seed}.json'
+    if path.exists():
+        print('skip (already in Drive):', path.name, flush=True)
+        return json.load(open(path))
+    return train_and_eval(arm, model_key, seed)
+"""),
+code(r"""import time
+
+# Seed-major, so an interrupted session leaves whole seeds finished rather than fragments of
+# every arm. Seed 42 alone is a complete six-arm result you can read; half of each arm is not.
+PLAN = [('B0', PRIMARY_MODEL, 42)]
+PLAN += [(arm, PRIMARY_MODEL, seed) for seed in SEEDS
+         for arm in [key for key in ARMS if key != 'B0']]
 if RUN_CROSS_FAMILY:
     cross_arms = [key for key in ['A0s','A1s','P1s','D2s','A2s','A3s'] if key in ARMS]
     for model_key in CROSS_FAMILY_MODELS:
-        RUNS.append(train_and_eval('B0', model_key, 42))
-        for arm in cross_arms:
-            for seed in CROSS_FAMILY_SEEDS:
-                RUNS.append(train_and_eval(arm, model_key, seed))
+        PLAN.append(('B0', model_key, 42))
+        PLAN += [(arm, model_key, seed) for seed in CROSS_FAMILY_SEEDS for arm in cross_arms]
+
+RUNS, started = [], time.time()
+for index, (arm, model_key, seed) in enumerate(PLAN, start=1):
+    print(f'\n=== [{index}/{len(PLAN)}] {model_key} {arm} seed={seed} '
+          f'| elapsed {(time.time() - started) / 3600:.2f}h ===', flush=True)
+    RUNS.append(load_or_run(arm, model_key, seed))
 
 pd.DataFrame([{key: value for key, value in row.items()
                if key not in {'log_history','preprocessing'}} for row in RUNS]).to_csv(
     RESULTS / 'task13_runs.csv', index=False)
-print('completed runs:', len(RUNS))
+print(f'completed runs: {len(RUNS)}/{len(PLAN)} in {(time.time() - started) / 3600:.2f}h')
 """),
 markdown("## 5. Master metrics and three-seed uncertainty"),
 code(r"""def load_eval(record):
