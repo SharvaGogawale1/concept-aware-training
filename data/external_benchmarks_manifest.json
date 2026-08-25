@@ -1,0 +1,51 @@
+{
+  "swords_commit": "04ca75370d0ce098a7f4db68240fc8e79a4f7b3b",
+  "hyperlex_commit": "ccb416191a46e37f7104a530e7c23f260e066e8c",
+  "bm_semlex_commit": "2677b1ecdb28d9bd427da51a0b957d4dbe770f14",
+  "files": [
+    {
+      "name": "swords_dev",
+      "path": "data/swords/swords-v1.1_dev.json.gz",
+      "url": "https://raw.githubusercontent.com/p-lambda/swords/04ca75370d0ce098a7f4db68240fc8e79a4f7b3b/assets/parsed/swords-v1.1_dev.json.gz",
+      "sha256": "bc3570786455a05f11fcb4fc7f54e117642d5fb5e98f19355028c5c7ee00c954"
+    },
+    {
+      "name": "swords_test",
+      "path": "data/swords/swords-v1.1_test.json.gz",
+      "url": "https://raw.githubusercontent.com/p-lambda/swords/04ca75370d0ce098a7f4db68240fc8e79a4f7b3b/assets/parsed/swords-v1.1_test.json.gz",
+      "sha256": "f94b6b73c52fd4bd549180bc119d44e9f9097ec78240a8b42363add158e58480"
+    },
+    {
+      "name": "bm_semlex_curated_200",
+      "path": "data/bm_semlex/curated_200.tsv",
+      "url": "https://raw.githubusercontent.com/ioana-ivan/bm-semlex/2677b1ecdb28d9bd427da51a0b957d4dbe770f14/output/synonyms/pairs_triples_examples/semcor_wordnet_aa_n_5000_rand_160.csv.curated.200.csv",
+      "sha256": "87cb29fe77b27e9ed5f64c08691209ff464399962013ed673fc35d3b107ea5ab"
+    },
+    {
+      "name": "bm_semlex_wordnet_nouns",
+      "path": "data/bm_semlex/wordnet_nouns_10000.txt",
+      "url": "https://raw.githubusercontent.com/ioana-ivan/bm-semlex/2677b1ecdb28d9bd427da51a0b957d4dbe770f14/output/synonyms/negative/n_10000.txt",
+      "sha256": "25fbdbc478e41a2d69f6a3d61edee2b5c8f39a80f41ed5bb0a048d3389eacb4f"
+    }
+  ],
+  "archives": [
+    {
+      "name": "hyperlex_data",
+      "target_dir": "data/hyperlex-data",
+      "url": "https://raw.githubusercontent.com/cambridgeltl/hyperlex/ccb416191a46e37f7104a530e7c23f260e066e8c/hyperlex-data.zip",
+      "sha256": "27ef061e2f711d8e8a53b9fe204eaf06c596ef53d95bbed81ae52c6eebe5713b",
+      "required_files": {
+        "hyperlex-all.txt": "582297878d7ab4d08b284291fdd828c686757dc2c8a9db062416c87bda73923c",
+        "splits/lexical/hyperlex_test_all_lexical.txt": "7fdfe8bde217bf0c935da347929e0e07213edb1b5d7695427451305c2e3dbc32",
+        "splits/random/hyperlex_test_all_random.txt": "4c8115d25c6ea732507a70f619bb7fb63a5aab6a0f3bf4990e482dc121a6a0e3"
+      }
+    }
+  ],
+  "metric_references": [
+    {
+      "name": "swords_gap_reference",
+      "url": "https://raw.githubusercontent.com/orenmel/lexsub/4197fccf489670fdc4e5510971f4288b9d0b1625/jcs/evaluation/measures/generalized_average_precision.py",
+      "sha256": "dd30ae8844ccfd9977aa554f50420d2b14d27d932d28c1015417fab907712ae7"
+    }
+  ]
+}
