@@ -318,19 +318,10 @@ code(r"""SCHEDULE = [
     '--block_size', '128', '--per_device_train_batch_size', '1',
     '--per_device_eval_batch_size', '1', '--gradient_accumulation_steps', '16',
     '--logging_steps', '10', '--save_strategy', 'no', '--save_only_model',
-    '--bf16', '--no-gradient_checkpointing', '--overwrite_output_dir', '--do_train', '--do_eval',
-    '--report_to', 'none', '--candidate_microbatch_size', '8',
+    '--bf16', '--gradient_checkpointing', '--overwrite_output_dir', '--do_train', '--do_eval',
+    '--report_to', 'none', '--candidate_microbatch_size', '2',
     '--forbidden_output_root', DRIVE_ROOT, '--no-deduplicate_text_rows',
 ]
-# Both departures from the June schedule are numerics-preserving, so runs completed under either
-# setting are directly comparable and may be mixed within a seed:
-#   * gradient checkpointing only trades recompute for memory, and at batch 1 x 128 tokens a 1B
-#     model peaks near 11 GiB of the L4's 22 GiB, so it bought nothing and cost ~25%;
-#   * candidate microbatching is a pure forward-splitting loop, pinned by
-#     test_candidate_microbatching_matches_one_full_forward.
-# Raising the microbatch to 8 matters most for P1s, which is ~36% of the notebook and almost
-# entirely candidate scoring.
-
 # Stream the child's output into the cell. `subprocess.run` inherits the kernel's file
 # descriptors, which Colab does not forward into cell output, so the trainer's logging_steps
 # lines were invisible. PYTHONUNBUFFERED is the half that actually matters: without it the pipe
@@ -375,10 +366,7 @@ def train_and_eval(arm, model_key, seed):
                 '--validation_file', val, '--objective', spec['objective'],
                 '--ncp_alpha', spec['alpha'], '--base_loss_weight', spec['base_weight'],
                 '--contrast_beta', '0', '--required_coverage', '.99',
-                # Same cache directory the preprocessing gate used, so training reuses that
-                # tokenization instead of redoing it. The cache key already includes the row
-                # and tokenizer digests, so distinct arms cannot collide.
-                '--preprocessing_cache_dir', SCRATCH / f'cache_{arm}',
+                '--preprocessing_cache_dir', SCRATCH / f'cache_{model_key}_{arm}',
                 '--seed', seed, '--output_dir', output] + SCHEDULE
             if replay: command += ['--replay_file', replay]
             run_command(command)
