@@ -7,6 +7,8 @@ import os
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 HERE = os.path.dirname(__file__)
 ROOT = os.path.abspath(os.path.join(HERE, "../../../.."))
 sys.path.insert(0, HERE)
@@ -171,3 +173,45 @@ def test_every_task14_arm_resolves_to_the_same_matched_volume(tmp_path):
     deduped = len(_read_train_rows(str(a0), "context_syn", "train",
                                    deduplicate_text_rows=True))
     assert deduped == len(originals) < budget
+
+
+def test_rejected_mass_share_is_the_suppression_metric_auroc_cannot_provide():
+    """AUROC measures RANKING of rejected below acceptable; this measures actual probability.
+
+    The two come apart exactly where the contrastive claim lives: a model can rank every
+    acceptable substitute above every rejected one (AUROC = 1.0) while still placing most of the
+    candidate set's mass on the rejected ones.  Regression test for the direction convention too,
+    since ``compare_task14_results`` reads a negative delta as an improvement.
+    """
+    import torch
+
+    def share(alt_logps, rejected_logps):
+        """Mirror of the computation in eval_swords.py."""
+        alt_nll = float(-torch.logsumexp(torch.tensor(alt_logps, dtype=torch.float64), dim=0))
+        rej_nll = float(-torch.logsumexp(torch.tensor(rejected_logps, dtype=torch.float64), dim=0))
+        return float(torch.sigmoid(torch.tensor(alt_nll - rej_nll, dtype=torch.float64)))
+
+    # Equal mass on each side -> exactly half.
+    assert share([math.log(0.1)], [math.log(0.1)]) == pytest.approx(0.5)
+
+    # Acceptable strictly preferred -> share below a half; suppressed further -> smaller still.
+    confident = share([math.log(0.30)], [math.log(0.01)])
+    lukewarm = share([math.log(0.30)], [math.log(0.20)])
+    assert confident < lukewarm < 0.5
+    assert confident == pytest.approx(0.01 / 0.31)          # closed form
+    assert lukewarm == pytest.approx(0.20 / 0.50)
+
+    # It sums over the whole rejected set, not just the best one.
+    many = share([math.log(0.30)], [math.log(0.05)] * 4)
+    one = share([math.log(0.30)], [math.log(0.05)])
+    assert many > one, "mass on rejected substitutes must accumulate across them"
+
+    # The case AUROC cannot see: perfect ranking, terrible mass allocation.  Every acceptable
+    # candidate outscores every rejected one, yet rejected substitutes hold most of the mass.
+    acceptable = [math.log(0.02)]
+    rejected = [math.log(0.019)] * 40
+    from eval_swords import auroc
+    scores = acceptable + rejected
+    labels = [True] + [False] * len(rejected)
+    assert auroc(scores, labels) == pytest.approx(1.0)      # ranking is perfect
+    assert share(acceptable, rejected) > 0.9                # mass allocation is not

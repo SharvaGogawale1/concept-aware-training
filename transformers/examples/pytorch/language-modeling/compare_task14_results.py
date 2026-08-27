@@ -110,7 +110,11 @@ def compare_swords(base: Dict[str, Any], treatment: Dict[str, Any], args: argpar
     pairs = paired_rows(base[args.mode]["per_target"], treatment[args.mode]["per_target"], "target_id")
     fields = ["gap", "gap_rat", "spearman", "auroc", "p_at_1", "oracle_f1_at_k",
               "gold_nll", "alternatives_nll", "inclusive_nll",
-              "acceptable_single_logp_mean", "acceptable_multi_logp_mean"]
+              "acceptable_single_logp_mean", "acceptable_multi_logp_mean",
+              # rejected_mass_share: lower is better, same direction as the NLLs above, so a
+              # negative delta means the challenger put LESS mass on human-rejected substitutes.
+              # rejected_nll is inverted (higher = less mass); read its sign accordingly.
+              "rejected_nll", "rejected_mass_share"]
     return {"n_paired": len(pairs), "metrics": bootstrap_mean_deltas(
         pairs, fields, args.n_bootstrap, args.seed
     )}

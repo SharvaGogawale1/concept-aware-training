@@ -352,6 +352,30 @@ def evaluate_checkpoint(model: Any, tokenizer: Any, records: Sequence[Dict[str, 
                         torch.cat([torch.tensor([gold_logp], dtype=torch.float64), alt_tensor]), dim=0
                     ))
 
+            # Human-REJECTED substitutes: below the lenient threshold, i.e. unacceptable even
+            # under the most permissive reading.  This is the set contrastive training claims to
+            # suppress.  `auroc` says whether they RANK below acceptable ones; these say whether
+            # their probability was actually pushed down, which is a different question and the
+            # one an InfoNCE arm is making a claim about.
+            rejected = [h < LENIENT for h in human]
+            rejected_logps = [value for value, drop in zip(exact_logps, rejected) if drop]
+            rejected_sequences = [seq for seq, drop in zip(token_sequences, rejected) if drop]
+            rejected_collision = (
+                has_strict_prefix_collision(rejected_sequences) if rejected_sequences else False
+            )
+            rejected_nll = rejected_mass_share = None
+            if rejected_logps and not rejected_collision:
+                rejected_tensor = torch.tensor(rejected_logps, dtype=torch.float64)
+                rejected_nll = float(-torch.logsumexp(rejected_tensor, dim=0))
+                if alt_nll is not None:
+                    # p_rejected / (p_rejected + p_acceptable), computed as a sigmoid of the NLL
+                    # difference so no probability is ever materialized.  Scale-free, and LOWER is
+                    # better -- the same direction as every NLL here, so a paired delta reads the
+                    # same way.  Raw `rejected_nll` is the opposite: higher means less mass.
+                    rejected_mass_share = float(
+                        torch.sigmoid(torch.tensor(alt_nll - rejected_nll, dtype=torch.float64))
+                    )
+
             acceptable_single = [value for value, positive, length in zip(exact_logps, acceptable, lengths)
                                  if positive and length == 1]
             acceptable_multi = [value for value, positive, length in zip(exact_logps, acceptable, lengths)
@@ -382,6 +406,9 @@ def evaluate_checkpoint(model: Any, tokenizer: Any, records: Sequence[Dict[str, 
                     "alternatives_nll": alt_nll,
                     "inclusive_nll": inclusive_nll,
                     "mass_prefix_collision": mass_prefix_collision,
+                    "n_rejected": sum(rejected),
+                    "rejected_nll": rejected_nll,
+                    "rejected_mass_share": rejected_mass_share,
                     "acceptable_single_logp_mean": (
                         statistics.fmean(acceptable_single) if acceptable_single else None
                     ),
@@ -400,6 +427,7 @@ def evaluate_checkpoint(model: Any, tokenizer: Any, records: Sequence[Dict[str, 
             "oracle_f1_at_k", "oracle_precision_at_k", "oracle_recall_at_k",
             "oracle_accuracy_at_k", "gold_nll", "alternatives_nll", "inclusive_nll",
             "acceptable_single_logp_mean", "acceptable_multi_logp_mean",
+            "rejected_nll", "rejected_mass_share",
         ]
         summary = {
             "targets_scored": len(per_target),
@@ -465,6 +493,7 @@ def main() -> None:
             print(f"  {mode:5s} spearman={summary['spearman']:.4f} "
                   f"GAP={summary['gap']:.4f} GAP-ratio={summary['gap_rat']:.4f} "
                   f"auroc={summary['auroc']:.4f} oracle-F1@k={summary['oracle_f1_at_k']:.4f} "
+                  f"rejected-share={summary['rejected_mass_share']} "
                   f"p@1={summary['p_at_1']:.4f} "
                   f"(n={summary['targets_scored']})")
         results.append(record)
