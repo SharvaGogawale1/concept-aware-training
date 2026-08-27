@@ -690,3 +690,80 @@ def test_logged_total_loss_equals_its_logged_components():
             entry["weighted_clm_loss"] + alpha * entry["concept_loss"] + beta * entry["contrast_loss"]
         )
         assert abs(entry["loss"] - expected) < 1e-3, entry
+
+
+# ---------------------------------------------------------------------------
+# Logged loss components must describe the same window as the logged total.
+# ---------------------------------------------------------------------------
+def test_logged_components_are_window_means_not_last_microbatch(monkeypatch):
+    """HF reports ``loss`` as the mean over the logging window.
+
+    Emitting the most recent microbatch's components next to it mixes two estimators: the parts
+    do not sum to the whole and the component curves look far noisier than they are.  Regression
+    test for that -- it is a reporting defect only, but every loss figure reads from these keys.
+    """
+    import pytest
+    from transformers import Trainer
+
+    captured = []
+    monkeypatch.setattr(Trainer, "log", lambda self, logs, *a, **k: captured.append(dict(logs)))
+
+    class ScaledModel(torch.nn.Module):
+        """Base CLM loss is a settable constant, so the window mean is exactly predictable."""
+        def __init__(self):
+            super().__init__()
+            self.value = torch.nn.Parameter(torch.tensor(1.0))
+            self.template_logits = torch.nn.Parameter(torch.randn(1, 6, 8))
+
+        def forward(self, input_ids, attention_mask=None, labels=None, use_cache=None):
+            logits = self.template_logits[:, : input_ids.size(1)].expand(input_ids.size(0), -1, -1)
+            return SimpleNamespace(loss=self.value if labels is not None else None, logits=logits)
+
+    def inputs():
+        return {
+            "input_ids": torch.tensor([[1, 3, 4]]),
+            "attention_mask": torch.ones(1, 3, dtype=torch.long),
+            "labels": torch.tensor([[1, 3, 4]]),
+            "candidate_input_ids": torch.tensor([[1, 3, 5, 6]]),
+            "candidate_attention_mask": torch.ones(1, 4, dtype=torch.long),
+            "candidate_labels": torch.tensor([[-100, -100, 5, 6]]),
+            "candidate_group_ids": torch.tensor([0]),
+            "concept_eligible_count": torch.tensor(1),
+            "row_ids": ["row"],
+        }
+
+    torch.manual_seed(0)
+    model = ScaledModel().train()
+    trainer = object.__new__(SequenceNCPTrainer)
+    trainer.objective, trainer.alpha, trainer.contrast_beta = "set_marginal", 0.5, 0.0
+    trainer.required_coverage = 0.99
+    trainer._eligible_seen = trainer._supervised_seen = 0
+    trainer._last_components = {}
+
+    # Two microbatches in one logging window, with different CLM losses.
+    with torch.no_grad():
+        model.value.fill_(2.0)
+    trainer.compute_loss(model, inputs())
+    with torch.no_grad():
+        model.value.fill_(6.0)
+    trainer.compute_loss(model, inputs())
+    assert trainer._last_components["clm_loss"] == pytest.approx(6.0)   # last microbatch
+
+    trainer.log({"loss": 4.0, "epoch": 0.5})
+    assert captured[-1]["clm_loss"] == pytest.approx(4.0), "must be the window mean, not 6.0"
+
+    # The window resets after a train log, so the next one cannot double-count.
+    with torch.no_grad():
+        model.value.fill_(10.0)
+    trainer.compute_loss(model, inputs())
+    trainer.log({"loss": 10.0, "epoch": 1.0})
+    assert captured[-1]["clm_loss"] == pytest.approx(10.0)
+
+    # An eval log carries no "loss" key and must neither consume nor reset the train window.
+    with torch.no_grad():
+        model.value.fill_(8.0)
+    trainer.compute_loss(model, inputs())
+    trainer.log({"eval_loss": 99.0})
+    assert captured[-1]["clm_loss"] == pytest.approx(8.0)      # falls back to last components
+    trainer.log({"loss": 8.0, "epoch": 2.0})
+    assert captured[-1]["clm_loss"] == pytest.approx(8.0), "eval log must not have reset the window"

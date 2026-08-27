@@ -487,6 +487,13 @@ class SequenceNCPTrainer(Trainer):
         self._eligible_seen = 0
         self._supervised_seen = 0
         self._last_components: Dict[str, float] = {}
+        # Hugging Face reports ``loss`` as the mean over the logging window, so emitting the most
+        # recent microbatch's components alongside it mixes two estimators: the parts do not sum
+        # to the whole and the component curves are far noisier than the total.  Accumulate the
+        # components over the same window and report their mean.  Logging only -- the optimized
+        # loss is untouched.
+        self._component_sums: Dict[str, float] = {}
+        self._component_steps = 0
 
     def _score_candidate_batch(
         self,
@@ -570,11 +577,26 @@ class SequenceNCPTrainer(Trainer):
             "contrast_loss": float(contrast_loss.detach().cpu()),
             "concept_batch_coverage": supervised_groups / max(eligible_count, 1),
         }
+        if model.training:
+            # getattr rather than direct access: several unit tests build a trainer without
+            # running __init__, matching the base_loss_weight convention a few lines above.
+            sums = getattr(self, "_component_sums", None)
+            if sums is None:
+                sums = self._component_sums = {}
+            for key, value in self._last_components.items():
+                sums[key] = sums.get(key, 0.0) + value
+            self._component_steps = getattr(self, "_component_steps", 0) + 1
         return (total_loss, outputs) if return_outputs else total_loss
 
     def log(self, logs: Dict[str, float], *args: Any, **kwargs: Any) -> None:
         logs = dict(logs)
-        logs.update(self._last_components)
+        # Only train logs carry "loss"; eval logs must not consume or reset the training window.
+        if "loss" in logs and getattr(self, "_component_steps", 0):
+            logs.update({key: value / self._component_steps
+                         for key, value in self._component_sums.items()})
+            self._component_sums, self._component_steps = {}, 0
+        else:
+            logs.update(self._last_components)
         return super().log(logs, *args, **kwargs)
 
     def concept_coverage_stats(self) -> Dict[str, float]:
