@@ -686,6 +686,7 @@ notebook = {
     "nbformat_minor": 5,
 }
 
-output = Path(__file__).resolve().parent / "research_tasks_13_controlled_1b_audit.ipynb"
+output = (Path(__file__).resolve().parent.parent / "notebooks"
+          / "research_tasks_13_controlled_1b_audit.ipynb")
 output.write_text(json.dumps(notebook, indent=1) + "\n", encoding="utf-8")
 print(f"wrote {output} with {len(cells)} cells")

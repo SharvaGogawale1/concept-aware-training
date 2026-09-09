@@ -595,7 +595,8 @@ notebook = {
     "nbformat_minor": 5,
 }
 
-Path("research_tasks_14_external_ntp_vs_ncp.ipynb").write_text(
+(Path(__file__).resolve().parent.parent / "notebooks"
+ / "research_tasks_14_external_ntp_vs_ncp.ipynb").write_text(
     json.dumps(notebook, indent=1) + "\n", encoding="utf-8"
 )
 print(f"wrote research_tasks_14_external_ntp_vs_ncp.ipynb ({len(cells)} cells)")
