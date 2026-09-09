@@ -1,0 +1,380 @@
+\documentclass[11pt]{article}
+\usepackage[review]{acl}
+
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{inconsolata}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{graphicx}
+
+% Arm names. Defined once so a rename never desynchronises text and tables.
+\newcommand{\armB}{\textsc{Base}}
+\newcommand{\armA}{\textsc{Ntp}}
+\newcommand{\armAA}{\textsc{Aug}}
+\newcommand{\armP}{\textsc{Eq}}
+\newcommand{\armPF}{\textsc{Code}}
+\newcommand{\armC}{\textsc{Ctrl}}
+\newcommand{\armMX}{\textsc{Sm-x}}
+\newcommand{\armMI}{\textsc{Sm-i}}
+\newcommand{\armMP}{\textsc{Pw}}
+\newcommand{\armMC}{\textsc{Sm-i+c}}
+\newcommand{\armMPC}{\textsc{Pw+c}}
+
+\title{Concept-aware language model training has not been evaluated:\\
+a gradient defect, a repair, and a first measurement}
+
+\author{Anonymous submission}
+
+\begin{document}
+\maketitle
+
+\section{Methods}
+
+\subsection{Task and objective families}
+
+A causal language model trained with next-token prediction (NTP) maximises the
+probability of the single token that was observed at each position. At a
+\emph{concept slot}, a position where several words are acceptable, NTP treats
+every unobserved acceptable word as an error. Next-concept prediction (NCP)
+replaces the target at those positions with a set $C$ of acceptable words and
+rewards probability assigned to any member of the set.
+
+We evaluate on SWORDS \citep{lee2021swords}, a lexical substitution benchmark in
+which annotators rate candidate substitutes for a target word in context. Ratings
+come from between three and ten annotators per candidate. We keep candidates with
+acceptability at or above $0.5$ as the acceptable set and candidates at or below
+$0.0$ as the rejected set. The labels are human judgements, so no part of the
+evaluation depends on model-generated annotation.
+
+Three loss forms appear in this paper. Write $p(c)$ for the model probability of
+candidate $c$ at a concept slot, $L_{\text{CLM}}$ for the ordinary causal
+language-modelling loss on the same rows, and $C$ for the candidate set.
+
+\paragraph{Per-word.} The mean over candidates of the negative log-probability,
+\begin{equation}
+L_{\text{pw}} = -\frac{1}{|C|}\sum_{c \in C} \log p(c).
+\label{eq:pw}
+\end{equation}
+Every candidate contributes equally, so the gradient pushes mass onto each member
+of the set independently of how the model currently ranks them.
+
+\paragraph{Set marginal.} The negative log of the summed probability,
+\begin{equation}
+L_{\text{sm}} = -\log \sum_{c \in C} p(c).
+\label{eq:sm}
+\end{equation}
+The gradient of Equation~\ref{eq:sm} is a softmax over the candidates, so it
+concentrates on the member the model already prefers. This distinction predicts
+that Equation~\ref{eq:pw} spreads probability more evenly than
+Equation~\ref{eq:sm}, and we test it directly.
+
+\paragraph{Contrastive.} An InfoNCE term over the human-rejected substitutes,
+$\log\sum_{c \in C \cup N} p(c) - \log\sum_{c \in C} p(c)$, where $N$ holds the
+$2{,}919$ substitutes SWORDS annotators marked unacceptable. Earlier rounds of
+this project mined negatives from WordNet; an audit found that miner produced no
+usable wrong-sense negatives, so these human-labelled negatives are the first
+valid test of a contrastive term in this setting.
+
+Every trained arm optimises
+\begin{equation}
+L = w\,L_{\text{CLM}} + \alpha\,L_{\text{concept}} + \beta\,L_{\text{contrast}},
+\label{eq:total}
+\end{equation}
+where $w$ is the retention weight, $\alpha$ scales the concept term and $\beta$
+the contrastive term. Reporting $w$ explicitly matters here, because the source
+paper's equation and its released code disagree about its value.
+
+\subsection{What the source paper specifies, and what its code does}
+
+\citet{iyer2026beyond} give the NCP objective as
+$L(T^*|S) = \frac{1}{|T^*|}\sum_n \log p(t_n \in T^*|S,\Theta)$, maximised. This
+is Equation~\ref{eq:pw} at $\alpha = 1$ with no language-modelling term, that is,
+$w = 0$. We call this arm \armP{}.
+
+Their released trainer computes
+\texttt{loss = base\_loss - (loss\_adjustment / valid\_count)}, where
+\texttt{loss\_adjustment / valid\_count} is the mean over slots of the mean over
+candidates of $\log p(c)$. That expression is $L_{\text{CLM}} + L_{\text{pw}}$,
+which is Equation~\ref{eq:total} at $w = 1$ and $\alpha = 1$. The code therefore
+implements a different objective from the printed equation. We call the code's
+version \armPF{}.
+
+A third difference separates \armPF{} from what the released code actually
+optimises. The candidate log-probabilities are computed inside
+\texttt{torch.no\_grad()}, so \texttt{loss\_adjustment} is a constant with
+respect to $\Theta$ and $\partial L / \partial \Theta = \partial L_{\text{CLM}} /
+\partial \Theta$. The concept term changes the reported loss value and
+contributes no gradient. Runs using that trainer were causal language-model
+fine-tuning on the concept CSV, and the objective in Equation~\ref{eq:pw} has not
+been trained. \armPF{} is its first measurement.
+
+\subsection{Training data views}
+
+Attributing a difference between two arms to their loss requires holding the
+training data fixed, so we build four views of the same SWORDS training split and
+pad each to the same budget of $1{,}607$ rows.
+
+\textbf{Repeated originals} contains the original sentences, repeated to the
+budget, with no candidate sets. \textbf{Augmentation} writes one sentence per
+acceptable alternative, which is the data-side procedure the source paper
+describes. \textbf{Paper} cycles concept rows to the budget with the observed
+word removed from the candidate set. \textbf{Hybrid} mixes concept rows with
+repeated originals as replay.
+
+Two design axes cut across these views. A view is \emph{gold-inclusive} when the
+observed word stays in the candidate set and \emph{gold-exclusive} when it is
+removed; the two give opposite gradient signs on the observed token. A view uses
+\emph{replay} when part of its budget holds plain original sentences, which
+supplies retention pressure toward the observed continuation. Our proposal
+combined gold inclusion with replay; the source paper's view uses neither.
+
+\subsection{Arms}
+
+Table~\ref{tab:arms} lists every arm. \armB{} is the untouched checkpoint and is
+included because it is what a practitioner would deploy without any training, and
+because a trained arm that loses to it has not earned its compute. \armA{} and
+\armAA{} reproduce the source paper's two data-side baselines. \armP{} and
+\armPF{} are the printed equation and the repaired code. \armC{} is the
+$\alpha = 0$ control that isolates the effect of fine-tuning on this data at all.
+\armMX{}, \armMI{}, \armMP{}, \armMC{} and \armMPC{} are ours.
+
+\begin{table}[t]
+\centering\footnotesize\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lccll}
+\toprule
+Arm & $w$ & $\alpha$ & Concept loss & Data view \\
+\midrule
+\armB{}   & n/a & n/a & none          & none \\
+\armA{}   & 1   & 0   & none          & repeated \\
+\armAA{}  & 1   & 0   & none          & augmentation \\
+\armP{}   & 0   & 1   & per-word      & paper, excl. \\
+\armPF{}  & 1   & 1   & per-word      & paper, excl. \\
+\armC{}   & 1   & 0   & none          & hybrid, incl. \\
+\armMX{}  & 1   & 0.5 & set marginal  & hybrid, excl. \\
+\armMI{}  & 1   & 0.5 & set marginal  & hybrid, incl. \\
+\armMP{}  & 1   & $\alpha$ & per-word & hybrid, incl. \\
+\armMC{}  & 1   & 0.5 & set m. $+$ InfoNCE & hybrid, incl. \\
+\armMPC{} & 1   & 1   & per-word $+$ InfoNCE & hybrid, incl. \\
+\bottomrule
+\end{tabular}
+\caption{Training arms. $w$ is the weight on the causal language-modelling term
+and $\alpha$ scales the concept term (Equation~\ref{eq:total}). \armP{} and
+\armPF{} differ only in $w$, so their comparison isolates the term the published
+equation omits and the released code includes.}
+\label{tab:arms}
+\end{table}
+
+\subsection{Metrics}
+
+\textbf{GAP} is the generalised average precision of the model's ranking of
+candidates against the annotator ratings, and is the benchmark's official score.
+\textbf{p@1} is the fraction of targets whose top-ranked candidate is one
+annotators accepted; it is the most directly interpretable number here and moves
+in steps of $1/74$ on our evaluation set. \textbf{AUROC} is the separation of
+acceptable from rejected substitutes, which is the quantity a contrastive term
+claims to improve. \textbf{ALT NLL} is the mean negative log-likelihood of the
+acceptable alternatives, so it measures probability mass rather than rank.
+\textbf{GOLD NLL} is the negative log-likelihood of the word that actually
+appeared, and it is the cost side of the trade: an objective can improve every
+ranking metric by moving mass off the observed word. \textbf{NTP PPL} is ordinary
+perplexity on held-out text and reports whether the model remains a language
+model. AUROC and ALT NLL come apart in a way that matters, since a model can rank
+perfectly while holding most of its mass on rejected candidates.
+
+\subsection{Protocol}
+
+We train Llama-3.2-1B for two epochs at learning rate $1\times10^{-5}$ with a
+cosine schedule and 10\% warmup, on a single T4, with three seeds
+($42$, $7$, $123$). Every arm sees the same $1{,}607$ rows, the same schedule and
+the same seeds, so any difference between two arms comes from the fields
+Table~\ref{tab:arms} varies. We evaluate on $74$ held-out SWORDS targets that
+never appear in training.
+
+Comparisons use a paired bootstrap over targets with $5{,}000$ resamples,
+computed per seed. We fixed the claim rule before reading any result: a claim is
+permitted only when all three seeds agree in sign \emph{and} every seed's
+confidence interval excludes zero. Tables report the mean over seeds with the
+standard deviation across seeds. The gate arms were fixed in advance so that arms
+added later could not move the pass criterion.
+
+\section{Results}
+
+\subsection{Repairing the gradient produces the strongest arm}
+
+Table~\ref{tab:main} gives the main result. \armP{}, the published equation
+implemented literally, ranks substitutes well and damages the model: GOLD NLL
+rises to $6.159$ and perplexity to $9.807$, both worse than the untouched
+checkpoint at $4.446$ and $7.846$. Adding the language-modelling term that the
+released code contains, and repairing the gradient, gives \armPF{}. It holds
+\armP{}'s ranking quality within noise (GAP $0.4553$ against $0.4559$, AUROC
+$0.7131$ against $0.7123$, p@1 $0.4369$ against $0.4324$) and recovers most of
+the loss: GOLD NLL falls to $4.966$ and perplexity to $8.739$.
+
+The collapse under \armP{} follows from the missing retention term. Any
+description of the published equation as damaging to the language model describes
+the equation as printed and not the method the authors ran.
+
+\begin{table*}[t]
+\centering\small\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lcccccc}
+\toprule
+Arm & GAP $\uparrow$ & p@1 $\uparrow$ & AUROC $\uparrow$ & ALT NLL $\downarrow$ & GOLD NLL $\downarrow$ & NTP PPL $\downarrow$ \\
+\midrule
+\armB{} untouched base & 0.4009 & 0.2432 & 0.6711 & 8.049 & 4.446 & 7.846 \\
+\armA{} repeated originals & 0.3961\,{\tiny$\pm$0.0008} & 0.2973\,{\tiny$\pm$0.0000} & 0.6604\,{\tiny$\pm$0.0004} & 9.520\,{\tiny$\pm$0.011} & 4.527\,{\tiny$\pm$0.005} & 9.528\,{\tiny$\pm$0.019} \\
+\armAA{} NCP augmentation & 0.4111\,{\tiny$\pm$0.0011} & 0.3063\,{\tiny$\pm$0.0078} & 0.6792\,{\tiny$\pm$0.0005} & 7.996\,{\tiny$\pm$0.029} & 4.516\,{\tiny$\pm$0.005} & 9.040\,{\tiny$\pm$0.009} \\
+\armP{} published equation & 0.4559\,{\tiny$\pm$0.0008} & 0.4324\,{\tiny$\pm$0.0135} & 0.7123\,{\tiny$\pm$0.0005} & 5.997\,{\tiny$\pm$0.007} & 6.159\,{\tiny$\pm$0.016} & 9.807\,{\tiny$\pm$0.108} \\
+\armPF{} released code, repaired & 0.4553\,{\tiny$\pm$0.0004} & 0.4369\,{\tiny$\pm$0.0078} & 0.7131\,{\tiny$\pm$0.0011} & 6.366\,{\tiny$\pm$0.003} & 4.966\,{\tiny$\pm$0.016} & 8.739\,{\tiny$\pm$0.051} \\
+\armMI{} set marginal & 0.4016\,{\tiny$\pm$0.0006} & 0.3018\,{\tiny$\pm$0.0078} & 0.6712\,{\tiny$\pm$0.0005} & 8.575\,{\tiny$\pm$0.023} & 4.167\,{\tiny$\pm$0.015} & 8.372\,{\tiny$\pm$0.023} \\
+\armMP{} per-word, $\alpha{=}1$ & 0.4121\,{\tiny$\pm$0.0027} & 0.2838\,{\tiny$\pm$0.0135} & 0.6876\,{\tiny$\pm$0.0024} & 7.440\,{\tiny$\pm$0.055} & 4.206\,{\tiny$\pm$0.005} & 8.201\,{\tiny$\pm$0.024} \\
+\armMP{} per-word, $\alpha{=}8$ & 0.4319\,{\tiny$\pm$0.0049} & 0.3423\,{\tiny$\pm$0.0207} & 0.7024\,{\tiny$\pm$0.0026} & 6.568\,{\tiny$\pm$0.084} & 4.530\,{\tiny$\pm$0.040} & 8.283\,{\tiny$\pm$0.033} \\
+\bottomrule
+\end{tabular}
+\caption{SWORDS results on 74 held-out targets, mean over three seeds with
+standard deviation across seeds. \armB{} is deterministic and has one value.
+\armPF{} leads on every ranking metric. Our arms lead on GOLD NLL and perplexity,
+which is the retention side of the trade rather than the benchmark's target.}
+\label{tab:main}
+\end{table*}
+
+\subsection{Every arm of ours loses to the repaired objective}
+
+Table~\ref{tab:vsp1f} compares each of our arms against \armPF{} under the
+pre-registered rule. All six lose on p@1 and on AUROC, with all seeds agreeing
+and confidence intervals excluding zero in eleven of the twelve cells. All six
+win on GOLD NLL by between $0.76$ and $0.80$.
+
+The direction is consistent across our whole design. Our arms preserve the
+observed word better and rank alternatives worse. Both effects follow from the
+same two choices: gold inclusion keeps the observed word in the candidate set,
+and replay spends part of the budget on plain original sentences. Both supply
+retention pressure, so they buy GOLD NLL and cost ranking. On a benchmark scored
+by ranking, that places our design on the wrong side of the trade.
+
+\begin{table}[t]
+\centering\footnotesize\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lccc}
+\toprule
+Arm vs \armPF{} & p@1 & AUROC & GOLD NLL \\
+\midrule
+\armC{} & $-0.1261$ & $-0.0429$ & $-0.7873$ \\
+\armMX{} & $-0.1216^{\dagger}$ & $-0.0344$ & $-0.7965$ \\
+\armMI{} & $-0.1351$ & $-0.0418$ & $-0.7994$ \\
+\armMP{} & $-0.1532$ & $-0.0255$ & $-0.7604$ \\
+\armMC{} & $-0.1306$ & $-0.0414$ & $-0.7993$ \\
+\armMPC{} & $-0.1532$ & $-0.0266$ & $-0.7584$ \\
+\bottomrule
+\end{tabular}
+\caption{Paired bootstrap deltas against \armPF{}, mean over three seeds.
+Negative is worse for p@1 and AUROC and better for GOLD NLL. All entries have all
+three seeds agreeing in sign; $\dagger$ marks the one cell where a confidence
+interval includes zero. Every other entry satisfies the pre-registered claim
+rule. Arm definitions are in Table~\ref{tab:arms}.}
+\label{tab:vsp1f}
+\end{table}
+
+\subsection{Raising the concept weight does not close the gap}
+
+The concept weight $\alpha$ was inherited from the source paper's equation and
+had never been tuned, so a reasonable objection to Table~\ref{tab:vsp1f} is that
+our arms are simply under-weighted. Table~\ref{tab:alpha} sweeps it.
+
+GAP rises with $\alpha$ and saturates. The gain per doubling falls from $+0.0070$
+to $+0.0013$, leaving a ceiling near $0.432$ against \armPF{}'s $0.4553$. GOLD
+NLL rises throughout and passes the untouched checkpoint's $4.446$ at
+$\alpha = 6$, so beyond that point the arm pays more than an untrained model on
+the observed word while still ranking below \armPF{}. Reaching \armPF{}'s GOLD
+NLL of $4.966$ by extrapolation requires roughly $\alpha = 16$, at a projected
+GAP near $0.433$. Our arms do not appear to dominate even at matched retention.
+
+\begin{table}[t]
+\centering\footnotesize\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lccccc}
+\toprule
+$\alpha$ & GAP & $\Delta$GAP & AUROC & ALT NLL & GOLD NLL \\
+\midrule
+1 & 0.4121 &  & 0.6876 & 7.440 & 4.206 \\
+2 & 0.4191 & $+0.0070$ & 0.6932 & 7.048 & 4.279 \\
+4 & 0.4270 & $+0.0079$ & 0.6988 & 6.744 & 4.405 \\
+6 & 0.4306 & $+0.0036$ & 0.7011 & 6.628 & 4.480 \\
+8 & 0.4319 & $+0.0013$ & 0.7024 & 6.568 & 4.530 \\
+\bottomrule
+\end{tabular}
+\caption{Concept weight sweep on \armMP{}. $\Delta$GAP is the change from the
+previous row. Gains saturate while GOLD NLL keeps rising, crossing the untouched
+checkpoint ($4.446$) at $\alpha = 6$.}
+\label{tab:alpha}
+\end{table}
+
+\subsection{Two design choices do not survive}
+
+Table~\ref{tab:ablation} reports the two ablations that carried predictions.
+
+We registered the hypothesis that gold-\emph{inclusive} candidate sets would beat
+gold-exclusive ones, on the reasoning that keeping the observed word prevents the
+model from unlearning it. The opposite holds in all three seeds: \armMX{} beats
+\armMI{} on GAP ($0.4065$ against $0.4016$), AUROC ($0.6787$ against $0.6712$)
+and ALT NLL ($8.015$ against $8.575$), with non-overlapping seed ranges. \armPF{}
+is also gold-exclusive. We report this as a descriptive result, since the paired
+bootstrap for this pair was not computed in the present run.
+
+The contrastive term is null on both base objectives. Adding InfoNCE over
+human-labelled rejected substitutes moves AUROC by $+0.0004$ on the set marginal,
+with the sign disagreeing across seeds, and leaves the per-word arm unchanged
+within noise. These are the hardest negatives available in this setting, so the
+result is not explained by negative quality. Pretrained models already separate
+acceptable from rejected substitutes at AUROC $0.671$ before any training, which
+suggests little remains for a contrastive term to learn at this data scale.
+
+\begin{table}[t]
+\centering\footnotesize\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lccc}
+\toprule
+Arm & GAP $\uparrow$ & AUROC $\uparrow$ & ALT NLL $\downarrow$ \\
+\midrule
+gold-exclusive \armMX{} & 0.4065 & 0.6787 & 8.015 \\
+gold-inclusive \armMI{} & 0.4016 & 0.6712 & 8.575 \\
+\armMI{} $+$ InfoNCE & 0.4020 & 0.6716 & 8.568 \\
+\armMP{} $+$ InfoNCE & 0.4112 & 0.6865 & 7.452 \\
+\armMP{} alone & 0.4121 & 0.6876 & 7.440 \\
+\bottomrule
+\end{tabular}
+\caption{Design ablations, mean over three seeds. Top: gold exclusion beats gold
+inclusion at matched objective and data. Bottom: adding InfoNCE over
+human-rejected substitutes changes neither base objective beyond seed noise.}
+\label{tab:ablation}
+\end{table}
+
+\subsection{What the data view contributes}
+
+\armMP{} beats \armMI{} on GAP ($+0.0105$), AUROC ($+0.0164$) and ALT NLL
+($-1.1344$), all under the claim rule. The per-word form spreads probability
+across the candidate set where the set marginal concentrates it on the member the
+model already prefers, which is what Equations~\ref{eq:pw} and \ref{eq:sm}
+predict. This is the one component of our design that behaves as intended.
+
+The remaining gap between \armMP{} and \armPF{} spans two fields at once, the
+candidate set and the data view, so the present run cannot divide it. We report
+that as an open attribution rather than assigning it to either.
+
+\section*{Limitations}
+
+We train a single 1B model. The source paper used models in the 7B to 8B range,
+and the effect of a concept objective may depend on scale, so our comparison is
+internally matched but externally narrow. The training set holds $1{,}607$ rows
+and the evaluation $74$ targets, which quantises p@1 at $1/74$ and limits the
+resolution of every ranking metric. Selection of $\alpha$ used the development
+set that Tables~\ref{tab:main} and \ref{tab:alpha} report, so the tuned rows are
+optimistic and a held-out test measurement is still owed. The gold-exclusive
+result in Table~\ref{tab:ablation} rests on seed ranges rather than a paired
+bootstrap. Finally, our conclusion about the released implementation applies to
+the code in that repository; we cannot rule out that the published numbers came
+from a version that was not released.
+
+\bibliography{custom}
+
+\end{document}
