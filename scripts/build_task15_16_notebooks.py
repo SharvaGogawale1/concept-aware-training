@@ -69,7 +69,8 @@ RUN_EVAL = False
 # finish in one sitting.  Set False to force a full retrain.
 RESUME_FINISHED_RUNS = True
 
-_BAR = re.compile(r"^\s*\d+%\|")
+_BAR = re.compile(r"\b(\d+)/(\d+)\s*\[")   # tqdm counter, e.g. "  200/1000 ["
+PROGRESS_EVERY = 100                        # print one progress line per this many items
 
 def run(argv, cwd=None, env=None):
     """Run a child process, streaming its output into the cell.
@@ -88,13 +89,15 @@ def run(argv, cwd=None, env=None):
     if env: merged.update(env)
     process = subprocess.Popen(argv, cwd=cwd, env=merged, text=True, bufsize=1,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    tail, bars = [], 0
+    tail = []
     for line in process.stdout:
+        line = line.replace("\r", "")
         tail.append(line)
         del tail[:-40]
-        if _BAR.match(line):          # thin out tqdm redraws
-            bars += 1
-            if bars % 20:
+        hit = _BAR.search(line)       # tqdm writes "c4:  12%| | 120/1000 [..."
+        if hit:
+            done, total = int(hit.group(1)), int(hit.group(2))
+            if done % PROGRESS_EVERY and done != total:
                 continue
         print(line, end="", flush=True)
     code = process.wait()
@@ -349,16 +352,25 @@ if RUN_DATA:
         run([sys.executable, "data/get_content_words.py", "--model", BASE_MODEL,
              "--dataset", "c4", "--max_length", "256"], cwd=EXT)
         cache_dataset_to_drive(LEAF)
+    # An interrupted shard leaves PARTIAL synonyms_/topk_ files behind, so their
+    # mere existence does not mean the shard finished.  Record completion in a
+    # Drive-side manifest instead; embedding_synonyms.py truncates both files when
+    # it restarts a shard, so a re-run is always clean.
+    shards_done = load_runs("task15_shards")
     for start in range(0, 10000, 1000):
         end = start + 1000
+        key = f"{start}_{end}"
         synonym_part = LEAF / f"synonyms_{start}_{end}.jsonl"
         topk_part = LEAF.parent / "prompting" / f"topk_{start}_{end}.jsonl"
-        if synonym_part.is_file() and topk_part.is_file():
+        if (RESUME_FINISHED_RUNS and key in shards_done
+                and synonym_part.is_file() and topk_part.is_file()):
             print("resume: extraction shard already complete", start, end)
             continue
         run([sys.executable, "data/embedding_synonyms.py", "c4",
              "--start", start, "--end", end, "--model", BASE_MODEL], cwd=EXT)
         cache_dataset_to_drive(LEAF)
+        shards_done[key] = synonym_part
+        save_runs(shards_done, "task15_shards")
     run([sys.executable, "data/merge_synonym_parts.py", "--train-size", "8000",
          "--val-size", "1000", "--test-size", "1000", "--expected-count", "2", "--force"], cwd=EXT)
     run([sys.executable, "data/augment_synonyms.py", "--base-dir", DATA,
