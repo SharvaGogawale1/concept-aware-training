@@ -36,7 +36,7 @@ def write(name, cells):
 COMMON_SETUP = r'''
 from pathlib import Path
 from getpass import getpass
-import hashlib, json, os, shutil, subprocess, sys, torch
+import hashlib, json, os, re, shutil, subprocess, sys, torch
 
 BASE_MODEL = "meta-llama/Llama-3.2-1B"
 PRIMARY_SEED = 42
@@ -69,14 +69,39 @@ RUN_EVAL = False
 # finish in one sitting.  Set False to force a full retrain.
 RESUME_FINISHED_RUNS = True
 
+_BAR = re.compile(r"^\s*\d+%\|")
+
 def run(argv, cwd=None, env=None):
-    print("+", " ".join(map(str, argv)))
+    """Run a child process, streaming its output into the cell.
+
+    subprocess.run() writes the child's stdout to the kernel's file descriptor,
+    which Colab does not route into the cell, so a failing command used to raise
+    CalledProcessError with no diagnostic at all.  Stream it line by line and put
+    the tail into the exception message.
+    """
+    argv = list(map(str, argv))
+    print("+", " ".join(argv), flush=True)
     merged = os.environ.copy()
     merged.update({"CONCEPT_DATA_ROOT": str(DATA),
                    "CONCEPT_CHECKPOINT_ROOT": str(RUNS),
                    "CONCEPT_RESULTS_ROOT": str(DRIVE_RESULTS)})
     if env: merged.update(env)
-    subprocess.run(list(map(str, argv)), cwd=cwd, env=merged, check=True)
+    process = subprocess.Popen(argv, cwd=cwd, env=merged, text=True, bufsize=1,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    tail, bars = [], 0
+    for line in process.stdout:
+        tail.append(line)
+        del tail[:-40]
+        if _BAR.match(line):          # thin out tqdm redraws
+            bars += 1
+            if bars % 20:
+                continue
+        print(line, end="", flush=True)
+    code = process.wait()
+    if code:
+        raise RuntimeError(
+            f"command failed with exit code {code}\n  {' '.join(argv)}\n"
+            f"--- last {len(tail)} lines of its output ---\n{''.join(tail)}")
 
 def assert_ephemeral(path):
     resolved = str(Path(path).resolve())
