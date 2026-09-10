@@ -51,7 +51,8 @@ MAIN = Path("/content/concept-aware-training")
 EXT = Path("/content/learning-concepts")
 DATA = Path("/content/concept_data")
 RUNS = Path("/content/concept_runs")
-DRIVE_PROJECT = Path("/content/drive/MyDrive/concept_training")
+DRIVE_ROOT = Path("/content/drive")
+DRIVE_PROJECT = DRIVE_ROOT / "MyDrive/concept_training"
 DRIVE_RESULTS = DRIVE_PROJECT / "task15_16_results"
 os.environ["HF_HOME"] = "/content/hf_cache"
 os.environ["HF_DATASETS_CACHE"] = "/content/hf_cache/datasets"
@@ -190,13 +191,20 @@ def restore_adapter_from_drive(path):
 
 DATA.mkdir(parents=True, exist_ok=True)
 RUNS.mkdir(parents=True, exist_ok=True)
-DRIVE_RESULTS.mkdir(parents=True, exist_ok=True)
+# DRIVE_RESULTS is deliberately NOT created here.  Creating any path under
+# /content/drive before drive.mount() makes the mountpoint non-empty, and the
+# mount then fails with "Mountpoint must not already contain files".  The next
+# cell creates it immediately after mounting.
 '''
 
 
 BOOTSTRAP = r'''
 from google.colab import drive
-drive.mount("/content/drive")
+if DRIVE_ROOT.is_dir() and not (DRIVE_ROOT / "MyDrive").is_dir():
+    # A previous cell (or a failed run) left plain directories at the mountpoint.
+    shutil.rmtree(DRIVE_ROOT)
+drive.mount(str(DRIVE_ROOT))
+DRIVE_RESULTS.mkdir(parents=True, exist_ok=True)
 
 if not MAIN.exists():
     run(["git", "clone", "https://github.com/SharvaGogawale1/concept-aware-training.git", MAIN])
