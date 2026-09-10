@@ -39,7 +39,13 @@ from getpass import getpass
 import hashlib, json, os, shutil, subprocess, sys, torch
 
 BASE_MODEL = "meta-llama/Llama-3.2-1B"
-SEEDS = [42, 123, 2024]
+PRIMARY_SEED = 42
+# One seed first.  Seed 42 alone screens the pipeline and shows the direction of
+# every effect, but it CANNOT support a claim: the pre-registered rule needs all
+# three seeds to agree in sign.  Flip to True for the reportable run; resume makes
+# the seed-42 arms free the second time.
+RUN_MULTISEED = False
+SEEDS = [PRIMARY_SEED] + ([123, 2024] if RUN_MULTISEED else [])
 UPSTREAM_COMMIT = "b1d414143d11c8ed988b4cccbb06626cc8272bbe"
 MAIN = Path("/content/concept-aware-training")
 EXT = Path("/content/learning-concepts")
@@ -100,24 +106,33 @@ def audit_no_drive_weights():
 DATA_CACHE = DRIVE_PROJECT / "task15_16_data"
 
 def cache_dataset_to_drive(leaf):
-    """Concept generation costs hours; /content does not survive a disconnect."""
-    destination = DATA_CACHE / Path(leaf).relative_to(DATA)
-    destination.mkdir(parents=True, exist_ok=True)
-    for path in Path(leaf).glob("*.jsonl"):
-        shutil.copy2(path, destination / path.name)
-    print("cached dataset to", destination)
+    """Cache JSONL data needed by later notebooks, including top-k shards."""
+    model_root = Path(leaf).parent
+    copied = 0
+    for source in (model_root, model_root / "embedding", model_root / "prompting"):
+        destination = DATA_CACHE / source.relative_to(DATA)
+        destination.mkdir(parents=True, exist_ok=True)
+        for path in source.glob("*.jsonl"):
+            shutil.copy2(path, destination / path.name)
+            copied += 1
+    print(f"cached {copied} dataset files under", DATA_CACHE / model_root.relative_to(DATA))
 
 def restore_dataset_from_drive(leaf):
-    source = DATA_CACHE / Path(leaf).relative_to(DATA)
-    if not (source / "synonyms_train.jsonl").is_file():
-        return False
-    Path(leaf).mkdir(parents=True, exist_ok=True)
-    for path in source.glob("*.jsonl"):
-        target = Path(leaf) / path.name
-        if not target.is_file():
-            shutil.copy2(path, target)
-    print("restored dataset from", source)
-    return True
+    model_root = Path(leaf).parent
+    embedding_source = DATA_CACHE / Path(leaf).relative_to(DATA)
+    copied = 0
+    for destination in (model_root, model_root / "embedding", model_root / "prompting"):
+        source = DATA_CACHE / destination.relative_to(DATA)
+        if not source.exists():
+            continue
+        destination.mkdir(parents=True, exist_ok=True)
+        for path in source.glob("*.jsonl"):
+            target = destination / path.name
+            if not target.is_file():
+                shutil.copy2(path, target)
+                copied += 1
+    print(f"restored {copied} dataset files from", DATA_CACHE / model_root.relative_to(DATA))
+    return (embedding_source / "synonyms_train.jsonl").is_file()
 
 RUN_MANIFEST = DRIVE_RESULTS / "run_manifests"
 
@@ -282,19 +297,33 @@ Primary reproduction evidence is nine-task mean STS, content-word NTP, and globa
 
 The audit hard-fails on split overlap, target misalignment, empty sets, or any concept that is not a complete single token. The observed target is part of every set by construction.'''),
         code(r'''
+MODEL_TAG = BASE_MODEL.split("/")[-1].lower()
+LEAF = DATA / "c4" / MODEL_TAG / "embedding"
 if RUN_DATA:
-    run([sys.executable, "data/get_content_words.py", "--model", BASE_MODEL,
-         "--dataset", "c4", "--max_length", "256"], cwd=EXT)
-    run([sys.executable, "data/embedding_synonyms.py", "c4", "--start", "0", "--end", "10000",
-         "--model", BASE_MODEL], cwd=EXT)
+    # The extraction is the longest stage.  Ten independent 1k shards are
+    # cached after completion, so a Colab disconnect loses at most one shard.
+    restore_dataset_from_drive(LEAF)
+    combined = LEAF.parent / "combined.jsonl"
+    if not combined.is_file():
+        run([sys.executable, "data/get_content_words.py", "--model", BASE_MODEL,
+             "--dataset", "c4", "--max_length", "256"], cwd=EXT)
+        cache_dataset_to_drive(LEAF)
+    for start in range(0, 10000, 1000):
+        end = start + 1000
+        synonym_part = LEAF / f"synonyms_{start}_{end}.jsonl"
+        topk_part = LEAF.parent / "prompting" / f"topk_{start}_{end}.jsonl"
+        if synonym_part.is_file() and topk_part.is_file():
+            print("resume: extraction shard already complete", start, end)
+            continue
+        run([sys.executable, "data/embedding_synonyms.py", "c4",
+             "--start", start, "--end", end, "--model", BASE_MODEL], cwd=EXT)
+        cache_dataset_to_drive(LEAF)
     run([sys.executable, "data/merge_synonym_parts.py", "--train-size", "8000",
          "--val-size", "1000", "--test-size", "1000", "--expected-count", "2", "--force"], cwd=EXT)
     run([sys.executable, "data/augment_synonyms.py", "--base-dir", DATA,
          "--num-augmentations", "4", "--seed", "42", "--overwrite"], cwd=EXT)
     run([sys.executable, "data/randomize_synonyms.py", "--split", "train", "--overwrite"], cwd=EXT)
 
-MODEL_TAG = BASE_MODEL.split("/")[-1].lower()
-LEAF = DATA / "c4" / MODEL_TAG / "embedding"
 if RUN_DATA:
     cache_dataset_to_drive(LEAF)
 if RUN_DATA:
@@ -338,7 +367,7 @@ if RUN_SMOKE:
     del merged, adapted, base
     shutil.rmtree(smoke)
 '''),
-        md('''## Exact reproduction schedule
+        md(r'''## Exact reproduction schedule
 
 Seed 42 gets the complete $\lambda\in\{0.25,0.5,0.75,1\}$ curve. The headline NTP, one-epoch augmented NTP, randomized $\lambda=.25$, and concept-marginal $\lambda=1$ settings are then confirmed with seeds 42, 123, and 2024. Released effective batch size is logged. If the headline fails, only seed 42 is rerun with the paper-stated batch before any diagnosis.'''),
         code(TRAIN_HELPER),
@@ -433,7 +462,7 @@ if curves:
     sns.lineplot(frame, x="step", y=value, hue="method")
     plt.tight_layout(); plt.savefig(DRIVE_RESULTS / "task15_reproduction" / "training_loss.png", dpi=180)
 '''),
-        md('''## Reproduction gate
+        md(r'''## Reproduction gate
 
 Proceed only if Zhang concept marginal beats NTP and augmented NTP on mean STS, improves content-word perplexity over NTP, stays near pretrained global perplexity, and the $\lambda$ curve has the reported direction. If seed 42 fails, rerun that one setting with the paper-stated effective batch and report both configurations—do not silently substitute it.'''),
     ]
@@ -467,8 +496,9 @@ if RUN_DATA:
          "--output", NEG_TRAIN,
          "--report", DRIVE_RESULTS / "contrastive_negative_report.json",
          "--max-cosine", "0.35", "--max-negatives", "20"], cwd=EXT)
+    cache_dataset_to_drive(LEAF)
 '''),
-        md('''## Screen only seed 42
+        md(r'''## Screen only seed 42
 
 $\alpha\in\{.5,1,2,4\}$ controls uniform pressure. We set the concept-slot NTP weight to 1, so the observed-token term is never removed. Select the largest concept improvement whose global NLL is at most 0.20 above matched NTP. Then hold $\alpha$ fixed and screen $\beta\in\{.25,.5,1\}$.'''),
         code(r'''
@@ -602,6 +632,7 @@ if RUN_DATA:
         run([sys.executable, "data/build_hierarchy_dataset.py", "--input", source,
              "--output", output, "--report", DRIVE_RESULTS / f"hierarchy_coverage_{split}.json",
              "--seed", "42"], cwd=EXT)
+    cache_dataset_to_drive(LEAF)
 '''),
         md('''## Three-prompt robustness and exact sequence probabilities
 
