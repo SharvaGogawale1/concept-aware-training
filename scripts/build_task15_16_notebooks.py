@@ -246,9 +246,17 @@ else:
     assert reverse.returncode == 0, "External checkout is neither clean nor exactly patched."
 
 run([sys.executable, "-m", "pip", "install", "-q", "-e", str(EXT), "--no-deps"])
-run([sys.executable, "-m", "pip", "install", "-q", "transformers", "accelerate",
+run([sys.executable, "-m", "pip", "install", "-q", "accelerate",
      "peft", "bitsandbytes", "datasets", "spacy", "mteb>=1.12", "wandb",
      "nltk", "scipy", "scikit-learn", "seaborn", "pytest"])
+# Pinned LAST so nothing above can pull it forward.  Upstream pins no versions,
+# but their extraction reuses a prefix KV cache through
+# DynamicCache.from_legacy_cache, which transformers removed in v5; the current
+# Colab image installs v5 and the first shard dies with AttributeError.  The
+# 4.5x line keeps that API and still satisfies our Task-14 evaluators.
+run([sys.executable, "-m", "pip", "install", "-q", "transformers>=4.51,<4.58"])
+import transformers as _tf
+print("transformers", _tf.__version__)
 run([sys.executable, "-m", "spacy", "download", "en_core_web_sm"])
 import nltk
 nltk.download("wordnet", quiet=True)

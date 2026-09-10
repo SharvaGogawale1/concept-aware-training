@@ -521,10 +521,42 @@ index 0000000..b498df5
 +if __name__ == "__main__":
 +    main()
 diff --git a/data/embedding_synonyms.py b/data/embedding_synonyms.py
-index bc223d3..452d64d 100644
+index bc223d3..546ae1e 100644
 --- a/data/embedding_synonyms.py
 +++ b/data/embedding_synonyms.py
-@@ -164,7 +164,7 @@ class EmbeddingSynonymExtractor:
+@@ -65,6 +65,22 @@ NEXT_TOKEN_STARTS = (
+ )
+ 
+ 
++def _prefix_cache(prefix_legacy):
++    """Build a prefix Cache from per-layer (key, value) tuples.
++
++    DynamicCache.from_legacy_cache was removed in transformers v5, so fall back
++    to filling an empty cache layer by layer.  The notebook also pins
++    transformers below 4.58; this keeps the script working if that pin is ever
++    relaxed.
++    """
++    if hasattr(DynamicCache, "from_legacy_cache"):
++        return DynamicCache.from_legacy_cache(prefix_legacy)
++    cache = DynamicCache()
++    for layer_idx, (key, value) in enumerate(prefix_legacy):
++        cache.update(key, value, layer_idx)
++    return cache
++
++
+ class EmbeddingSynonymExtractor:
+     def __init__(self, config: TrainingConfig):
+         self.config = config
+@@ -144,7 +160,7 @@ class EmbeddingSynonymExtractor:
+                 )
+                 for k, v in zip(keys, values)
+             )
+-            cache = DynamicCache.from_legacy_cache(prefix_legacy)
++            cache = _prefix_cache(prefix_legacy)
+             attn_mask = torch.ones(b, idx + 1, device=device, dtype=torch.long)
+             position_ids = torch.full((b, 1), idx, device=device, dtype=torch.long)
+             cache_position = torch.tensor([idx], device=device, dtype=torch.long)
+@@ -164,7 +180,7 @@ class EmbeddingSynonymExtractor:
      def _rank_target(self, input_ids, logits, hidden_last, past_kv, idx, word):
          """Rank candidates for one target by cosine sim to the contextual rep.
  
@@ -533,7 +565,7 @@ index bc223d3..452d64d 100644
            - `pairs`: top POS_CHECK_TOP `(cand_word_clean, score)` sorted desc.
            - `topk_words`: the full filtered candidate pool (≤TOPK_LOGITS, post
              alphanumeric + whole-word + ≠target filter), stripped.
-@@ -177,7 +177,7 @@ class EmbeddingSynonymExtractor:
+@@ -177,7 +193,7 @@ class EmbeddingSynonymExtractor:
                  f"Target '{word}' at idx {idx} does not match decoded token "
                  f"'{decoded_target}'; skipping."
              )
@@ -542,7 +574,7 @@ index bc223d3..452d64d 100644
  
          prev_logits = logits[0, idx - 1, :]
          topk = torch.topk(prev_logits, k=TOPK_LOGITS)
-@@ -203,7 +203,7 @@ class EmbeddingSynonymExtractor:
+@@ -203,7 +219,7 @@ class EmbeddingSynonymExtractor:
              for t in decoded
          ]
          if not any(keep):
@@ -551,7 +583,7 @@ index bc223d3..452d64d 100644
          keep_t = torch.tensor(keep, device=cand_ids.device)
          cand_ids = cand_ids[keep_t]
          decoded = [t for t, k in zip(decoded, keep) if k]
-@@ -220,7 +220,7 @@ class EmbeddingSynonymExtractor:
+@@ -220,7 +236,7 @@ class EmbeddingSynonymExtractor:
              if sims_list[i] >= MIN_COSINE
          ]
          pairs.sort(key=lambda x: -x[1])
@@ -560,7 +592,7 @@ index bc223d3..452d64d 100644
  
      def analyze_sequence(self, row, save_path, topk_save_path):
          input_text = row["input_sequence"]
-@@ -265,16 +265,17 @@ class EmbeddingSynonymExtractor:
+@@ -265,16 +281,17 @@ class EmbeddingSynonymExtractor:
                  targets.append({
                      "word": word, "idx": idx,
                      "word_start": None, "word_end": None,
@@ -580,7 +612,7 @@ index bc223d3..452d64d 100644
              })
  
          # Phase 2: batch every spaCy parse for this sequence into one pipe call.
-@@ -320,6 +321,7 @@ class EmbeddingSynonymExtractor:
+@@ -320,6 +337,7 @@ class EmbeddingSynonymExtractor:
              responses.append({
                  "word": t["word"],
                  "position": t["idx"],
@@ -588,7 +620,7 @@ index bc223d3..452d64d 100644
                  "synonyms": [w for w, _ in survivors],
                  "scores": [round(s, 4) for _, s in survivors],
              })
-@@ -332,8 +334,14 @@ class EmbeddingSynonymExtractor:
+@@ -332,8 +350,14 @@ class EmbeddingSynonymExtractor:
              }) + "\n")
  
          topk_records = [
