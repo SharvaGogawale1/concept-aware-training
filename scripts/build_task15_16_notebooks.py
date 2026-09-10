@@ -75,6 +75,17 @@ RESUME_FINISHED_RUNS = True
 # ten shards.  Quantization also perturbs the top-100 pool and the 0.75 cosine
 # threshold the method depends on.  Use ONE setting for all ten shards.
 EXTRACT_4BIT = False
+# How many C4 sequences to extract concept sets for.  The paper uses 10,000 split
+# 8000/1000/1000, but extraction measured 7.45 s/sequence on an L4 (spaCy 32%,
+# GPU the rest; bf16 moved it only 7%), so the full set is ~21 h for one model.
+# Zhang et al. Fig. 8 ablates exactly this and reports STS unchanged at a quarter
+# of the training data, so 4,000 keeps the 80/10/10 ratio at ~8 h.  Set 10000 for
+# the strict reproduction.  merge_synonym_parts hard-fails unless the split sizes
+# sum to the number of sequences the shards actually cover, and the 3B scaling
+# stage uses the same count so size comparisons are not confounded by data volume.
+EXTRACT_SEQUENCES = 4000
+SPLIT_TRAIN = int(EXTRACT_SEQUENCES * 0.8)
+SPLIT_VAL = SPLIT_TEST = int(EXTRACT_SEQUENCES * 0.1)
 
 _BAR = re.compile(r"\b(\d+)/(\d+)\s*\[")   # tqdm counter, e.g. "  200/1000 ["
 PROGRESS_EVERY = 100                        # print one progress line per this many items
@@ -364,7 +375,7 @@ if RUN_DATA:
     # Drive-side manifest instead; embedding_synonyms.py truncates both files when
     # it restarts a shard, so a re-run is always clean.
     shards_done = load_runs("task15_shards")
-    for start in range(0, 10000, 1000):
+    for start in range(0, EXTRACT_SEQUENCES, 1000):
         end = start + 1000
         key = f"{start}_{end}"
         synonym_part = LEAF / f"synonyms_{start}_{end}.jsonl"
@@ -379,8 +390,8 @@ if RUN_DATA:
         cache_dataset_to_drive(LEAF)
         shards_done[key] = synonym_part
         save_runs(shards_done, "task15_shards")
-    run([sys.executable, "data/merge_synonym_parts.py", "--train-size", "8000",
-         "--val-size", "1000", "--test-size", "1000", "--expected-count", "2", "--force"], cwd=EXT)
+    run([sys.executable, "data/merge_synonym_parts.py", "--train-size", SPLIT_TRAIN,
+         "--val-size", SPLIT_VAL, "--test-size", SPLIT_TEST, "--expected-count", "2", "--force"], cwd=EXT)
     run([sys.executable, "data/augment_synonyms.py", "--base-dir", DATA,
          "--num-augmentations", "4", "--seed", "42", "--overwrite"], cwd=EXT)
     run([sys.executable, "data/randomize_synonyms.py", "--split", "train", "--overwrite"], cwd=EXT)
@@ -842,10 +853,11 @@ if RUN_SCALE_3B:
     # for 3B, audit 8k/1k/1k, and rebuild hierarchy labels before training.
     run([sys.executable, "data/get_content_words.py", "--model", SCALE_MODEL,
          "--dataset", "c4", "--max_length", "256"], cwd=EXT)
-    run([sys.executable, "data/embedding_synonyms.py", "c4", "--start", "0", "--end", "10000",
-         "--model", SCALE_MODEL], cwd=EXT)
-    run([sys.executable, "data/merge_synonym_parts.py", "--train-size", "8000",
-         "--val-size", "1000", "--test-size", "1000", "--expected-count", "2", "--force"], cwd=EXT)
+    run([sys.executable, "data/embedding_synonyms.py", "c4",
+         "--start", "0", "--end", EXTRACT_SEQUENCES, "--model", SCALE_MODEL,
+         *([] if EXTRACT_4BIT else ["--no-4bit"])], cwd=EXT)
+    run([sys.executable, "data/merge_synonym_parts.py", "--train-size", SPLIT_TRAIN,
+         "--val-size", SPLIT_VAL, "--test-size", SPLIT_TEST, "--expected-count", "2", "--force"], cwd=EXT)
     scale_tag = SCALE_MODEL.split("/")[-1].lower()
     scale_leaf = DATA / "c4" / scale_tag / "embedding"
     run([sys.executable, "data/audit_concept_data.py",
