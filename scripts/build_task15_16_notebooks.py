@@ -607,10 +607,22 @@ if RUN_DATA:
 
 Training samples these prompts uniformly: “In this context, *s* is a type of …”, “*s* and other …”, and “A more general term for *s* is …”. Evaluation reports each separately and their average. Hypernyms may be multi-token and are always scored by the full teacher-forced sequence; context is left-truncated before any candidate token.'''),
         code(r'''
-# The gamma screen only has to rank three values on seed 42.  Zhang et al. Fig. 8
-# shows quarter data matches full data on STS, so the screen runs on 2,000
-# sequences; the confirmed arms run on everything.  SCREEN_SAMPLES = None disables it.
-SCREEN_SAMPLES = 2000
+# Two cost knobs, both defaulting to the exact objective on full data.  They are
+# applied to the screen AND the confirmed runs together, because a gamma locked
+# under one setting does not transfer to another.
+#
+# HIERARCHY_SURFACES = 0 scores every member of the equivalence set.  A positive K
+#   truncates the bridge to the top-K by q and renormalises (~1.9x faster at K=3).
+#   It is approximately unbiased when tail members have similar P(H|s); watch
+#   hierarchy_bridge_mass_retained in the training log and treat anything below
+#   ~0.9 as too aggressive.
+# TRAIN_SAMPLES = None uses all 8,000 sequences.  Reducing it cuts hierarchy
+#   supervision proportionally, because only one slot per batch is supervised, so
+#   2,000 sequences means a quarter of the hierarchy updates, not just a quarter of
+#   the flat data.  Zhang et al. Fig. 8 licenses the flat-data reduction on STS; it
+#   says nothing about hierarchy sample efficiency.
+HIERARCHY_SURFACES = 0
+TRAIN_SAMPLES = None
 
 def train_hierarchy(label, mode, gamma, seed, max_samples=None):
     out = RUNS / label / f"seed_{seed}" / f"gamma_{gamma}" / f"n_{max_samples or 'full'}"
@@ -625,7 +637,7 @@ def train_hierarchy(label, mode, gamma, seed, max_samples=None):
          "--contrast-beta", FLAT_CONTRAST_BETA,
          "--seed", seed, "--epochs", "5", "--learning-rate", "7e-5",
          "--candidate-microbatch-size", "8", "--max-hierarchy-slots-per-batch", "1",
-         "--max-hierarchy-surfaces", "3", "--report-to", "none",
+         "--max-hierarchy-surfaces", HIERARCHY_SURFACES, "--report-to", "none",
          *(["--max-train-samples", max_samples] if max_samples else []),
          *(["--slot-ntp-weight", FLAT_SLOT_NTP_WEIGHT]
            if FLAT_SLOT_NTP_WEIGHT is not None else [])], cwd=EXT)
@@ -636,11 +648,11 @@ HIERARCHY_RUNS = load_runs("task16")
 if RUN_SCREEN:
     for gamma in [0.1, 0.25, 0.5]:
         HIERARCHY_RUNS[f"conditioned_gamma{gamma}_seed42"] = train_hierarchy(
-            "conditioned_hierarchy", "conditioned", gamma, 42, max_samples=SCREEN_SAMPLES)
+            "conditioned_hierarchy", "conditioned", gamma, 42, max_samples=TRAIN_SAMPLES)
     HIERARCHY_RUNS["independent_seed42"] = train_hierarchy(
-        "independent_hypernym", "independent", 0.25, 42, max_samples=SCREEN_SAMPLES)
+        "independent_hypernym", "independent", 0.25, 42, max_samples=TRAIN_SAMPLES)
     HIERARCHY_RUNS["shuffled_seed42"] = train_hierarchy(
-        "shuffled_hierarchy", "shuffled", 0.25, 42, max_samples=SCREEN_SAMPLES)
+        "shuffled_hierarchy", "shuffled", 0.25, 42, max_samples=TRAIN_SAMPLES)
 '''),
         md('''## Evaluation and gamma lock
 
@@ -708,14 +720,17 @@ if RUN_CONFIRM:
             objective=FLAT_OBJECTIVE, slot_ntp_weight=FLAT_SLOT_NTP_WEIGHT,
             contrast_beta=FLAT_CONTRAST_BETA, train_file=FLAT_SOURCE)
         HIERARCHY_RUNS[f"conditioned_seed{seed}"] = train_hierarchy(
-            "conditioned_hierarchy", "conditioned", SELECTED_GAMMA, seed)
+            "conditioned_hierarchy", "conditioned", SELECTED_GAMMA, seed,
+            max_samples=TRAIN_SAMPLES)
         HIERARCHY_RUNS[f"independent_seed{seed}"] = train_hierarchy(
-            "independent_hypernym", "independent", SELECTED_GAMMA, seed)
+            "independent_hypernym", "independent", SELECTED_GAMMA, seed,
+            max_samples=TRAIN_SAMPLES)
         HIERARCHY_RUNS[f"shuffled_seed{seed}"] = train_hierarchy(
-            "shuffled_hierarchy", "shuffled", SELECTED_GAMMA, seed)
-    # Screen runs used SCREEN_SAMPLES and live under a different n_ directory, so
-    # they no longer collide with the confirmed full-data runs.  Drop the screen keys
-    # from the reported table anyway: they are a hyperparameter search, not arms.
+            "shuffled_hierarchy", "shuffled", SELECTED_GAMMA, seed,
+            max_samples=TRAIN_SAMPLES)
+    # Drop the gamma-screen keys from the reported table: they are a hyperparameter
+    # search, not arms.  Screen and confirm share TRAIN_SAMPLES and HIERARCHY_SURFACES,
+    # so at the locked gamma they address the same adapter and resume for free.
     for stale in [k for k in HIERARCHY_RUNS if k.startswith("conditioned_gamma")]:
         HIERARCHY_RUNS.pop(stale, None)
     for label, path in HIERARCHY_RUNS.items(): sync_small_artifacts(path, f"task16_logs/{label}")

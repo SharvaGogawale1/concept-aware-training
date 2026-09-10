@@ -1553,10 +1553,10 @@ index 0778a31..497e1cd 100644
      if config.use_wandb:
 diff --git a/train_hierarchy.py b/train_hierarchy.py
 new file mode 100644
-index 0000000..2ff1e3d
+index 0000000..25d6d46
 --- /dev/null
 +++ b/train_hierarchy.py
-@@ -0,0 +1,312 @@
+@@ -0,0 +1,317 @@
 +"""QLoRA training for independent, conditioned, and shuffled hierarchies."""
 +
 +import argparse
@@ -1609,7 +1609,7 @@ index 0000000..2ff1e3d
 +        hierarchy_max_length=256,
 +        candidate_microbatch_size=16,
 +        max_hierarchy_slots_per_batch=1,
-+        max_hierarchy_surfaces=3,
++        max_hierarchy_surfaces=0,
 +        **kwargs,
 +    ):
 +        super().__init__(**kwargs)
@@ -1779,9 +1779,14 @@ index 0000000..2ff1e3d
 +    parser.add_argument("--gradient-accumulation-steps", type=int, default=2)
 +    parser.add_argument("--candidate-microbatch-size", type=int, default=16)
 +    parser.add_argument("--max-hierarchy-slots-per-batch", type=int, default=1)
-+    parser.add_argument("--max-hierarchy-surfaces", type=int, default=3,
-+                        help="Truncate the equivalence bridge to its top-K members by q "
-+                             "(0 disables truncation and scores every member).")
++    parser.add_argument("--max-hierarchy-surfaces", type=int, default=0,
++                        help="0 (default) scores every member of the equivalence set, which "
++                             "is the objective as specified.  A positive K truncates the "
++                             "bridge to its top-K members by q and renormalises: about 1.9x "
++                             "faster at K=3, approximately unbiased when the tail members "
++                             "have similar P(H|s), and biased downward when they do not.  "
++                             "If you set it, set it for the screen and the confirmed runs "
++                             "alike so the locked gamma transfers.")
 +    parser.add_argument("--max-train-samples", type=int, default=None)
 +    parser.add_argument("--report-to", choices=["none", "wandb"], default="none")
 +    return parser.parse_args()
