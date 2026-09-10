@@ -68,6 +68,13 @@ RUN_EVAL = False
 # Colab sessions, so without this the screen -> gate -> confirm sequence has to
 # finish in one sitting.  Set False to force a full retrain.
 RESUME_FINISHED_RUNS = True
+# Precision for CONCEPT EXTRACTION only; training is QLoRA-4bit either way.
+# Upstream inherits use_4bit=True from TrainingConfig, but extraction runs ~94
+# small forwards per sequence and NF4 dequantization dominates them: 8.0 s/seq
+# at 4-bit against roughly a third of that in bf16, i.e. 22 h against ~8 h for
+# ten shards.  Quantization also perturbs the top-100 pool and the 0.75 cosine
+# threshold the method depends on.  Use ONE setting for all ten shards.
+EXTRACT_4BIT = False
 
 _BAR = re.compile(r"\b(\d+)/(\d+)\s*\[")   # tqdm counter, e.g. "  200/1000 ["
 PROGRESS_EVERY = 100                        # print one progress line per this many items
@@ -367,7 +374,8 @@ if RUN_DATA:
             print("resume: extraction shard already complete", start, end)
             continue
         run([sys.executable, "data/embedding_synonyms.py", "c4",
-             "--start", start, "--end", end, "--model", BASE_MODEL], cwd=EXT)
+             "--start", start, "--end", end, "--model", BASE_MODEL,
+             *([] if EXTRACT_4BIT else ["--no-4bit"])], cwd=EXT)
         cache_dataset_to_drive(LEAF)
         shards_done[key] = synonym_part
         save_runs(shards_done, "task15_shards")
