@@ -1553,10 +1553,10 @@ index 0778a31..497e1cd 100644
      if config.use_wandb:
 diff --git a/train_hierarchy.py b/train_hierarchy.py
 new file mode 100644
-index 0000000..8ac437c
+index 0000000..2ff1e3d
 --- /dev/null
 +++ b/train_hierarchy.py
-@@ -0,0 +1,289 @@
+@@ -0,0 +1,312 @@
 +"""QLoRA training for independent, conditioned, and shuffled hierarchies."""
 +
 +import argparse
@@ -1609,6 +1609,7 @@ index 0000000..8ac437c
 +        hierarchy_max_length=256,
 +        candidate_microbatch_size=16,
 +        max_hierarchy_slots_per_batch=1,
++        max_hierarchy_surfaces=3,
 +        **kwargs,
 +    ):
 +        super().__init__(**kwargs)
@@ -1619,6 +1620,12 @@ index 0000000..8ac437c
 +        self.hierarchy_max_length = int(hierarchy_max_length)
 +        self.candidate_microbatch_size = int(candidate_microbatch_size)
 +        self.max_hierarchy_slots_per_batch = int(max_hierarchy_slots_per_batch)
++        # The bridge sum runs one relation-prompt forward per surface per hypernym.
++        # Scoring all ~8 equivalence members costs 2-3x a flat step for a term whose
++        # mass is concentrated on the top few.  Truncate to the top-K by q and
++        # renormalise; retained mass is logged so the approximation is auditable.
++        self.max_hierarchy_surfaces = int(max_hierarchy_surfaces)
++        self.hierarchy_bridge_mass = 0.0
 +        self.hierarchy_seen = 0
 +        self.hierarchy_skipped = 0
 +        self.hierarchy_prefix_collisions = 0
@@ -1692,6 +1699,15 @@ index 0000000..8ac437c
 +                bridge_logits = logits[batch_index, shift].float()
 +                q = torch.softmax(bridge_logits[torch.tensor(token_ids, device=logits.device)], dim=0)
 +                q = q.detach()  # The hierarchy head must not reshape the synonym bridge.
++                if 0 < self.max_hierarchy_surfaces < q.numel():
++                    keep = torch.topk(q, self.max_hierarchy_surfaces).indices
++                    keep = keep.sort().values
++                    surfaces = [surfaces[i] for i in keep.tolist()]
++                    q = q[keep]
++                    self.hierarchy_bridge_mass = float(q.sum())
++                    q = q / q.sum()
++                else:
++                    self.hierarchy_bridge_mass = 1.0
 +
 +                template_index = slot_rng.randrange(len(RELATION_TEMPLATES))
 +                pairs = []
@@ -1737,6 +1753,7 @@ index 0000000..8ac437c
 +                "hierarchy_slots_seen": self.hierarchy_seen,
 +                "hierarchy_slots_skipped": self.hierarchy_skipped,
 +                "hierarchy_prefix_collisions": self.hierarchy_prefix_collisions,
++                "hierarchy_bridge_mass_retained": self.hierarchy_bridge_mass,
 +            })
 +        if return_outputs:
 +            return total, outputs
@@ -1762,6 +1779,10 @@ index 0000000..8ac437c
 +    parser.add_argument("--gradient-accumulation-steps", type=int, default=2)
 +    parser.add_argument("--candidate-microbatch-size", type=int, default=16)
 +    parser.add_argument("--max-hierarchy-slots-per-batch", type=int, default=1)
++    parser.add_argument("--max-hierarchy-surfaces", type=int, default=3,
++                        help="Truncate the equivalence bridge to its top-K members by q "
++                             "(0 disables truncation and scores every member).")
++    parser.add_argument("--max-train-samples", type=int, default=None)
 +    parser.add_argument("--report-to", choices=["none", "wandb"], default="none")
 +    return parser.parse_args()
 +
@@ -1785,7 +1806,8 @@ index 0000000..8ac437c
 +    config.per_device_train_batch_size = args.per_device_batch_size
 +    config.gradient_accumulation_steps = args.gradient_accumulation_steps
 +    model, tokenizer = setup_model_and_tokenizer(config)
-+    train_data = ConceptDataset(args.train_file, tokenizer, max_length=config.max_length)
++    train_data = ConceptDataset(args.train_file, tokenizer, max_length=config.max_length,
++                                max_samples=args.max_train_samples)
 +    validation_data = ConceptDataset(args.validation_file, tokenizer, max_length=config.max_length)
 +
 +    training_args = TrainingArguments(
@@ -1829,6 +1851,7 @@ index 0000000..8ac437c
 +        hierarchy_max_length=config.max_length,
 +        candidate_microbatch_size=args.candidate_microbatch_size,
 +        max_hierarchy_slots_per_batch=args.max_hierarchy_slots_per_batch,
++        max_hierarchy_surfaces=args.max_hierarchy_surfaces,
 +    )
 +    trainer.train()
 +    trainer.save_model(str(output))  # one final LoRA adapter; no optimizer state

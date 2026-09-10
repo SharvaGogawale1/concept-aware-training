@@ -97,6 +97,56 @@ def audit_no_drive_weights():
              if p.name in forbidden or p.name.startswith("checkpoint-")]
     assert not found, f"full-weight/optimizer artifacts reached Drive: {found}"
 
+DATA_CACHE = DRIVE_PROJECT / "task15_16_data"
+
+def cache_dataset_to_drive(leaf):
+    """Concept generation costs hours; /content does not survive a disconnect."""
+    destination = DATA_CACHE / Path(leaf).relative_to(DATA)
+    destination.mkdir(parents=True, exist_ok=True)
+    for path in Path(leaf).glob("*.jsonl"):
+        shutil.copy2(path, destination / path.name)
+    print("cached dataset to", destination)
+
+def restore_dataset_from_drive(leaf):
+    source = DATA_CACHE / Path(leaf).relative_to(DATA)
+    if not (source / "synonyms_train.jsonl").is_file():
+        return False
+    Path(leaf).mkdir(parents=True, exist_ok=True)
+    for path in source.glob("*.jsonl"):
+        target = Path(leaf) / path.name
+        if not target.is_file():
+            shutil.copy2(path, target)
+    print("restored dataset from", source)
+    return True
+
+RUN_MANIFEST = DRIVE_RESULTS / "run_manifests"
+
+def save_runs(runs, name):
+    """Persist label -> adapter path so a later session can evaluate earlier phases."""
+    RUN_MANIFEST.mkdir(parents=True, exist_ok=True)
+    (RUN_MANIFEST / f"{name}.json").write_text(
+        json.dumps({k: str(v) for k, v in runs.items()}, indent=2))
+
+def load_runs(name):
+    path = RUN_MANIFEST / f"{name}.json"
+    if not path.is_file():
+        return {}
+    return {k: Path(v) for k, v in json.loads(path.read_text()).items()}
+
+def restore_all(runs):
+    """Pull every adapter in `runs` back onto /content; drop any that is missing."""
+    live = {}
+    for label, path in runs.items():
+        if (Path(path) / "adapter_config.json").is_file() or restore_adapter_from_drive(path):
+            live[label] = Path(path)
+        else:
+            print("missing adapter, dropping from this pass:", label)
+    return live
+
+def eval_done(marker):
+    """True when a completed evaluation artifact is already on Drive."""
+    return Path(marker).is_file() and RESUME_FINISHED_RUNS
+
 ADAPTER_CACHE = DRIVE_PROJECT / "task15_16_adapters"
 ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors",
                  "training_history.jsonl", "run_config.json")
@@ -170,6 +220,9 @@ login(token=getpass("Hugging Face token (input hidden): "), add_to_git_credentia
 TRAIN_HELPER = r'''
 MODEL_TAG = BASE_MODEL.split("/")[-1].lower()
 LEAF = DATA / "c4" / MODEL_TAG / "embedding"
+# /content is wiped between sessions; pull the generated concept data back rather
+# than paying the multi-hour regeneration again.
+restore_dataset_from_drive(LEAF)
 
 def adapter_path(method, seed, value):
     path = RUNS / method / f"seed_{seed}" / str(value)
@@ -243,6 +296,8 @@ if RUN_DATA:
 MODEL_TAG = BASE_MODEL.split("/")[-1].lower()
 LEAF = DATA / "c4" / MODEL_TAG / "embedding"
 if RUN_DATA:
+    cache_dataset_to_drive(LEAF)
+if RUN_DATA:
     run([sys.executable, "data/audit_concept_data.py",
          "--train", LEAF / "synonyms_train.jsonl",
          "--validation", LEAF / "synonyms_val.jsonl",
@@ -288,7 +343,7 @@ if RUN_SMOKE:
 Seed 42 gets the complete $\lambda\in\{0.25,0.5,0.75,1\}$ curve. The headline NTP, one-epoch augmented NTP, randomized $\lambda=.25$, and concept-marginal $\lambda=1$ settings are then confirmed with seeds 42, 123, and 2024. Released effective batch size is logged. If the headline fails, only seed 42 is rerun with the paper-stated batch before any diagnosis.'''),
         code(TRAIN_HELPER),
         code(r'''
-REPRO_RUNS = {}
+REPRO_RUNS = load_runs("task15")
 if RUN_SCREEN:
     REPRO_RUNS["ntp_seed42"] = train_flat("ntp", 42, 0.0)
     for lam in [0.25, 0.5, 0.75, 1.0]:
@@ -308,6 +363,7 @@ if RUN_CONFIRM:
     # adapter_path() maps both calls to the same directory.  Two dict keys pointing at
     # one adapter would score it twice and report it as two arms.
     REPRO_RUNS.pop("zhang_lambda1.0_seed42", None)
+save_runs(REPRO_RUNS, "task15")
 
 # Use only if the released-batch seed-42 reproduction misses the stated trend.
 # This is a named sensitivity run, never a replacement or a cherry-picked row.
@@ -321,6 +377,8 @@ if RERUN_PAPER_STATED_BATCH:
 Every checkpoint is scored by the same evaluators. “Global NLL” covers every next-token position; “content-word NLL” covers the semantic slots; “set mass” is total probability assigned to the gold-inclusive valid set. SWORDS and bm-semlex are zero-shot here.'''),
         code(r'''
 if RUN_EVAL:
+    # A fresh session has the manifest but not the weights; pull them back first.
+    REPRO_RUNS = restore_all(REPRO_RUNS)
     checkpoints = [BASE_MODEL, *map(str, REPRO_RUNS.values())]
     result_dir = DRIVE_RESULTS / "task15_reproduction"
     result_dir.mkdir(parents=True, exist_ok=True)
@@ -414,7 +472,7 @@ if RUN_DATA:
 
 $\alpha\in\{.5,1,2,4\}$ controls uniform pressure. We set the concept-slot NTP weight to 1, so the observed-token term is never removed. Select the largest concept improvement whose global NLL is at most 0.20 above matched NTP. Then hold $\alpha$ fixed and screen $\beta\in\{.25,.5,1\}$.'''),
         code(r'''
-OBJECTIVE_RUNS = {}
+OBJECTIVE_RUNS = load_runs("task15b")
 if RUN_SCREEN:
     for alpha in [0.5, 1.0, 2.0, 4.0]:
         OBJECTIVE_RUNS[f"uniform_alpha{alpha}_seed42"] = train_flat(
@@ -433,6 +491,7 @@ if RUN_SCREEN and SELECTED_ALPHA is not None:
 Contrastive is promoted only when it improves SWORDS acceptable/rejected AUROC over the identical uniform model while preserving STS and NTP. It is not promoted for a better training loss alone.'''),
         code(r'''
 if RUN_EVAL:
+    OBJECTIVE_RUNS = restore_all(OBJECTIVE_RUNS)
     result_dir = DRIVE_RESULTS / "task15b_screen"; result_dir.mkdir(parents=True, exist_ok=True)
     checkpoints = [str(x) for x in OBJECTIVE_RUNS.values()]
     run([sys.executable, "eval/eval_perplexity_explicit.py", "--checkpoints", *checkpoints,
@@ -482,6 +541,7 @@ if RUN_CONFIRM:
                 slot_ntp_weight=1.0, contrast_beta=SELECTED_BETA, train_file=NEG_TRAIN)
     for label, path in OBJECTIVE_RUNS.items(): sync_small_artifacts(path, f"task15b_logs/{label}")
     audit_no_drive_weights()
+save_runs(OBJECTIVE_RUNS, "task15b")
 '''),
         md('''## Decision
 
@@ -524,7 +584,7 @@ FLAT_CONTRAST_BETA = 0.0
 FLAT_SOURCE = LEAF / ("synonyms_train_conservative_negatives.jsonl"
                       if FLAT_CONTRAST_BETA > 0 else "synonyms_train.jsonl")
 RUN_REFERENCES = False
-REFERENCE_RUNS = {}
+REFERENCE_RUNS = load_runs("task16_references")
 if RUN_REFERENCES:
     REFERENCE_RUNS["ntp"] = train_flat("task16_ntp_reference", 42, 0.0)
     REFERENCE_RUNS["augmented_ntp"] = train_flat(
@@ -547,8 +607,13 @@ if RUN_DATA:
 
 Training samples these prompts uniformly: “In this context, *s* is a type of …”, “*s* and other …”, and “A more general term for *s* is …”. Evaluation reports each separately and their average. Hypernyms may be multi-token and are always scored by the full teacher-forced sequence; context is left-truncated before any candidate token.'''),
         code(r'''
-def train_hierarchy(label, mode, gamma, seed):
-    out = RUNS / label / f"seed_{seed}" / f"gamma_{gamma}"
+# The gamma screen only has to rank three values on seed 42.  Zhang et al. Fig. 8
+# shows quarter data matches full data on STS, so the screen runs on 2,000
+# sequences; the confirmed arms run on everything.  SCREEN_SAMPLES = None disables it.
+SCREEN_SAMPLES = 2000
+
+def train_hierarchy(label, mode, gamma, seed, max_samples=None):
+    out = RUNS / label / f"seed_{seed}" / f"gamma_{gamma}" / f"n_{max_samples or 'full'}"
     assert_ephemeral(out)
     if RESUME_FINISHED_RUNS and finished(out):
         print("resume: already trained, skipping", out)
@@ -560,27 +625,30 @@ def train_hierarchy(label, mode, gamma, seed):
          "--contrast-beta", FLAT_CONTRAST_BETA,
          "--seed", seed, "--epochs", "5", "--learning-rate", "7e-5",
          "--candidate-microbatch-size", "8", "--max-hierarchy-slots-per-batch", "1",
-         "--report-to", "none",
+         "--max-hierarchy-surfaces", "3", "--report-to", "none",
+         *(["--max-train-samples", max_samples] if max_samples else []),
          *(["--slot-ntp-weight", FLAT_SLOT_NTP_WEIGHT]
            if FLAT_SLOT_NTP_WEIGHT is not None else [])], cwd=EXT)
     cache_adapter_to_drive(out)
     return out
 
-HIERARCHY_RUNS = {}
+HIERARCHY_RUNS = load_runs("task16")
 if RUN_SCREEN:
     for gamma in [0.1, 0.25, 0.5]:
         HIERARCHY_RUNS[f"conditioned_gamma{gamma}_seed42"] = train_hierarchy(
-            "conditioned_hierarchy", "conditioned", gamma, 42)
+            "conditioned_hierarchy", "conditioned", gamma, 42, max_samples=SCREEN_SAMPLES)
     HIERARCHY_RUNS["independent_seed42"] = train_hierarchy(
-        "independent_hypernym", "independent", 0.25, 42)
+        "independent_hypernym", "independent", 0.25, 42, max_samples=SCREEN_SAMPLES)
     HIERARCHY_RUNS["shuffled_seed42"] = train_hierarchy(
-        "shuffled_hierarchy", "shuffled", 0.25, 42)
+        "shuffled_hierarchy", "shuffled", 0.25, 42, max_samples=SCREEN_SAMPLES)
 '''),
         md('''## Evaluation and gamma lock
 
 Primary hierarchy metrics are HyperLex Spearman, forward-versus-reverse accuracy, and hypernym-versus-co-hyponym AUROC, stratified by relation depth and POS. SWORDS, bm-semlex, STS, and global/content NTP are retention tests. Select gamma on seed 42; then freeze it.'''),
         code(r'''
 if RUN_EVAL:
+    REFERENCE_RUNS = restore_all(REFERENCE_RUNS)
+    HIERARCHY_RUNS = restore_all(HIERARCHY_RUNS)
     result_dir = DRIVE_RESULTS / "task16_screen"; result_dir.mkdir(parents=True, exist_ok=True)
     checkpoints = [str(x) for x in {**REFERENCE_RUNS, **HIERARCHY_RUNS}.values()]
     run([sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/eval_hyperlex.py",
@@ -645,14 +713,15 @@ if RUN_CONFIRM:
             "independent_hypernym", "independent", SELECTED_GAMMA, seed)
         HIERARCHY_RUNS[f"shuffled_seed{seed}"] = train_hierarchy(
             "shuffled_hierarchy", "shuffled", SELECTED_GAMMA, seed)
-    # The gamma screen already trained conditioned_hierarchy at the locked gamma on
-    # seed 42, and train_hierarchy() maps both calls to the same directory.  Keeping
-    # both keys would score one adapter twice and print it as two arms.  The
-    # independent and shuffled screen keys are seed-suffixed already, so they are
-    # overwritten rather than duplicated.
-    HIERARCHY_RUNS.pop(f"conditioned_gamma{SELECTED_GAMMA}_seed42", None)
+    # Screen runs used SCREEN_SAMPLES and live under a different n_ directory, so
+    # they no longer collide with the confirmed full-data runs.  Drop the screen keys
+    # from the reported table anyway: they are a hyperparameter search, not arms.
+    for stale in [k for k in HIERARCHY_RUNS if k.startswith("conditioned_gamma")]:
+        HIERARCHY_RUNS.pop(stale, None)
     for label, path in HIERARCHY_RUNS.items(): sync_small_artifacts(path, f"task16_logs/{label}")
     audit_no_drive_weights()
+save_runs(HIERARCHY_RUNS, "task16")
+save_runs(REFERENCE_RUNS, "task16_references")
 '''),
         code(r'''
 # Stage 3 is deliberately unreachable until the 1B evidence is locked.
