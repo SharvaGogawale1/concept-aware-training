@@ -54,3 +54,9 @@ build/
 
 # Jupyter checkpoints
 .ipynb_checkpoints/
+
+# Pinned external reproduction source is cloned locally; version the patch and
+# provenance instead of nesting another Git repository in this one.
+external/learning-concepts/
+!external/README.md
+!external/*.patch

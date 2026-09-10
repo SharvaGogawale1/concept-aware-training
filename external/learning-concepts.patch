@@ -1,0 +1,1848 @@
+diff --git a/conceptlib/config.py b/conceptlib/config.py
+index 95f3ea2..88fd96d 100644
+--- a/conceptlib/config.py
++++ b/conceptlib/config.py
+@@ -31,6 +31,9 @@ class TrainingConfig:
+     max_synonyms_per_content_word = 10
+     max_content_words = None  # None means all content words; otherwise sample this many
+     target_mass = 0.6
++    concept_objective: str = "set_marginal"
++    slot_ntp_weight: Optional[float] = None
++    contrast_beta: float = 0.0
+     use_weighted_ce: bool = False
+     ce_concept_token_weight: float = 5.0
+ 
+diff --git a/conceptlib/sequence_scoring.py b/conceptlib/sequence_scoring.py
+new file mode 100644
+index 0000000..c86ef1f
+--- /dev/null
++++ b/conceptlib/sequence_scoring.py
+@@ -0,0 +1,79 @@
++"""Exact continuation scoring shared by hierarchy training and evaluation."""
++
++from typing import Iterable, List, Sequence, Tuple
++
++import torch
++import torch.nn.functional as F
++
++
++def encode_continuation(tokenizer, prefix: str, continuation: str) -> Tuple[List[int], List[int]]:
++    """Tokenize ``prefix + continuation`` and return full ids plus continuation ids.
++
++    Tokenizing the concatenated string is essential: many tokenizers encode a
++    word differently at a boundary than they do in isolation.
++    """
++    prefix_ids = tokenizer.encode(prefix, add_special_tokens=True)
++    full_ids = tokenizer.encode(prefix + continuation, add_special_tokens=True)
++    if full_ids[: len(prefix_ids)] != prefix_ids:
++        # Boundary merges can change the final prefix token.  A trailing space
++        # keeps the relation templates at a stable token boundary.
++        raise ValueError("prefix is not a token-prefix of the full continuation")
++    continuation_ids = full_ids[len(prefix_ids) :]
++    if not continuation_ids:
++        raise ValueError("empty continuation")
++    return full_ids, continuation_ids
++
++
++def left_truncate(full_ids: Sequence[int], continuation_len: int, max_length: int) -> List[int]:
++    """Left-truncate context only; never discard continuation tokens."""
++    if continuation_len >= max_length:
++        raise ValueError("continuation alone reaches max_length")
++    if len(full_ids) <= max_length:
++        return list(full_ids)
++    return list(full_ids[-max_length:])
++
++
++def continuation_log_probability(logits: torch.Tensor, continuation_ids: Sequence[int]) -> torch.Tensor:
++    """Exact log p(c|x) from teacher-forced logits for one packed sequence."""
++    n = len(continuation_ids)
++    if n <= 0 or logits.shape[0] < n + 1:
++        raise ValueError("invalid continuation/logit lengths")
++    positions = logits[-n - 1 : -1]
++    labels = torch.as_tensor(continuation_ids, device=logits.device, dtype=torch.long)
++    return F.log_softmax(positions.float(), dim=-1).gather(1, labels[:, None]).sum()
++
++
++def exact_candidate_log_probs(
++    model,
++    tokenizer,
++    prompts_and_candidates: Iterable[Tuple[str, str]],
++    max_length: int = 256,
++    microbatch_size: int = 16,
++) -> torch.Tensor:
++    """Score variable-length candidates exactly, with candidate microbatching."""
++    encoded = []
++    for prompt, candidate in prompts_and_candidates:
++        full, continuation = encode_continuation(tokenizer, prompt, candidate)
++        full = left_truncate(full, len(continuation), max_length)
++        encoded.append((full, continuation))
++    if not encoded:
++        param = next(model.parameters())
++        return param.sum()[None] * 0.0
++
++    device = next(model.parameters()).device
++    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
++    scores = []
++    for start in range(0, len(encoded), microbatch_size):
++        chunk = encoded[start : start + microbatch_size]
++        width = max(len(full) for full, _ in chunk)
++        ids = torch.full((len(chunk), width), pad_id, dtype=torch.long, device=device)
++        mask = torch.zeros_like(ids)
++        lengths = []
++        for row, (full, _) in enumerate(chunk):
++            ids[row, : len(full)] = torch.tensor(full, device=device)
++            mask[row, : len(full)] = 1
++            lengths.append(len(full))
++        logits = model(input_ids=ids, attention_mask=mask).logits
++        for row, ((_, continuation), length) in enumerate(zip(chunk, lengths)):
++            scores.append(continuation_log_probability(logits[row, :length], continuation))
++    return torch.stack(scores)
+diff --git a/data/audit_concept_data.py b/data/audit_concept_data.py
+new file mode 100644
+index 0000000..aaee0a4
+--- /dev/null
++++ b/data/audit_concept_data.py
+@@ -0,0 +1,87 @@
++"""Hard-fail audit for the 8k/1k/1k Zhang concept splits."""
++
++import argparse
++import hashlib
++import json
++from pathlib import Path
++
++from transformers import AutoTokenizer
++
++
++def read(path):
++    return [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
++
++
++def audit_split(name, path, tokenizer):
++    rows = read(path)
++    bad_target = bad_candidate = empty = slots = 0
++    for row in rows:
++        ids = tokenizer(row["input_sequence"], add_special_tokens=True)["input_ids"]
++        for slot in row.get("content_word_responses", row.get("content_words", [])):
++            slots += 1
++            position = int(slot["position"])
++            expected = tokenizer.encode(" " + str(slot["word"]).strip(), add_special_tokens=False)
++            if position >= len(ids) or len(expected) != 1 or ids[position] != expected[0]:
++                bad_target += 1
++            concepts = [slot.get("word"), *slot.get("synonyms", [])]
++            if not concepts:
++                empty += 1
++            for concept in concepts:
++                if len(tokenizer.encode(" " + str(concept).strip(), add_special_tokens=False)) != 1:
++                    bad_candidate += 1
++    return rows, {
++        "split": name,
++        "path": str(Path(path).resolve()),
++        "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
++        "rows": len(rows),
++        "slots": slots,
++        "target_alignment_failures": bad_target,
++        "non_single_token_concepts": bad_candidate,
++        "empty_concept_sets": empty,
++        "observed_target_included_by_schema": True,
++    }
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--train", required=True)
++    parser.add_argument("--validation", required=True)
++    parser.add_argument("--test", required=True)
++    parser.add_argument("--tokenizer", required=True)
++    parser.add_argument("--report", required=True)
++    parser.add_argument("--allow-nonstandard-sizes", action="store_true")
++    args = parser.parse_args()
++    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
++    all_rows, reports = {}, []
++    for name, path in [("train", args.train), ("validation", args.validation), ("test", args.test)]:
++        all_rows[name], report = audit_split(name, path, tokenizer)
++        reports.append(report)
++    expected = {"train": 8000, "validation": 1000, "test": 1000}
++    sizes = {r["split"]: r["rows"] for r in reports}
++    if sizes != expected and not args.allow_nonstandard_sizes:
++        raise AssertionError(f"expected {expected}, observed {sizes}")
++    identities = {
++        name: {row["input_sequence"] for row in rows} for name, rows in all_rows.items()
++    }
++    overlaps = {
++        "train_validation": len(identities["train"] & identities["validation"]),
++        "train_test": len(identities["train"] & identities["test"]),
++        "validation_test": len(identities["validation"] & identities["test"]),
++    }
++    failures = sum(
++        report["target_alignment_failures"]
++        + report["non_single_token_concepts"]
++        + report["empty_concept_sets"]
++        for report in reports
++    )
++    if failures or any(overlaps.values()):
++        raise AssertionError(f"concept audit failed: failures={failures}, overlaps={overlaps}")
++    result = {"splits": reports, "context_overlap": overlaps, "passed": True}
++    report_path = Path(args.report)
++    report_path.parent.mkdir(parents=True, exist_ok=True)
++    report_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
++    print(json.dumps(result, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/data/build_contrastive_negatives.py b/data/build_contrastive_negatives.py
+new file mode 100644
+index 0000000..14352d3
+--- /dev/null
++++ b/data/build_contrastive_negatives.py
+@@ -0,0 +1,165 @@
++"""Attach conservative, automatically mined negatives to Zhang concept JSONL.
++
++The source `embedding_synonyms.py` records the model's top next-token pool and
++each candidate's contextual cosine.  A candidate is retained as a negative only
++when it is a plausible next token, is below a conservative similarity ceiling,
++has the target WordNet POS, is not a morphological variant, and shares no
++WordNet synset with the target or an accepted synonym.
++
++The output preserves the original schema and adds `negatives` and
++`negative_scores` to each item in `content_word_responses`.
++"""
++from __future__ import annotations
++
++import argparse
++import glob
++import json
++import os
++from collections import Counter
++from pathlib import Path
++
++from nltk.corpus import wordnet as wn
++from nltk.stem import PorterStemmer
++
++
++POS_MAP = {"NOUN": wn.NOUN, "VERB": wn.VERB, "ADJ": wn.ADJ}
++
++
++def _normalise(word: str) -> str:
++    return " ".join(str(word).strip().lower().replace("_", " ").split())
++
++
++def _wordnet_form(word: str) -> str:
++    return _normalise(word).replace(" ", "_")
++
++
++def load_topk(patterns: list[str]) -> dict[tuple[str, int], dict]:
++    index = {}
++    paths = sorted({path for pattern in patterns for path in glob.glob(pattern)})
++    if not paths:
++        raise FileNotFoundError(f"no top-k files matched: {patterns}")
++    for path in paths:
++        with open(path, encoding="utf-8") as handle:
++            for line in handle:
++                row = json.loads(line)
++                text = row["input_sequence"]
++                for target in row.get("content_word_topk", []):
++                    index[(text, int(target["position"]))] = target
++    return index
++
++
++def mine_target(target: dict, topk: dict, max_cosine: float,
++                max_negatives: int, reasons: Counter) -> tuple[list[str], list[float]]:
++    pos = target.get("pos") or topk.get("pos")
++    wn_pos = POS_MAP.get(pos)
++    if wn_pos is None:
++        reasons["unsupported_pos"] += 1
++        return [], []
++
++    positives = [target["word"], *target.get("synonyms", [])]
++    positive_norm = {_normalise(word) for word in positives}
++    positive_stems = {PorterStemmer().stem(word) for word in positive_norm}
++    positive_synsets = {
++        synset
++        for word in positives
++        for synset in wn.synsets(_wordnet_form(word), pos=wn_pos)
++    }
++
++    tokens = topk.get("topk_tokens", [])
++    scores = topk.get("topk_scores", [])
++    if len(tokens) != len(scores):
++        reasons["missing_similarity_scores"] += 1
++        return [], []
++
++    negatives, negative_scores = [], []
++    for candidate, score in zip(tokens, scores):
++        clean = _normalise(candidate)
++        if not clean or clean in positive_norm:
++            reasons["positive_or_empty"] += 1
++            continue
++        if float(score) > max_cosine:
++            reasons["too_similar"] += 1
++            continue
++        if PorterStemmer().stem(clean) in positive_stems:
++            reasons["morphological_variant"] += 1
++            continue
++        candidate_synsets = set(wn.synsets(_wordnet_form(clean), pos=wn_pos))
++        if not candidate_synsets:
++            reasons["no_matching_wordnet_pos"] += 1
++            continue
++        if candidate_synsets & positive_synsets:
++            reasons["shared_synset"] += 1
++            continue
++        negatives.append(str(candidate).strip())
++        negative_scores.append(float(score))
++        if len(negatives) >= max_negatives:
++            break
++    if not negatives:
++        reasons["no_safe_negative"] += 1
++    return negatives, negative_scores
++
++
++def build(source: str, topk_patterns: list[str], output: str,
++          report: str, max_cosine: float, max_negatives: int) -> dict:
++    topk_index = load_topk(topk_patterns)
++    reasons = Counter()
++    rows = slots = covered = 0
++    Path(output).parent.mkdir(parents=True, exist_ok=True)
++    with open(source, encoding="utf-8") as src, open(output, "w", encoding="utf-8") as dst:
++        for line in src:
++            row = json.loads(line)
++            rows += 1
++            text = row["input_sequence"]
++            for target in row.get("content_word_responses", []):
++                slots += 1
++                key = (text, int(target["position"]))
++                pool = topk_index.get(key)
++                if pool is None:
++                    reasons["missing_topk_slot"] += 1
++                    target["negatives"] = []
++                    target["negative_scores"] = []
++                    continue
++                target.setdefault("pos", pool.get("pos"))
++                negatives, scores = mine_target(
++                    target, pool, max_cosine, max_negatives, reasons
++                )
++                target["negatives"] = negatives
++                target["negative_scores"] = scores
++                covered += bool(negatives)
++            dst.write(json.dumps(row, ensure_ascii=False) + "\n")
++
++    summary = {
++        "source": os.path.abspath(source),
++        "output": os.path.abspath(output),
++        "rows": rows,
++        "slots": slots,
++        "slots_with_negatives": covered,
++        "negative_coverage": covered / max(slots, 1),
++        "max_contextual_cosine": max_cosine,
++        "max_negatives_per_slot": max_negatives,
++        "rejection_reasons": dict(sorted(reasons.items())),
++    }
++    Path(report).parent.mkdir(parents=True, exist_ok=True)
++    with open(report, "w", encoding="utf-8") as handle:
++        json.dump(summary, handle, indent=2, sort_keys=True)
++    return summary
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--source", required=True)
++    parser.add_argument("--topk", action="append", required=True,
++                        help="glob for topk_*.jsonl; repeatable")
++    parser.add_argument("--output", required=True)
++    parser.add_argument("--report", required=True)
++    parser.add_argument("--max-cosine", type=float, default=0.35)
++    parser.add_argument("--max-negatives", type=int, default=20)
++    args = parser.parse_args()
++    print(json.dumps(build(
++        args.source, args.topk, args.output, args.report,
++        args.max_cosine, args.max_negatives,
++    ), indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/data/build_hierarchy_dataset.py b/data/build_hierarchy_dataset.py
+new file mode 100644
+index 0000000..b498df5
+--- /dev/null
++++ b/data/build_hierarchy_dataset.py
+@@ -0,0 +1,153 @@
++"""Enrich Zhang-format concept JSONL with auditable WordNet hierarchy labels.
++
++Synonym supervision is retained for nouns, verbs, and adjectives.  Hierarchy
++supervision is added only for noun/verb slots with one defensible synset and at
++least one direct hypernym.  HyperLex is never read by this builder.
++"""
++
++import argparse
++import collections
++import hashlib
++import json
++import random
++from pathlib import Path
++
++from nltk.corpus import wordnet as wn
++
++
++POS_MAP = {"NOUN": wn.NOUN, "VERB": wn.VERB, "n": wn.NOUN, "v": wn.VERB}
++
++
++def norm(text):
++    return str(text).strip().lower().replace("_", " ")
++
++
++def lemma_surfaces(synsets):
++    return sorted({norm(lemma.name()) for synset in synsets for lemma in synset.lemmas()})
++
++
++def select_sense(word, synonyms, pos):
++    wn_pos = POS_MAP.get(pos)
++    if wn_pos is None:
++        return None, "hierarchy_pos_not_noun_or_verb"
++    synonym_norms = {norm(x) for x in synonyms}
++    candidates = []
++    for synset in wn.synsets(norm(word).replace(" ", "_"), pos=wn_pos):
++        names = {norm(lemma.name()) for lemma in synset.lemmas()}
++        if names & synonym_norms:
++            candidates.append(synset)
++    candidates = list({synset.name(): synset for synset in candidates}.values())
++    if not candidates:
++        return None, "no_synset_intersection"
++    if len(candidates) != 1:
++        return None, "ambiguous_synset_intersection"
++    if not candidates[0].hypernyms():
++        return None, "no_direct_hypernym"
++    return candidates[0], None
++
++
++def enrich(rows, seed):
++    frequency = collections.Counter(
++        norm(slot.get("word", ""))
++        for row in rows
++        for slot in row.get("content_word_responses", row.get("content_words", []))
++    )
++    retained_by_pos = collections.defaultdict(list)
++    exclusions = collections.Counter()
++    all_slots = []
++
++    for row_idx, row in enumerate(rows):
++        slots = row.get("content_word_responses", row.get("content_words", []))
++        for slot_idx, slot in enumerate(slots):
++            slot.setdefault("slot_id", f"{row_idx}:{slot_idx}")
++            slot["target_frequency"] = frequency[norm(slot.get("word", ""))]
++            slot["concept_set_size"] = 1 + len(slot.get("synonyms", []))
++            synset, reason = select_sense(
++                slot.get("word", ""), slot.get("synonyms", []), slot.get("pos")
++            )
++            if synset is None:
++                slot["hierarchy_exclusion_reason"] = reason
++                slot["hypernyms"] = []
++                exclusions[reason] += 1
++            else:
++                slot["synset"] = synset.name()
++                slot["hypernyms"] = lemma_surfaces(synset.hypernyms())
++                slot["wordnet_depth"] = synset.min_depth()
++                slot["hierarchy_exclusion_reason"] = None
++                retained_by_pos[synset.pos()].append(slot)
++            all_slots.append(slot)
++
++    # Relation-destroying control: same-POS hypernyms from another retained
++    # slot.  A deterministic rotation avoids accidental self-assignment.
++    rng = random.Random(seed)
++    for pos, slots in retained_by_pos.items():
++        donor_sets = [list(slot["hypernyms"]) for slot in slots]
++        for slot in slots:
++            alternatives = [donor for donor in donor_sets if donor != slot["hypernyms"]]
++            slot["shuffled_hypernyms"] = list(rng.choice(alternatives)) if alternatives else []
++
++    retained = [s for s in all_slots if s.get("hierarchy_exclusion_reason") is None]
++    excluded = [s for s in all_slots if s.get("hierarchy_exclusion_reason") is not None]
++
++    def describe(values):
++        values = sorted(float(x) for x in values if x is not None)
++        if not values:
++            return {"n": 0, "mean": None, "median": None, "min": None, "max": None}
++        mid = len(values) // 2
++        median = values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
++        return {
++            "n": len(values), "mean": sum(values) / len(values), "median": median,
++            "min": values[0], "max": values[-1],
++        }
++
++    report = {
++        "rows": len(rows),
++        "slots_total": len(all_slots),
++        "slots_retained": len(retained),
++        "coverage": len(retained) / max(1, len(all_slots)),
++        "coverage_by_pos": {},
++        "exclusion_reasons": dict(exclusions),
++        "retained_frequency": describe(s.get("target_frequency") for s in retained),
++        "excluded_frequency": describe(s.get("target_frequency") for s in excluded),
++        "retained_concept_set_size": describe(s.get("concept_set_size") for s in retained),
++        "excluded_concept_set_size": describe(s.get("concept_set_size") for s in excluded),
++        "wordnet_depth": describe(s.get("wordnet_depth") for s in retained),
++        "shuffled_control_coverage": (
++            sum(bool(s.get("shuffled_hypernyms")) for s in retained) / max(1, len(retained))
++        ),
++    }
++    for pos in sorted({str(s.get("pos")) for s in all_slots}):
++        group = [s for s in all_slots if str(s.get("pos")) == pos]
++        kept = [s for s in group if s.get("hierarchy_exclusion_reason") is None]
++        report["coverage_by_pos"][pos] = {
++            "total": len(group), "retained": len(kept),
++            "coverage": len(kept) / max(1, len(group)),
++        }
++    return rows, report
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--input", required=True)
++    parser.add_argument("--output", required=True)
++    parser.add_argument("--report", required=True)
++    parser.add_argument("--seed", type=int, default=42)
++    args = parser.parse_args()
++
++    source = Path(args.input)
++    rows = [json.loads(line) for line in source.read_text().splitlines() if line.strip()]
++    rows, report = enrich(rows, args.seed)
++    report["source_sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
++
++    output = Path(args.output)
++    output.parent.mkdir(parents=True, exist_ok=True)
++    output.write_text("".join(json.dumps(row) + "\n" for row in rows))
++    report["output_sha256"] = hashlib.sha256(output.read_bytes()).hexdigest()
++    report_path = Path(args.report)
++    report_path.parent.mkdir(parents=True, exist_ok=True)
++    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
++    print(json.dumps(report, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/data/embedding_synonyms.py b/data/embedding_synonyms.py
+index bc223d3..452d64d 100644
+--- a/data/embedding_synonyms.py
++++ b/data/embedding_synonyms.py
+@@ -164,7 +164,7 @@ class EmbeddingSynonymExtractor:
+     def _rank_target(self, input_ids, logits, hidden_last, past_kv, idx, word):
+         """Rank candidates for one target by cosine sim to the contextual rep.
+ 
+-        Returns `(pairs, topk_words)`:
++        Returns `(pairs, topk_words, topk_scores)`:
+           - `pairs`: top POS_CHECK_TOP `(cand_word_clean, score)` sorted desc.
+           - `topk_words`: the full filtered candidate pool (≤TOPK_LOGITS, post
+             alphanumeric + whole-word + ≠target filter), stripped.
+@@ -177,7 +177,7 @@ class EmbeddingSynonymExtractor:
+                 f"Target '{word}' at idx {idx} does not match decoded token "
+                 f"'{decoded_target}'; skipping."
+             )
+-            return [], []
++            return [], [], []
+ 
+         prev_logits = logits[0, idx - 1, :]
+         topk = torch.topk(prev_logits, k=TOPK_LOGITS)
+@@ -203,7 +203,7 @@ class EmbeddingSynonymExtractor:
+             for t in decoded
+         ]
+         if not any(keep):
+-            return [], []
++            return [], [], []
+         keep_t = torch.tensor(keep, device=cand_ids.device)
+         cand_ids = cand_ids[keep_t]
+         decoded = [t for t, k in zip(decoded, keep) if k]
+@@ -220,7 +220,7 @@ class EmbeddingSynonymExtractor:
+             if sims_list[i] >= MIN_COSINE
+         ]
+         pairs.sort(key=lambda x: -x[1])
+-        return pairs[:POS_CHECK_TOP], topk_words
++        return pairs[:POS_CHECK_TOP], topk_words, [round(v, 6) for v in sims_list]
+ 
+     def analyze_sequence(self, row, save_path, topk_save_path):
+         input_text = row["input_sequence"]
+@@ -265,16 +265,17 @@ class EmbeddingSynonymExtractor:
+                 targets.append({
+                     "word": word, "idx": idx,
+                     "word_start": None, "word_end": None,
+-                    "ranked": [], "topk_words": [],
++                    "ranked": [], "topk_words": [], "topk_scores": [],
+                 })
+                 continue
+-            ranked, topk_words = self._rank_target(
++            ranked, topk_words, topk_scores = self._rank_target(
+                 input_ids, logits, hidden_last, past_kv, idx, word
+             )
+             targets.append({
+                 "word": word, "idx": idx,
+                 "word_start": word_start, "word_end": word_end,
+                 "ranked": ranked, "topk_words": topk_words,
++                "topk_scores": topk_scores,
+             })
+ 
+         # Phase 2: batch every spaCy parse for this sequence into one pipe call.
+@@ -320,6 +321,7 @@ class EmbeddingSynonymExtractor:
+             responses.append({
+                 "word": t["word"],
+                 "position": t["idx"],
++                "pos": target_pos[ti],
+                 "synonyms": [w for w, _ in survivors],
+                 "scores": [round(s, 4) for _, s in survivors],
+             })
+@@ -332,8 +334,14 @@ class EmbeddingSynonymExtractor:
+             }) + "\n")
+ 
+         topk_records = [
+-            {"word": t["word"], "position": t["idx"], "topk_tokens": t["topk_words"]}
+-            for t in targets
++            {
++                "word": t["word"],
++                "position": t["idx"],
++                "pos": target_pos[ti],
++                "topk_tokens": t["topk_words"],
++                "topk_scores": t["topk_scores"],
++            }
++            for ti, t in enumerate(targets)
+         ]
+         os.makedirs(os.path.dirname(topk_save_path), exist_ok=True)
+         with open(topk_save_path, "a") as f:
+diff --git a/eval/eval_concept_sets.py b/eval/eval_concept_sets.py
+new file mode 100644
+index 0000000..2066e29
+--- /dev/null
++++ b/eval/eval_concept_sets.py
+@@ -0,0 +1,104 @@
++"""Intrinsic metrics for Zhang-format gold-inclusive single-token concept sets."""
++
++import argparse
++import json
++import math
++from pathlib import Path
++
++import torch
++import torch.nn.functional as F
++from transformers import AutoTokenizer
++
++from eval_perplexity_explicit import load_model
++
++
++@torch.no_grad()
++def evaluate(model, tokenizer, rows, max_length, device):
++    records = []
++    for row_id, row in enumerate(rows):
++        enc = tokenizer(row["input_sequence"], truncation=True, max_length=max_length, return_tensors="pt")
++        ids = enc["input_ids"].to(device)
++        logits = model(input_ids=ids, attention_mask=enc["attention_mask"].to(device), use_cache=False).logits
++        for slot_id, slot in enumerate(row.get("content_word_responses", [])):
++            pos = int(slot["position"])
++            if not 0 < pos < ids.shape[1]:
++                continue
++            target = int(ids[0, pos])
++            candidates = [target]
++            for surface in slot.get("synonyms", []):
++                encoded = tokenizer.encode(" " + str(surface).strip(), add_special_tokens=False)
++                if len(encoded) == 1 and encoded[0] not in candidates:
++                    candidates.append(encoded[0])
++            logp = F.log_softmax(logits[0, pos - 1].float(), dim=-1)
++            values = logp[torch.tensor(candidates, device=device)]
++            probs = values.exp()
++            normalised = probs / probs.sum()
++            records.append({
++                "row_id": row_id,
++                "slot_id": slot_id,
++                "set_mass": float(probs.sum()),
++                "set_nll": float(-torch.logsumexp(values, dim=0)),
++                "observed_target_nll": float(-values[0]),
++                "alternative_nll": float(-torch.logsumexp(values[1:], dim=0)) if len(values) > 1 else None,
++                "candidate_entropy": float(-(normalised * normalised.log()).sum()),
++                "minimum_candidate_probability": float(probs.min()),
++                "hierarchy_coverage": (
++                    "excluded" if slot.get("hierarchy_exclusion_reason") else "retained"
++                ),
++                "pos": slot.get("pos"),
++                "frequency_bucket": "low" if (slot.get("target_frequency") or 0) <= 1 else "high",
++                "set_size_bucket": "small" if len(candidates) <= 2 else "large",
++                "wordnet_depth": slot.get("wordnet_depth"),
++            })
++    def mean(key):
++        values = [r[key] for r in records if r[key] is not None]
++        return sum(values) / len(values) if values else None
++    strata = {}
++    for field in ["hierarchy_coverage", "pos", "frequency_bucket", "set_size_bucket", "wordnet_depth"]:
++        strata[field] = {}
++        for value in sorted({str(r[field]) for r in records}):
++            subset = [r for r in records if str(r[field]) == value]
++            strata[field][value] = {
++                "n": len(subset),
++                "set_nll": sum(r["set_nll"] for r in subset) / len(subset),
++                "observed_target_nll": sum(r["observed_target_nll"] for r in subset) / len(subset),
++            }
++    return {
++        "n_slots": len(records),
++        **{key: mean(key) for key in [
++            "set_mass", "set_nll", "observed_target_nll", "alternative_nll",
++            "candidate_entropy", "minimum_candidate_probability",
++        ]},
++        "strata": strata,
++        "per_slot": records,
++    }
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--checkpoints", nargs="+", required=True)
++    parser.add_argument("--base-model", required=True)
++    parser.add_argument("--test-jsonl", required=True)
++    parser.add_argument("--output", required=True)
++    parser.add_argument("--max-length", type=int, default=256)
++    parser.add_argument("--no-quantize", action="store_true")
++    args = parser.parse_args()
++    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
++    tokenizer = AutoTokenizer.from_pretrained(args.base_model)
++    if tokenizer.pad_token_id is None:
++        tokenizer.pad_token = tokenizer.eos_token
++    rows = [json.loads(line) for line in open(args.test_jsonl) if line.strip()]
++    results = []
++    for checkpoint in args.checkpoints:
++        model = load_model(checkpoint, args.base_model, dtype, device, not args.no_quantize)
++        results.append({"checkpoint": checkpoint, **evaluate(model, tokenizer, rows, args.max_length, device)})
++        del model
++        if torch.cuda.is_available():
++            torch.cuda.empty_cache()
++    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
++    Path(args.output).write_text(json.dumps(results, indent=2) + "\n")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/eval/eval_mteb.py b/eval/eval_mteb.py
+index 4def87a..2563ba1 100644
+--- a/eval/eval_mteb.py
++++ b/eval/eval_mteb.py
+@@ -86,6 +86,19 @@ parser.add_argument("--dataset-type", type=str, required=True,
+ parser.add_argument("--max-train-samples", type=int, default=None)
+ parser.add_argument("--use-data-augmentation", action="store_true")
+ parser.add_argument("--num-train-epochs", type=int, default=None)
++adapter_group = parser.add_mutually_exclusive_group()
++adapter_group.add_argument(
++    "--adapter-path", default=None,
++    help="Evaluate one explicit PEFT adapter instead of resolving the repository convention.",
++)
++adapter_group.add_argument(
++    "--no-adapter", action="store_true",
++    help="Evaluate only the untouched base model.",
++)
++parser.add_argument(
++    "--run-label", default="external",
++    help="Stable label for an explicit adapter/base run in CSV and raw-output paths.",
++)
+ 
+ # MTEB-specific
+ parser.add_argument("--tasks", type=str, default="sts",
+@@ -134,6 +147,10 @@ if args.only_adapter_weights:
+ # Adapter path (shared builder in conceptlib.paths)
+ # -------------------------------------------------
+ def build_adapter_dir(adapter_weight: str, ce_concept_token_weight: Optional[float] = None):
++    if args.no_adapter:
++        return None
++    if args.adapter_path:
++        return args.adapter_path
+     if adapter_weight == "base":
+         return None
+     return paths.adapter_dir(
+@@ -441,7 +458,9 @@ def main():
+                     rows.append(row)
+         return ecu.upsert_csv(args.csv_output, fieldnames, key_cols, base_dim, rows)
+ 
+-    if args.use_weighted_ce:
++    if args.adapter_path or args.no_adapter:
++        run_plan = [(args.run_label if args.adapter_path else args.run_label or "base", None)]
++    elif args.use_weighted_ce:
+         ce_weights = (2.0, 5.0, 10.0, 20.0, 50.0, 100.0)
+         if args.only_ce_weights:
+             keep = [float(s.strip()) for s in args.only_ce_weights.split(",")
+diff --git a/eval/eval_perplexity_explicit.py b/eval/eval_perplexity_explicit.py
+new file mode 100644
+index 0000000..14dfd5b
+--- /dev/null
++++ b/eval/eval_perplexity_explicit.py
+@@ -0,0 +1,93 @@
++"""Global and content-word NTP metrics for explicit base/checkpoint/adapter paths."""
++
++import argparse
++import json
++import math
++from pathlib import Path
++
++import torch
++import torch.nn.functional as F
++from peft import PeftConfig, PeftModel
++from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
++
++
++def load_model(reference, base_model, dtype, device, quantize_4bit=True):
++    quantization = None
++    load_kwargs = {"torch_dtype": dtype}
++    if quantize_4bit and device.type == "cuda":
++        quantization = BitsAndBytesConfig(
++            load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16,
++            bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=False,
++        )
++        load_kwargs = {"quantization_config": quantization, "device_map": {"": "cuda:0"}}
++    path = Path(reference)
++    if path.is_dir() and (path / "adapter_config.json").exists():
++        base = base_model or PeftConfig.from_pretrained(reference).base_model_name_or_path
++        model = AutoModelForCausalLM.from_pretrained(base, **load_kwargs)
++        model = PeftModel.from_pretrained(model, reference)
++    else:
++        model = AutoModelForCausalLM.from_pretrained(reference, **load_kwargs)
++    return model.eval() if quantization is not None else model.to(device).eval()
++
++
++@torch.no_grad()
++def evaluate(model, tokenizer, rows, max_length, device):
++    global_nll, content_nll, other_nll = [], [], []
++    alignment_failures = 0
++    for row in rows:
++        encoded = tokenizer(row["input_sequence"], truncation=True, max_length=max_length, return_tensors="pt")
++        ids = encoded["input_ids"].to(device)
++        logits = model(input_ids=ids, attention_mask=encoded["attention_mask"].to(device), use_cache=False).logits
++        losses = F.cross_entropy(logits[:, :-1].float().transpose(1, 2), ids[:, 1:], reduction="none")[0]
++        content_positions = set()
++        for slot in row.get("content_word_responses", row.get("content_words", [])):
++            position = int(slot["position"])
++            if 0 < position < ids.shape[1]:
++                expected = tokenizer.encode(" " + str(slot["word"]).strip(), add_special_tokens=False)
++                if len(expected) == 1 and expected[0] == int(ids[0, position]):
++                    content_positions.add(position - 1)
++                else:
++                    alignment_failures += 1
++        global_nll.extend(losses.tolist())
++        content_nll.extend(float(losses[p]) for p in sorted(content_positions))
++        other_nll.extend(float(losses[p]) for p in range(len(losses)) if p not in content_positions)
++
++    def report(values):
++        mean = sum(values) / len(values) if values else None
++        return {"n": len(values), "mean_nll": mean, "perplexity": math.exp(mean) if mean is not None else None}
++    return {
++        "global": report(global_nll),
++        "content_words": report(content_nll),
++        "other_positions": report(other_nll),
++        "alignment_failures": alignment_failures,
++    }
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--checkpoints", nargs="+", required=True)
++    parser.add_argument("--base-model", required=True)
++    parser.add_argument("--test-jsonl", required=True)
++    parser.add_argument("--output", required=True)
++    parser.add_argument("--max-length", type=int, default=256)
++    parser.add_argument("--no-quantize", action="store_true")
++    args = parser.parse_args()
++    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
++    tokenizer = AutoTokenizer.from_pretrained(args.base_model)
++    if tokenizer.pad_token_id is None:
++        tokenizer.pad_token = tokenizer.eos_token
++    rows = [json.loads(line) for line in open(args.test_jsonl) if line.strip()]
++    results = []
++    for checkpoint in args.checkpoints:
++        model = load_model(checkpoint, args.base_model, dtype, device, not args.no_quantize)
++        results.append({"checkpoint": checkpoint, **evaluate(model, tokenizer, rows, args.max_length, device)})
++        del model
++        if torch.cuda.is_available():
++            torch.cuda.empty_cache()
++    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
++    Path(args.output).write_text(json.dumps(results, indent=2) + "\n")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/test_hierarchy.py b/tests/test_hierarchy.py
+new file mode 100644
+index 0000000..2977b2c
+--- /dev/null
++++ b/tests/test_hierarchy.py
+@@ -0,0 +1,48 @@
++import torch
++import torch.nn.functional as F
++
++from conceptlib.sequence_scoring import continuation_log_probability
++from train_hierarchy import RELATION_TEMPLATES, relation_prompt
++
++
++def test_exact_multitoken_continuation_matches_bruteforce():
++    logits = torch.tensor([
++        [1.0, 0.0, -1.0],
++        [0.0, 2.0, -1.0],
++        [1.0, -1.0, 3.0],
++    ])
++    observed = continuation_log_probability(logits, [1, 2])
++    expected = F.log_softmax(logits[0], dim=-1)[1] + F.log_softmax(logits[1], dim=-1)[2]
++    assert torch.allclose(observed, expected)
++
++
++def test_every_multitoken_position_receives_gradient():
++    logits = torch.zeros((3, 4), requires_grad=True)
++    continuation_log_probability(logits, [1, 2]).backward()
++    assert logits.grad[0].abs().sum() > 0
++    assert logits.grad[1].abs().sum() > 0
++
++
++def test_hierarchy_bridge_is_explicitly_detached():
++    logits = torch.tensor([1.0, 2.0], requires_grad=True)
++    q = torch.softmax(logits, dim=0).detach()
++    relation_scores = torch.tensor([-2.0, -3.0], requires_grad=True)
++    loss = -torch.logsumexp(torch.log(q) + relation_scores, dim=0)
++    loss.backward()
++    assert logits.grad is None
++    assert relation_scores.grad is not None
++
++
++def test_exactly_three_registered_templates():
++    assert RELATION_TEMPLATES == (
++        "In this context, {substitute} is a type of",
++        "{substitute} and other",
++        "A more general term for {substitute} is",
++    )
++
++
++def test_relation_templates_preserve_context_and_substitute_identity():
++    for index in range(3):
++        prompt = relation_prompt("The terrier barked.", "terrier", index)
++        assert "The terrier barked." in prompt
++        assert "terrier" in prompt
+diff --git a/tests/test_objectives.py b/tests/test_objectives.py
+new file mode 100644
+index 0000000..7c218dd
+--- /dev/null
++++ b/tests/test_objectives.py
+@@ -0,0 +1,95 @@
++import torch
++import torch.nn.functional as F
++from types import SimpleNamespace
++
++from train import ConceptLossTrainer
++
++
++def _trainer(objective="set_marginal", contrast_beta=0.0, target_mass=1.1):
++    trainer = ConceptLossTrainer.__new__(ConceptLossTrainer)
++    trainer.concept_objective = objective
++    trainer.contrast_beta = contrast_beta
++    trainer.target_mass = target_mass
++    return trainer
++
++
++def test_single_member_objectives_equal_cross_entropy():
++    logits = torch.tensor([[[1.0, 2.0, -1.0]]], requires_grad=True)
++    expected = -F.log_softmax(logits[0, 0], dim=-1)[1]
++    args = (logits, [0], [0], [[1]], [[]])
++    marginal, _ = _trainer("set_marginal")._compute_concept_losses_vectorized(*args)
++    uniform, _ = _trainer("uniform")._compute_concept_losses_vectorized(*args)
++    assert torch.allclose(marginal, expected)
++    assert torch.allclose(uniform, expected)
++
++
++def test_released_set_marginal_matches_reference_implementation():
++    logits = torch.tensor([[[0.2, 1.3, -0.7, 0.8]]], requires_grad=True)
++    trainer = _trainer("set_marginal", target_mass=0.95)
++    observed, _ = trainer._compute_concept_losses_vectorized(
++        logits, [0], [0], [[1, 3]], [[]]
++    )
++    probabilities = F.softmax(logits[0, 0].float(), dim=-1)
++    mass = probabilities[1] + probabilities[3]
++    expected = torch.where(mass >= 0.95, torch.zeros_like(mass), -torch.log(mass.clamp(min=1e-9)))
++    assert torch.allclose(observed, expected, atol=1e-7)
++
++
++def test_uniform_does_not_inherit_set_mass_cutoff():
++    logits = torch.tensor([[[8.0, -8.0, -9.0]]], requires_grad=True)
++    uniform, _ = _trainer("uniform", target_mass=0.6)._compute_concept_losses_vectorized(
++        logits, [0], [0], [[0, 1]], [[]]
++    )
++    assert uniform.item() > 1.0
++
++
++def test_contrastive_is_zero_without_negatives_and_positive_with_them():
++    logits = torch.tensor([[[1.0, 2.0, 3.0]]], requires_grad=True)
++    trainer = _trainer("set_marginal", contrast_beta=1.0)
++    _, empty = trainer._compute_concept_losses_vectorized(
++        logits, [0], [0], [[1]], [[]]
++    )
++    _, present = trainer._compute_concept_losses_vectorized(
++        logits, [0], [0], [[1]], [[2]]
++    )
++    assert empty.item() == 0.0
++    assert present.item() > 0.0
++
++
++def test_every_uniform_candidate_receives_gradient():
++    logits = torch.zeros((1, 1, 4), requires_grad=True)
++    uniform, _ = _trainer("uniform")._compute_concept_losses_vectorized(
++        logits, [0], [0], [[1, 2]], [[]]
++    )
++    uniform.backward()
++    assert logits.grad[0, 0, 1].abs() > 0
++    assert logits.grad[0, 0, 2].abs() > 0
++
++
++def test_lambda_zero_is_exact_teacher_forced_ntp_and_ignores_padding():
++    # Must return the real output type: compute_loss reads
++    # outputs.get("logits", outputs[0]), and Python evaluates that default
++    # eagerly, so a plain dict raises KeyError(0) before .get() is ever called.
++    from transformers.modeling_outputs import CausalLMOutputWithPast
++
++    class ToyModel:
++        def __init__(self, logits):
++            self.logits = logits
++        def __call__(self, **kwargs):
++            return CausalLMOutputWithPast(logits=self.logits)
++
++    logits = torch.tensor([[[2.0, 0.0, -1.0], [0.0, 3.0, -2.0], [7.0, -4.0, 0.0]]])
++    trainer = ConceptLossTrainer.__new__(ConceptLossTrainer)
++    trainer.concept_loss_weight = 0
++    trainer.contrast_beta = 0
++    trainer.use_weighted_ce = False
++    trainer._is_evaluating = False
++    trainer.state = SimpleNamespace(global_step=0)
++    trainer.args = SimpleNamespace(logging_steps=50)
++    ids = torch.tensor([[0, 1, 2]])
++    mask = torch.tensor([[1, 1, 0]])
++    observed = trainer.compute_loss(ToyModel(logits), {
++        "input_ids": ids, "attention_mask": mask, "content_words": [[]]
++    })
++    expected = F.cross_entropy(logits[:, 0, :], ids[:, 1])
++    assert torch.allclose(observed, expected)
+diff --git a/train.py b/train.py
+index 0778a31..497e1cd 100644
+--- a/train.py
++++ b/train.py
+@@ -132,20 +132,47 @@ class ConceptDataset(Dataset):
+ 
+                     seen = {target_token_id}
+                     synonym_first_ids = []
++                    synonym_surfaces = []
+                     for synonym in tw.get('synonyms', []):
+                         try:
+                             encoded = tokenizer.encode(' ' + synonym, add_special_tokens=False)
+                         except Exception:
+                             continue
+-                        if encoded and encoded[0] not in seen:
++                        # The released embedding pipeline is designed to emit
++                        # complete single-token concepts.  Reject rather than
++                        # silently truncate an unexpected multi-token value.
++                        if len(encoded) == 1 and encoded[0] not in seen:
+                             seen.add(encoded[0])
+                             synonym_first_ids.append(int(encoded[0]))
++                            synonym_surfaces.append(str(synonym).strip())
++
++                    negative_token_ids = []
++                    negative_seen = set(seen)
++                    for negative in tw.get('negatives', []):
++                        try:
++                            encoded = tokenizer.encode(' ' + str(negative).strip(), add_special_tokens=False)
++                        except Exception:
++                            continue
++                        # Zhang et al.'s pipeline is intentionally single-token.
++                        # Reject rather than truncate a multi-token negative.
++                        if len(encoded) == 1 and encoded[0] not in negative_seen:
++                            negative_seen.add(encoded[0])
++                            negative_token_ids.append(int(encoded[0]))
+ 
+                     content_words_processed.append({
+                         'position': position,
+                         'shift_position': position - 1,
+                         'target_token_id': target_token_id,
+                         'synonym_token_ids': synonym_first_ids,
++                        'word': word,
++                        'pos': tw.get('pos'),
++                        'synonym_surfaces': synonym_surfaces,
++                        'negative_token_ids': negative_token_ids,
++                        'hypernyms': list(tw.get('hypernyms', [])),
++                        'shuffled_hypernyms': list(tw.get('shuffled_hypernyms', [])),
++                        'synset': tw.get('synset'),
++                        'wordnet_depth': tw.get('wordnet_depth'),
++                        'hierarchy_exclusion_reason': tw.get('hierarchy_exclusion_reason'),
+                     })
+ 
+                 if not content_words_processed:
+@@ -155,6 +182,7 @@ class ConceptDataset(Dataset):
+                     'input_ids': input_ids_seq,
+                     'attention_mask': attention_mask_seq,
+                     'content_words': content_words_processed,
++                    'input_sequence': input_sequence,
+                 })
+ 
+         if max_samples and max_samples > 0:
+@@ -175,14 +203,31 @@ class ConceptDataset(Dataset):
+             'input_ids': item['input_ids'],
+             'attention_mask': item['attention_mask'],
+             'content_words': item['content_words'],
++            'input_sequence': item.get('input_sequence', ''),
+         }
+ 
+ 
+ class ConceptLossTrainer(Trainer):
+     """Custom Trainer that uses concept loss based on synonyms."""
+ 
+-    def __init__(self, concept_loss_weight=0, max_synonyms_per_content_word=None, max_content_words=None, target_mass=0.3, model_name="", randomized_synonyms=False, use_weighted_ce=False, ce_concept_token_weight=5.0, **kwargs):
++    def __init__(
++        self,
++        concept_loss_weight=0,
++        max_synonyms_per_content_word=None,
++        max_content_words=None,
++        target_mass=0.3,
++        model_name="",
++        randomized_synonyms=False,
++        use_weighted_ce=False,
++        ce_concept_token_weight=5.0,
++        concept_objective="set_marginal",
++        slot_ntp_weight=None,
++        contrast_beta=0.0,
++        **kwargs,
++    ):
+         super().__init__(**kwargs)
++        if concept_objective not in {"set_marginal", "uniform"}:
++            raise ValueError("concept_objective must be set_marginal or uniform")
+         self.concept_loss_weight = concept_loss_weight
+         self.max_synonyms_per_content_word = max_synonyms_per_content_word
+         self.max_content_words = max_content_words
+@@ -197,6 +242,12 @@ class ConceptLossTrainer(Trainer):
+         self._is_evaluating = False
+         self._last_eval_metrics = {}
+         self.randomized_synonyms = randomized_synonyms
++        self.concept_objective = concept_objective
++        # None preserves the released Zhang et al. interpolation exactly:
++        # slot CE is weighted by 1-lambda.  Setting 1.0 implements the retained
++        # observed-token term used by our uniform objective.
++        self.slot_ntp_weight = slot_ntp_weight
++        self.contrast_beta = float(contrast_beta)
+ 
+     def get_eval_dataloader(self, eval_dataset=None):
+         """Create eval dataloader that adds labels for loss computation."""
+@@ -258,7 +309,11 @@ class ConceptLossTrainer(Trainer):
+ 
+         # Skip concept-loss work entirely when its weight is 0 and we're not in
+         # weighted-CE mode (which needs concept timesteps for its own weighting).
+-        skip_concept_work = (self.concept_loss_weight == 0) and not self.use_weighted_ce
++        skip_concept_work = (
++            self.concept_loss_weight == 0
++            and self.contrast_beta == 0
++            and not self.use_weighted_ce
++        )
+ 
+         if skip_concept_work:
+             concept_loss = torch.tensor(0.0, device=logits.device)
+@@ -266,12 +321,16 @@ class ConceptLossTrainer(Trainer):
+             ce_loss = (per_token_ce * valid.float()).sum() / N_total
+             training_loss = ce_loss
+         else:
+-            flat_b_idx, flat_shift_idx, flat_concept_ids = self._build_concept_targets(
++            flat_b_idx, flat_shift_idx, flat_concept_ids, flat_negative_ids = self._build_concept_targets(
+                 content_words_list, batch_size, shift_len
+             )
+ 
+-            concept_loss = self._compute_concept_loss_vectorized(
+-                logits, flat_b_idx, flat_shift_idx, flat_concept_ids
++            concept_loss, contrast_loss = self._compute_concept_losses_vectorized(
++                logits,
++                flat_b_idx,
++                flat_shift_idx,
++                flat_concept_ids,
++                flat_negative_ids,
+             )
+ 
+             if self.use_weighted_ce:
+@@ -282,7 +341,7 @@ class ConceptLossTrainer(Trainer):
+                     ce_weights[b_t, s_t] = self.ce_concept_token_weight
+                 denom = (ce_weights * valid.float()).sum().clamp(min=1e-8)
+                 ce_loss = (per_token_ce * ce_weights * valid.float()).sum() / denom
+-                training_loss = ce_loss
++                training_loss = ce_loss + self.contrast_beta * contrast_loss
+             else:
+                 target_mask = torch.zeros(batch_size, shift_len, dtype=torch.bool, device=logits.device)
+                 if flat_b_idx:
+@@ -301,10 +360,23 @@ class ConceptLossTrainer(Trainer):
+                 ce_loss_non_targets = (per_token_ce * non_target_valid.float()).sum() / N_non_target.clamp(min=1e-8)
+                 ce_loss_targets = (per_token_ce * target_valid.float()).sum() / N_target.clamp(min=1e-8)
+ 
++                slot_ntp_weight = (
++                    1 - self.concept_loss_weight
++                    if self.slot_ntp_weight is None
++                    else float(self.slot_ntp_weight)
++                )
+                 training_loss = (
+                     N_non_target * ce_loss_non_targets
+-                    + (1 - self.concept_loss_weight) * N_target * ce_loss_targets
+-                ) / N_total + self.concept_loss_weight * concept_loss
++                    + slot_ntp_weight * N_target * ce_loss_targets
++                ) / N_total
++                training_loss = (
++                    training_loss
++                    + self.concept_loss_weight * concept_loss
++                    + self.contrast_beta * contrast_loss
++                )
++
++        if skip_concept_work:
++            contrast_loss = torch.tensor(0.0, device=logits.device)
+ 
+         ce_loss_val = ce_loss.detach().item()
+         concept_loss_val = concept_loss.detach().item()
+@@ -319,6 +391,7 @@ class ConceptLossTrainer(Trainer):
+                 self.log({
+                     "ce_loss": ce_loss_val,
+                     "concept_loss": concept_loss_val,
++                    "contrast_loss": contrast_loss.detach().item(),
+                     "perplexity": perplexity,
+                 })
+ 
+@@ -343,6 +416,7 @@ class ConceptLossTrainer(Trainer):
+         flat_b_idx = []
+         flat_shift_idx = []
+         flat_concept_ids = []
++        flat_negative_ids = []
+ 
+         for b in range(batch_size):
+             content_words = content_words_list[b]
+@@ -354,7 +428,12 @@ class ConceptLossTrainer(Trainer):
+                     k = len(content_words) // 4
+                 elif max_content_words == "one":
+                     k = 1
+-                rng = random.Random(self.state.global_step * batch_size + b)
++                # Seed-dependent: without args.seed the same content words are
++                # subsampled at every step for every seed, so a three-seed run
++                # would vary only in init and shuffling.
++                rng = random.Random(
++                    self.state.global_step * batch_size + b + 7919 * int(self.args.seed)
++                )
+                 content_words = rng.sample(content_words, k)
+ 
+             for tw in content_words:
+@@ -382,10 +461,25 @@ class ConceptLossTrainer(Trainer):
+                 flat_b_idx.append(b)
+                 flat_shift_idx.append(shift_pos)
+                 flat_concept_ids.append(ids)
+-
+-        return flat_b_idx, flat_shift_idx, flat_concept_ids
+-
+-    def _compute_concept_loss_vectorized(self, logits, flat_b_idx, flat_shift_idx, flat_concept_ids):
++                negatives = []
++                seen_ids = set(ids)
++                for token_id in tw.get('negative_token_ids', []):
++                    token_id = int(token_id)
++                    if token_id not in seen_ids:
++                        seen_ids.add(token_id)
++                        negatives.append(token_id)
++                flat_negative_ids.append(negatives)
++
++        return flat_b_idx, flat_shift_idx, flat_concept_ids, flat_negative_ids
++
++    def _compute_concept_losses_vectorized(
++        self,
++        logits,
++        flat_b_idx,
++        flat_shift_idx,
++        flat_concept_ids,
++        flat_negative_ids,
++    ):
+         """
+         Vectorized concept loss:
+           - Gather logits only at target shift positions: [num_targets, V].
+@@ -394,7 +488,8 @@ class ConceptLossTrainer(Trainer):
+           - Apply margin (hinge) loss at target_mass.
+         """
+         if not flat_b_idx:
+-            return torch.tensor(0.0, device=logits.device, requires_grad=True)
++            zero = torch.tensor(0.0, device=logits.device, requires_grad=True)
++            return zero, zero
+ 
+         device = logits.device
+         b_t = torch.tensor(flat_b_idx, device=device, dtype=torch.long)
+@@ -402,7 +497,7 @@ class ConceptLossTrainer(Trainer):
+ 
+         # logits[b, shift_pos] = logits at index shift_pos predicts token at shift_pos+1.
+         target_logits = logits[b_t, s_t]                    # [num_targets, V]
+-        target_probs = F.softmax(target_logits.float(), dim=-1)
++        target_log_probs = F.log_softmax(target_logits.float(), dim=-1)
+ 
+         num_targets = len(flat_concept_ids)
+         max_concept = max(len(ids) for ids in flat_concept_ids)
+@@ -413,18 +508,45 @@ class ConceptLossTrainer(Trainer):
+             padded_ids[i, :n] = torch.tensor(ids, dtype=torch.long, device=device)
+             valid_mask[i, :n] = True
+ 
+-        gathered = target_probs.gather(1, padded_ids)        # [num_targets, max_concept]
+-        mass = (gathered * valid_mask.float()).sum(dim=1)    # [num_targets]
++        gathered_log = target_log_probs.gather(1, padded_ids)
++        gathered_log = gathered_log.masked_fill(~valid_mask, float("-inf"))
++        log_mass = torch.logsumexp(gathered_log, dim=1)
++        mass = log_mass.exp()
+ 
+         # Margin loss: zero contribution above target_mass, -log(mass) below.
+         # torch.where evaluates both branches; clamp keeps log finite either way.
+-        neg_log = -torch.log(mass.clamp(min=1e-9))
+-        loss_per_target = torch.where(
+-            mass >= self.target_mass,
+-            torch.zeros_like(mass),
+-            neg_log,
++        if self.concept_objective == "set_marginal":
++            neg_log = -log_mass
++            loss_per_target = torch.where(
++                mass >= self.target_mass,
++                torch.zeros_like(mass),
++                neg_log,
++            )
++        else:
++            # The mass cutoff is deliberately not applied to the uniform
++            # objective: high total mass can coexist with a near-zero member,
++            # which is exactly what this loss is intended to correct.
++            safe_log = gathered_log.masked_fill(~valid_mask, 0.0)
++            loss_per_target = -(safe_log.sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1))
++
++        contrast_losses = []
++        if self.contrast_beta:
++            for row, negative_ids in enumerate(flat_negative_ids):
++                if not negative_ids:
++                    continue
++                neg_ids = torch.tensor(negative_ids, device=device, dtype=torch.long)
++                negative_log = target_log_probs[row].gather(0, neg_ids)
++                positive_log = gathered_log[row][valid_mask[row]]
++                all_log = torch.cat([positive_log, negative_log])
++                contrast_losses.append(
++                    torch.logsumexp(all_log, dim=0) - torch.logsumexp(positive_log, dim=0)
++                )
++        contrast_loss = (
++            torch.stack(contrast_losses).mean()
++            if contrast_losses
++            else target_logits.sum() * 0.0
+         )
+-        return loss_per_target.mean()
++        return loss_per_target.mean(), contrast_loss
+ 
+     def compute_metrics(self, eval_pred):
+         """Compute and return evaluation metrics from accumulated values."""
+@@ -512,6 +634,19 @@ class EvalMetricsCallback(TrainerCallback):
+                 logger.warning("wandb.run is None, cannot log metrics")
+ 
+ 
++class JsonlHistoryCallback(TrainerCallback):
++    """Write scalar learning curves only; never serialise trainer state."""
++
++    def __init__(self, path):
++        self.path = pathlib.Path(path)
++        self.path.parent.mkdir(parents=True, exist_ok=True)
++
++    def on_log(self, args, state, control, logs=None, **kwargs):
++        if logs:
++            with self.path.open("a", encoding="utf-8") as handle:
++                handle.write(json.dumps({"step": state.global_step, **logs}) + "\n")
++
++
+ def collate_fn(examples, tokenizer):
+     """Custom collate function for concept dataset."""
+     input_ids = pad_sequence(
+@@ -527,11 +662,13 @@ def collate_fn(examples, tokenizer):
+ 
+     # List of lists: content_words_list[b] = [{word, position, synonyms}, ...] for sequence b
+     content_words_list = [ex['content_words'] for ex in examples]
++    input_sequences = [ex.get('input_sequence', '') for ex in examples]
+ 
+     return {
+         'input_ids': input_ids,
+         'attention_mask': attention_mask,
+         'content_words': content_words_list,
++        'input_sequences': input_sequences,
+     }
+ 
+ 
+@@ -627,6 +764,42 @@ def parse_args():
+         default=None,
+         help='Weight for concept loss (default: use value from config)'
+     )
++    parser.add_argument(
++        '--concept-objective',
++        choices=['set_marginal', 'uniform'],
++        default=None,
++        help='Concept loss form. Default preserves the released set marginal.',
++    )
++    parser.add_argument(
++        '--slot-ntp-weight',
++        type=float,
++        default=None,
++        help='Explicit CE weight at concept slots. Omit to preserve 1-lambda.',
++    )
++    parser.add_argument(
++        '--contrast-beta',
++        type=float,
++        default=None,
++        help='Weight on set-level InfoNCE over per-slot negatives.',
++    )
++    parser.add_argument('--seed', type=int, default=None)
++    parser.add_argument('--output-dir', type=str, default=None)
++    parser.add_argument('--train-file', type=str, default=None,
++                        help='Explicit training JSONL; overrides repository path resolution.')
++    parser.add_argument('--validation-file', type=str, default=None,
++                        help='Explicit validation JSONL; overrides repository path resolution.')
++    parser.add_argument('--negative-candidate-file', type=str, default=None,
++                        help='Training JSONL enriched with per-slot negatives; alias for --train-file.')
++    parser.add_argument('--per-device-train-batch-size', type=int, default=None)
++    parser.add_argument('--gradient-accumulation-steps', type=int, default=None)
++    parser.add_argument(
++        '--save-strategy', choices=['no', 'epoch'], default=None,
++        help='Checkpoint policy; final LoRA adapter is always saved once.',
++    )
++    parser.add_argument(
++        '--report-to', choices=['none', 'wandb'], default=None,
++        help='Disable W&B for reproducible unattended Colab runs.',
++    )
+     parser.add_argument(
+         '--model-name',
+         type=str,
+@@ -684,7 +857,7 @@ def parse_args():
+     )
+     parser.add_argument(
+         '--num-train-epochs',
+-        type=int,
++        type=float,
+         default=None,
+         help='Number of train epochs (default: use value from config)'
+     )
+@@ -707,6 +880,22 @@ def main():
+     if args.concept_loss_weight is not None:
+         logger.info(f"Overriding concept_loss_weight from command line: {args.concept_loss_weight}")
+         config.concept_loss_weight = args.concept_loss_weight
++    if args.concept_objective is not None:
++        config.concept_objective = args.concept_objective
++    if args.slot_ntp_weight is not None:
++        config.slot_ntp_weight = args.slot_ntp_weight
++    if args.contrast_beta is not None:
++        config.contrast_beta = args.contrast_beta
++    if args.seed is not None:
++        config.seed = args.seed
++    if args.save_strategy is not None:
++        config.save_strategy = args.save_strategy
++    if args.report_to is not None:
++        config.use_wandb = args.report_to == 'wandb'
++    if args.per_device_train_batch_size is not None:
++        config.per_device_train_batch_size = args.per_device_train_batch_size
++    if args.gradient_accumulation_steps is not None:
++        config.gradient_accumulation_steps = args.gradient_accumulation_steps
+ 
+     if args.model_name is not None:
+         logger.info(f"Overriding model_name from command line: {args.model_name}")
+@@ -753,7 +942,7 @@ def main():
+     content_word_tag = "all_content_words" if config.max_content_words is None else f"{config.max_content_words}_content_words"
+ 
+     data_base_dir = dataset_dir(dataset_name, config.model_name, dataset_type)
+-    val_path = os.path.join(data_base_dir, "synonyms_val.jsonl")
++    val_path = args.validation_file or os.path.join(data_base_dir, "synonyms_val.jsonl")
+ 
+     # Pick the training file and a short run-name tag for the active ablation.
+     if config.randomized_synonyms:
+@@ -772,17 +961,29 @@ def main():
+         train_path = os.path.join(data_base_dir, "synonyms_train.jsonl")
+         run_tag = None
+ 
+-    config.output_dir = adapter_dir(
+-        dataset_name, config.model_name, dataset_type,
+-        max_content_words=config.max_content_words,
+-        randomized_synonyms=config.randomized_synonyms,
+-        use_weighted_ce=config.use_weighted_ce,
+-        ce_concept_token_weight=config.ce_concept_token_weight,
+-        max_train_samples=config.max_train_samples,
+-        use_data_augmentation=args.use_data_augmentation,
+-        num_train_epochs=config.num_train_epochs,
+-        concept_loss_weight=config.concept_loss_weight,
+-    )
++    if args.train_file and args.negative_candidate_file:
++        raise ValueError("pass only one of --train-file and --negative-candidate-file")
++    train_path = args.negative_candidate_file or args.train_file or train_path
++
++    if args.output_dir:
++        config.output_dir = args.output_dir
++    else:
++        config.output_dir = adapter_dir(
++            dataset_name, config.model_name, dataset_type,
++            max_content_words=config.max_content_words,
++            randomized_synonyms=config.randomized_synonyms,
++            use_weighted_ce=config.use_weighted_ce,
++            ce_concept_token_weight=config.ce_concept_token_weight,
++            max_train_samples=config.max_train_samples,
++            use_data_augmentation=args.use_data_augmentation,
++            num_train_epochs=config.num_train_epochs,
++            concept_loss_weight=config.concept_loss_weight,
++        )
++    if os.path.abspath(config.output_dir).startswith("/content/drive/"):
++        raise ValueError(
++            "Model/adapter output must remain under ephemeral /content; "
++            "Google Drive is reserved for metrics and plots."
++        )
+ 
+     run_name_parts = [dataset_name, suffix, dataset_type, content_word_tag]
+     if run_tag:
+@@ -793,6 +994,10 @@ def main():
+     os.makedirs(config.output_dir, exist_ok=True)
+ 
+     logger.info(f"Using concept_loss_weight: {config.concept_loss_weight}")
++    logger.info(f"Using concept_objective: {config.concept_objective}")
++    logger.info(f"Using slot_ntp_weight: {config.slot_ntp_weight}")
++    logger.info(f"Using contrast_beta: {config.contrast_beta}")
++    logger.info(f"Using seed: {config.seed}")
+     logger.info(f"Using model_name: {config.model_name}")
+     logger.info(f"Using dataset: {config.dataset}")
+     logger.info(f"Using randomized_synonyms: {config.randomized_synonyms}")
+@@ -807,6 +1012,10 @@ def main():
+     logger.info(f"Using max_train_samples: {config.max_train_samples}")
+     logger.info(f"Using num_train_epochs: {config.num_train_epochs}")
+     logger.info(f"Using use_data_augmentation: {args.use_data_augmentation}")
++    logger.info(
++        "Effective batch size: %s",
++        config.per_device_train_batch_size * config.gradient_accumulation_steps,
++    )
+ 
+     if args.use_data_augmentation:
+         assert config.concept_loss_weight == 0, (
+@@ -877,7 +1086,7 @@ def main():
+         optim="adamw_torch_fused",
+     )
+ 
+-    callbacks = []
++    callbacks = [JsonlHistoryCallback(os.path.join(config.output_dir, "training_history.jsonl"))]
+     if eval_dataset and config.early_stopping:
+         callbacks.append(
+             EarlyStoppingCallback(
+@@ -904,6 +1113,9 @@ def main():
+         randomized_synonyms=config.randomized_synonyms,
+         use_weighted_ce=config.use_weighted_ce,
+         ce_concept_token_weight=config.ce_concept_token_weight,
++        concept_objective=config.concept_objective,
++        slot_ntp_weight=config.slot_ntp_weight,
++        contrast_beta=config.contrast_beta,
+         callbacks=callbacks,
+     )
+ 
+@@ -916,6 +1128,27 @@ def main():
+     logger.info(f"\nSaving final model to {config.output_dir}...")
+     trainer.save_model(config.output_dir)
+     tokenizer.save_pretrained(config.output_dir)
++    with open(os.path.join(config.output_dir, "concept_training_config.json"), "w") as handle:
++        json.dump({
++            "upstream_commit": "b1d414143d11c8ed988b4cccbb06626cc8272bbe",
++            "model_name": config.model_name,
++            "dataset": config.dataset,
++            "dataset_type": dataset_type,
++            "seed": config.seed,
++            "concept_loss_weight": config.concept_loss_weight,
++            "concept_objective": config.concept_objective,
++            "slot_ntp_weight": config.slot_ntp_weight,
++            "contrast_beta": config.contrast_beta,
++            "target_mass": config.target_mass,
++            "num_train_epochs": config.num_train_epochs,
++            "learning_rate": config.learning_rate,
++            "per_device_train_batch_size": config.per_device_train_batch_size,
++            "gradient_accumulation_steps": config.gradient_accumulation_steps,
++            "effective_batch_size": (
++                config.per_device_train_batch_size * config.gradient_accumulation_steps
++            ),
++            "save_strategy": config.save_strategy,
++        }, handle, indent=2, sort_keys=True)
+     logger.info(f"Model saved to {config.output_dir}")
+ 
+     if config.use_wandb:
+diff --git a/train_hierarchy.py b/train_hierarchy.py
+new file mode 100644
+index 0000000..8ac437c
+--- /dev/null
++++ b/train_hierarchy.py
+@@ -0,0 +1,289 @@
++"""QLoRA training for independent, conditioned, and shuffled hierarchies."""
++
++import argparse
++import json
++import os
++import random
++from pathlib import Path
++
++import numpy as np
++import torch
++from transformers import TrainingArguments, TrainerCallback
++
++from conceptlib.config import TrainingConfig
++from conceptlib.sequence_scoring import exact_candidate_log_probs
++from train import ConceptDataset, ConceptLossTrainer, collate_fn, setup_model_and_tokenizer
++
++
++RELATION_TEMPLATES = (
++    "In this context, {substitute} is a type of",
++    "{substitute} and other",
++    "A more general term for {substitute} is",
++)
++
++
++def relation_prompt(context, substitute, template_index):
++    template = RELATION_TEMPLATES[template_index]
++    return f"Context: {context}\n{template.format(substitute=substitute)}"
++
++
++class JsonlHistoryCallback(TrainerCallback):
++    """Retain small scalar logs without model or optimizer checkpoints."""
++
++    def __init__(self, path):
++        self.path = Path(path)
++        self.path.parent.mkdir(parents=True, exist_ok=True)
++
++    def on_log(self, args, state, control, logs=None, **kwargs):
++        if logs:
++            with self.path.open("a") as handle:
++                handle.write(json.dumps({"step": state.global_step, **logs}) + "\n")
++
++
++class HierarchyTrainer(ConceptLossTrainer):
++    """Adds exact sequence-level hierarchy supervision to the flat objective."""
++
++    def __init__(
++        self,
++        hierarchy_mode="conditioned",
++        hierarchy_weight=0.25,
++        hierarchy_max_length=256,
++        candidate_microbatch_size=16,
++        max_hierarchy_slots_per_batch=1,
++        **kwargs,
++    ):
++        super().__init__(**kwargs)
++        if hierarchy_mode not in {"independent", "conditioned", "shuffled"}:
++            raise ValueError("unknown hierarchy mode")
++        self.hierarchy_mode = hierarchy_mode
++        self.hierarchy_weight = float(hierarchy_weight)
++        self.hierarchy_max_length = int(hierarchy_max_length)
++        self.candidate_microbatch_size = int(candidate_microbatch_size)
++        self.max_hierarchy_slots_per_batch = int(max_hierarchy_slots_per_batch)
++        self.hierarchy_seen = 0
++        self.hierarchy_skipped = 0
++        self.hierarchy_prefix_collisions = 0
++
++    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
++        flat_loss, outputs = super().compute_loss(
++            model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch
++        )
++        logits = outputs["logits"]
++        sequences = inputs.get("input_sequences", [])
++        rows = inputs.get("content_words", [])
++        slot_losses = []
++
++        processed_this_batch = 0
++        for batch_index, slots in enumerate(rows):
++            context = sequences[batch_index]
++            slots = list(slots)
++            # Seed-dependent, so the slot order and the relation template actually
++            # differ across seeds.  Otherwise three seeds share one template
++            # sequence and the template-robustness claim is untested.
++            slot_rng = random.Random(
++                (self.state.global_step + 1) * 1009 + batch_index + 7919 * int(self.args.seed)
++            )
++            slot_rng.shuffle(slots)
++            for local_index, slot in enumerate(slots):
++                if processed_this_batch >= self.max_hierarchy_slots_per_batch:
++                    break
++                hypernyms = (
++                    slot.get("shuffled_hypernyms", [])
++                    if self.hierarchy_mode == "shuffled"
++                    else slot.get("hypernyms", [])
++                )
++                hypernyms = sorted({str(x).strip() for x in hypernyms if str(x).strip()})
++                # Deduplicate equivalent token sequences and exclude set-mass
++                # events where one continuation is a strict prefix of another.
++                by_tokens = {}
++                for hypernym in hypernyms:
++                    token_ids = tuple(self.processing_class.encode(
++                        " " + hypernym, add_special_tokens=False
++                    ))
++                    if token_ids:
++                        by_tokens.setdefault(token_ids, hypernym)
++                token_sequences = list(by_tokens)
++                has_prefix_collision = any(
++                    len(a) < len(b) and b[: len(a)] == a
++                    for a in token_sequences for b in token_sequences
++                )
++                if has_prefix_collision:
++                    self.hierarchy_prefix_collisions += 1
++                    self.hierarchy_skipped += 1
++                    continue
++                hypernyms = list(by_tokens.values())
++                if not hypernyms or slot.get("pos") not in {"NOUN", "VERB", "n", "v"}:
++                    self.hierarchy_skipped += 1
++                    continue
++
++                surfaces = [str(slot.get("word", "")).strip()]
++                token_ids = [int(slot["target_token_id"])]
++                if self.hierarchy_mode != "independent":
++                    for surface, token_id in zip(
++                        slot.get("synonym_surfaces", []), slot.get("synonym_token_ids", [])
++                    ):
++                        if surface and int(token_id) not in token_ids:
++                            surfaces.append(str(surface).strip())
++                            token_ids.append(int(token_id))
++                if not surfaces:
++                    self.hierarchy_skipped += 1
++                    continue
++
++                shift = int(slot["shift_position"])
++                bridge_logits = logits[batch_index, shift].float()
++                q = torch.softmax(bridge_logits[torch.tensor(token_ids, device=logits.device)], dim=0)
++                q = q.detach()  # The hierarchy head must not reshape the synonym bridge.
++
++                template_index = slot_rng.randrange(len(RELATION_TEMPLATES))
++                pairs = []
++                counts = []
++                for surface in surfaces:
++                    prompt = relation_prompt(context, surface, template_index)
++                    candidates = [(prompt, " " + hypernym) for hypernym in hypernyms]
++                    pairs.extend(candidates)
++                    counts.append(len(candidates))
++
++                try:
++                    candidate_scores = exact_candidate_log_probs(
++                        model,
++                        self.processing_class,
++                        pairs,
++                        max_length=self.hierarchy_max_length,
++                        microbatch_size=self.candidate_microbatch_size,
++                    )
++                except ValueError:
++                    # A tokenizer boundary merge or an over-long continuation makes one
++                    # slot unscoreable.  Skip and count it; never abort a multi-hour run.
++                    self.hierarchy_skipped += 1
++                    continue
++                per_surface = []
++                cursor = 0
++                for count in counts:
++                    per_surface.append(torch.logsumexp(candidate_scores[cursor : cursor + count], dim=0))
++                    cursor += count
++                log_bridge = torch.log(q.clamp_min(1e-12))
++                slot_losses.append(-torch.logsumexp(log_bridge + torch.stack(per_surface), dim=0))
++                self.hierarchy_seen += 1
++                processed_this_batch += 1
++            if processed_this_batch >= self.max_hierarchy_slots_per_batch:
++                break
++
++        hierarchy_loss = (
++            torch.stack(slot_losses).mean() if slot_losses else logits.sum() * 0.0
++        )
++        total = flat_loss + self.hierarchy_weight * hierarchy_loss
++        if not self._is_evaluating and self.state.global_step % self.args.logging_steps == 0:
++            self.log({
++                "hierarchy_loss": float(hierarchy_loss.detach()),
++                "hierarchy_slots_seen": self.hierarchy_seen,
++                "hierarchy_slots_skipped": self.hierarchy_skipped,
++                "hierarchy_prefix_collisions": self.hierarchy_prefix_collisions,
++            })
++        if return_outputs:
++            return total, outputs
++        return total
++
++
++def parse_args():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--model-name", default="meta-llama/Llama-3.2-1B")
++    parser.add_argument("--train-file", required=True)
++    parser.add_argument("--validation-file", required=True)
++    parser.add_argument("--output-dir", required=True)
++    parser.add_argument("--hierarchy-mode", choices=["independent", "conditioned", "shuffled"], required=True)
++    parser.add_argument("--gamma", type=float, default=0.25)
++    parser.add_argument("--concept-loss-weight", type=float, default=1.0)
++    parser.add_argument("--concept-objective", choices=["set_marginal", "uniform"], default="set_marginal")
++    parser.add_argument("--slot-ntp-weight", type=float, default=None)
++    parser.add_argument("--contrast-beta", type=float, default=0.0)
++    parser.add_argument("--seed", type=int, default=42)
++    parser.add_argument("--epochs", type=float, default=5.0)
++    parser.add_argument("--learning-rate", type=float, default=7e-5)
++    parser.add_argument("--per-device-batch-size", type=int, default=8)
++    parser.add_argument("--gradient-accumulation-steps", type=int, default=2)
++    parser.add_argument("--candidate-microbatch-size", type=int, default=16)
++    parser.add_argument("--max-hierarchy-slots-per-batch", type=int, default=1)
++    parser.add_argument("--report-to", choices=["none", "wandb"], default="none")
++    return parser.parse_args()
++
++
++def main():
++    args = parse_args()
++    output = Path(args.output_dir).resolve()
++    if str(output).startswith("/content/drive/"):
++        raise ValueError("Adapters/checkpoints must remain under ephemeral /content, not Drive")
++    output.mkdir(parents=True, exist_ok=True)
++
++    random.seed(args.seed)
++    np.random.seed(args.seed)
++    torch.manual_seed(args.seed)
++    if torch.cuda.is_available():
++        torch.cuda.manual_seed_all(args.seed)
++
++    config = TrainingConfig()
++    config.model_name = args.model_name
++    config.learning_rate = args.learning_rate
++    config.per_device_train_batch_size = args.per_device_batch_size
++    config.gradient_accumulation_steps = args.gradient_accumulation_steps
++    model, tokenizer = setup_model_and_tokenizer(config)
++    train_data = ConceptDataset(args.train_file, tokenizer, max_length=config.max_length)
++    validation_data = ConceptDataset(args.validation_file, tokenizer, max_length=config.max_length)
++
++    training_args = TrainingArguments(
++        output_dir=str(output),
++        num_train_epochs=args.epochs,
++        per_device_train_batch_size=args.per_device_batch_size,
++        per_device_eval_batch_size=args.per_device_batch_size,
++        gradient_accumulation_steps=args.gradient_accumulation_steps,
++        learning_rate=args.learning_rate,
++        weight_decay=config.weight_decay,
++        warmup_ratio=config.warmup_ratio,
++        lr_scheduler_type=config.lr_scheduler_type,
++        logging_steps=config.logging_steps,
++        eval_strategy="epoch",
++        save_strategy="no",
++        load_best_model_at_end=False,
++        bf16=config.bf16,
++        fp16=config.fp16,
++        remove_unused_columns=False,
++        report_to=args.report_to,
++        seed=args.seed,
++        optim="adamw_torch_fused",
++    )
++    trainer = HierarchyTrainer(
++        model=model,
++        args=training_args,
++        train_dataset=train_data,
++        eval_dataset=validation_data,
++        data_collator=lambda examples: collate_fn(examples, tokenizer),
++        processing_class=tokenizer,
++        callbacks=[JsonlHistoryCallback(output / "training_history.jsonl")],
++        concept_loss_weight=args.concept_loss_weight,
++        concept_objective=args.concept_objective,
++        slot_ntp_weight=args.slot_ntp_weight,
++        contrast_beta=args.contrast_beta,
++        target_mass=config.target_mass,
++        max_synonyms_per_content_word=config.max_synonyms_per_content_word,
++        max_content_words=config.max_content_words,
++        hierarchy_mode=args.hierarchy_mode,
++        hierarchy_weight=args.gamma,
++        hierarchy_max_length=config.max_length,
++        candidate_microbatch_size=args.candidate_microbatch_size,
++        max_hierarchy_slots_per_batch=args.max_hierarchy_slots_per_batch,
++    )
++    trainer.train()
++    trainer.save_model(str(output))  # one final LoRA adapter; no optimizer state
++    tokenizer.save_pretrained(str(output))
++    (output / "hierarchy_training_config.json").write_text(json.dumps({
++        **vars(args),
++        "templates": RELATION_TEMPLATES,
++        "effective_batch_size": args.per_device_batch_size * args.gradient_accumulation_steps,
++        "upstream_commit": "b1d414143d11c8ed988b4cccbb06626cc8272bbe",
++        "hierarchy_slots_seen": trainer.hierarchy_seen,
++        "hierarchy_slots_skipped": trainer.hierarchy_skipped,
++        "hierarchy_prefix_collisions": trainer.hierarchy_prefix_collisions,
++    }, indent=2, sort_keys=True) + "\n")
++
++
++if __name__ == "__main__":
++    main()

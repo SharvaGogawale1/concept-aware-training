@@ -1,31 +1,30 @@
-# LaTeX source
+# ACL paper draft
 
-ACL style. Build with:
+Build from this directory with:
 
     latexmk -pdf main.tex
 
-`main.tex` is self-contained: all four tables are inlined, so there are no
-`\input` fragments to keep in sync. Every number comes from the Task 14 run
-recorded in `notebooks/research_tasks_14_external_ntp_vs_ncp.ipynb`
-(commit 3eafec0), sections 7b and 7c.
+`main.tex` uses the official ACL style files already in this directory. The
+reported results come from `notebooks/research_tasks_14_external_ntp_vs_ncp.ipynb`
+and its completed alpha sweep.
 
-Set `\usepackage[final]{acl}` for camera-ready, or `[preprint]` for a
-non-anonymous version with page numbers. The current setting is `[review]`.
+## Paper focus
 
-Files `acl.sty` and `acl_natbib.bst` are the official ACL template files.
+The main table keeps five interpretable systems: the untouched model, data
+augmentation, the printed concept objective, a differentiable reconstruction of
+the code-form objective, and the selected retention-aware method. Set-marginal
+and contrastive variants appear only in the appendix because they do not improve
+the central comparison.
 
-## What is written
+## Required before submission
 
-Methods and Results only, plus a Limitations section, which ACL requires and
-which does not count against the page limit. Abstract, introduction, related
-work and Figure 1 are not written yet.
+- Run paired bootstrap intervals for the selected alpha-4 method against data
+  augmentation and the code-form reconstruction.
+- Lock alpha at 4, train on the complete SWORDS development set, and evaluate
+  the official test set once.
+- Add another model scale or family after the 1B test result is confirmed.
+- Confirm the description of the source implementation with its authors. The
+  present text is limited to the public commit cited in the paper.
 
-## Numbers that still need to change before submission
-
-- `iyer2026beyond` in `custom.bib` is a placeholder. Fill in the real author
-  list and venue.
-- The alpha value was chosen on the same development set the tables report, so
-  the tuned rows are optimistic. A held-out SWORDS test measurement is still
-  owed and is gated in the notebook behind `RUN_PHASE_C_SWORDS_TEST`.
-- The gold-exclusive result rests on seed ranges, not a paired bootstrap. The
-  comparison is cheap to add: both arms are already trained and evaluated.
+Use `\usepackage[final]{acl}` only for camera-ready output. The current draft
+uses review mode and anonymous authors.

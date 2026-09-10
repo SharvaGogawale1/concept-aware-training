@@ -1,4 +1,4 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.27 (TeX Live 2025) (preloaded format=pdflatex 2025.5.1)  9 SEP 2026 20:15
+This is pdfTeX, Version 3.141592653-2.6-1.40.27 (TeX Live 2025) (preloaded format=pdflatex 2025.5.1)  9 SEP 2026 21:23
 entering extended mode
  restricted \write18 enabled.
  %&-line parsing enabled.
@@ -445,24 +445,24 @@ File: l3backend-pdftex.def 2024-05-08 L3 backend support: PDF output (pdfTeX)
 (./main.aux)
 \openout1 = `main.aux'.
 
-LaTeX Font Info:    Checking defaults for OML/cmm/m/it on input line 32.
-LaTeX Font Info:    ... okay on input line 32.
-LaTeX Font Info:    Checking defaults for OMS/cmsy/m/n on input line 32.
-LaTeX Font Info:    ... okay on input line 32.
-LaTeX Font Info:    Checking defaults for OT1/cmr/m/n on input line 32.
-LaTeX Font Info:    ... okay on input line 32.
-LaTeX Font Info:    Checking defaults for T1/cmr/m/n on input line 32.
-LaTeX Font Info:    ... okay on input line 32.
-LaTeX Font Info:    Checking defaults for TS1/cmr/m/n on input line 32.
-LaTeX Font Info:    ... okay on input line 32.
-LaTeX Font Info:    Checking defaults for OMX/cmex/m/n on input line 32.
-LaTeX Font Info:    ... okay on input line 32.
-LaTeX Font Info:    Checking defaults for U/cmr/m/n on input line 32.
-LaTeX Font Info:    ... okay on input line 32.
-LaTeX Font Info:    Checking defaults for PD1/pdf/m/n on input line 32.
-LaTeX Font Info:    ... okay on input line 32.
-LaTeX Font Info:    Checking defaults for PU/pdf/m/n on input line 32.
-LaTeX Font Info:    ... okay on input line 32.
+LaTeX Font Info:    Checking defaults for OML/cmm/m/it on input line 25.
+LaTeX Font Info:    ... okay on input line 25.
+LaTeX Font Info:    Checking defaults for OMS/cmsy/m/n on input line 25.
+LaTeX Font Info:    ... okay on input line 25.
+LaTeX Font Info:    Checking defaults for OT1/cmr/m/n on input line 25.
+LaTeX Font Info:    ... okay on input line 25.
+LaTeX Font Info:    Checking defaults for T1/cmr/m/n on input line 25.
+LaTeX Font Info:    ... okay on input line 25.
+LaTeX Font Info:    Checking defaults for TS1/cmr/m/n on input line 25.
+LaTeX Font Info:    ... okay on input line 25.
+LaTeX Font Info:    Checking defaults for OMX/cmex/m/n on input line 25.
+LaTeX Font Info:    ... okay on input line 25.
+LaTeX Font Info:    Checking defaults for U/cmr/m/n on input line 25.
+LaTeX Font Info:    ... okay on input line 25.
+LaTeX Font Info:    Checking defaults for PD1/pdf/m/n on input line 25.
+LaTeX Font Info:    ... okay on input line 25.
+LaTeX Font Info:    Checking defaults for PU/pdf/m/n on input line 25.
+LaTeX Font Info:    ... okay on input line 25.
 
 (/usr/local/texlive/2025/texmf-dist/tex/context/base/mkii/supp-pdf.mkii
 [Loading MPS to PDF converter (version 2006.09.02).]
@@ -523,25 +523,25 @@ e
 Package caption Info: Begin \AtBeginDocument code.
 Package caption Info: hyperref package is loaded.
 Package caption Info: End \AtBeginDocument code.
-Package hyperref Info: Link coloring ON on input line 32.
+Package hyperref Info: Link coloring ON on input line 25.
 (./main.out) (./main.out)
 \@outlinefile=\write3
 \openout3 = `main.out'.
 
-LaTeX Info: Redefining \microtypecontext on input line 32.
-Package microtype Info: Applying patch `item' on input line 32.
-Package microtype Info: Applying patch `toc' on input line 32.
-Package microtype Info: Applying patch `eqnum' on input line 32.
-Package microtype Info: Applying patch `footnote' on input line 32.
-Package microtype Info: Applying patch `verbatim' on input line 32.
-LaTeX Info: Redefining \microtypesetup on input line 32.
+LaTeX Info: Redefining \microtypecontext on input line 25.
+Package microtype Info: Applying patch `item' on input line 25.
+Package microtype Info: Applying patch `toc' on input line 25.
+Package microtype Info: Applying patch `eqnum' on input line 25.
+Package microtype Info: Applying patch `footnote' on input line 25.
+Package microtype Info: Applying patch `verbatim' on input line 25.
+LaTeX Info: Redefining \microtypesetup on input line 25.
 Package microtype Info: Generating PDF output.
 Package microtype Info: Character protrusion enabled (level 2).
 Package microtype Info: Using default protrusion set `alltext'.
 Package microtype Info: Automatic font expansion enabled (level 2),
 (microtype)             stretch: 20, shrink: 20, step: 1, non-selected.
 Package microtype Info: Using default expansion set `alltext-nott'.
-LaTeX Info: Redefining \showhyphens on input line 32.
+LaTeX Info: Redefining \showhyphens on input line 25.
 Package microtype Info: No adjustment of tracking.
 Package microtype Info: No adjustment of interword spacing.
 Package microtype Info: No adjustment of character kerning.
@@ -557,112 +557,147 @@ tim
 File: mt-cmr.cfg 2013/05/19 v2.2 microtype config. file: Computer Modern Roman 
 (RS)
 )
-LaTeX Font Info:    Trying to load font information for U+lasy on input line 33
+LaTeX Font Info:    Trying to load font information for U+lasy on input line 26
 .
 
 (/usr/local/texlive/2025/texmf-dist/tex/latex/base/ulasy.fd
 File: ulasy.fd 1998/08/17 v2.2e LaTeX symbol font definitions
 )
 
-
-Underfull \hbox (badness 10000) in paragraph at lines 75--81
- []\T1/ptm/b/n/10.95 (+20) Contrastive.[] \T1/ptm/m/n/10.95 (+20) An In-foNCE t
-erm over the
- []
-
-LaTeX Font Info:    Trying to load font information for T1+zi4 on input line 99
-.
-(/usr/local/texlive/2025/texmf-dist/tex/latex/inconsolata/t1zi4.fd
-File: t1zi4.fd 2018/01/14 T1/zi4 (Inconsolata)
+LaTeX Font Info:    Trying to load font information for TS1+ptm on input line 7
+1.
+(/usr/local/texlive/2025/texmf-dist/tex/latex/psnfss/ts1ptm.fd
+File: ts1ptm.fd 2001/06/04 font definitions for TS1/ptm.
 )
-LaTeX Font Info:    Font shape `T1/zi4/m/n' will be
-(Font)              scaled to size 10.95pt on input line 99.
-Package microtype Info: Loading generic protrusion settings for font family
-(microtype)             `zi4' (encoding: T1).
-(microtype)             For optimal results, create family-specific settings.
-(microtype)             See the microtype manual for details.
-
-Underfull \hbox (badness 10000) in paragraph at lines 98--105
-[]\T1/ptm/m/n/10.95 (+20) Their re-leased trainer com-putes \T1/zi4/m/n/10.95 l
-oss
- []
-
-
-Underfull \hbox (badness 6927) in paragraph at lines 98--105
-\T1/zi4/m/n/10.95 = base_loss - (loss_adjustment /
- []
-
-
-Underfull \hbox (badness 6691) in paragraph at lines 98--105
-\T1/zi4/m/n/10.95 valid_count)\T1/ptm/m/n/10.95 (+20) , where \T1/zi4/m/n/10.95
- loss_adjustment /
- []
-
-
-Underfull \hbox (badness 2837) in paragraph at lines 106--114
-\T1/ptm/m/n/10.95 (+20) the re-leased code ac-tu-ally op-ti-mises. The
- []
-
-
 
 [1{/usr/local/texlive/2025/texmf-var/fonts/map/pdftex/updmap/pdftex.map}{/usr/l
 ocal/texlive/2025/texmf-dist/fonts/enc/dvips/base/8r.enc}
 
 
 
-{/usr/local/texlive/2025/texmf-dist/fonts/enc/dvips/inconsolata/i4-t1-0.enc}]
-
-
-
-[2]
-
-
-Overfull \hbox (4.2853pt too wide) in paragraph at lines 296--309
- [][] 
+]
+Underfull \hbox (badness 1655) in paragraph at lines 112--120
+ []\T1/ptm/b/n/10.95 (+20) Lexical sub-sti-tu-tion and lex-i-cal en-tail-ment.[
+]
  []
 
 
 
-[3]
 
-(./main.bbl)
+Underfull \hbox (badness 3907) in paragraph at lines 174--178
+ []\T1/ptm/b/n/10.95 (+20) Ordinary lan-guage mod-elling.[] \T1/ptm/m/n/10.95 (
++20) The causal
+ []
 
-[4] (./main.aux)
+
+
+[2]
+Underfull \hbox (badness 2181) in paragraph at lines 213--218
+\T1/ptm/m/n/10.95 (+20) The source pa-per presents $\OML/cmm/m/it/10.95 L\OT1/c
+mr/m/n/10.95 (\OML/cmm/m/it/10.95 T[] \OMS/cmsy/m/n/10.95 j \OML/cmm/m/it/10.95
+ S\OT1/cmr/m/n/10.95 ) =
+ []
+
+LaTeX Font Info:    Trying to load font information for T1+zi4 on input line 22
+4.
+(/usr/local/texlive/2025/texmf-dist/tex/latex/inconsolata/t1zi4.fd
+File: t1zi4.fd 2018/01/14 T1/zi4 (Inconsolata)
+)
+LaTeX Font Info:    Font shape `T1/zi4/m/n' will be
+(Font)              scaled to size 10.95pt on input line 224.
+Package microtype Info: Loading generic protrusion settings for font family
+(microtype)             `zi4' (encoding: T1).
+(microtype)             For optimal results, create family-specific settings.
+(microtype)             See the microtype manual for details.
+LaTeX Font Info:    Font shape `T1/zi4/m/n' will be
+(Font)              scaled to size 9.0pt on input line 231.
+
+Underfull \hbox (badness 1184) in paragraph at lines 238--240
+ []\T1/ptm/b/n/10.95 (+20) Untouched model (\T1/ptm/b/sc/10.95 (+20) Base\T1/pt
+m/b/n/10.95 (+20) ).[] \T1/ptm/m/n/10.95 (+20) Llama-3.2-1B is
+ []
+
+
+Underfull \hbox (badness 1052) in paragraph at lines 238--240
+\T1/ptm/m/n/10.95 (+20) eval-u-ated be-fore post-training. It es-tab-lishes
+ []
+
+
+
+
+Underfull \hbox (badness 2913) in paragraph at lines 242--245
+ []\T1/ptm/b/n/10.95 (+20) Data aug-men-ta-tion (\T1/ptm/b/sc/10.95 (+20) Augme
+nt\T1/ptm/b/n/10.95 (+20) ).[] \T1/ptm/m/n/10.95 (+20) Each ac-
+ []
+
+
+
+[3{/usr/local/texlive/2025/texmf-dist/fonts/enc/dvips/inconsolata/i4-t1-0.enc}]
+
+
+
+
+[4]
+
+
+Underfull \hbox (badness 1383) in paragraph at lines 441--448
+[]\T1/ptm/m/n/10.95 (+20) The choice be-tween per-candidate and set-
+ []
+
+
+Underfull \hbox (badness 1755) in paragraph at lines 441--448
+\T1/ptm/m/n/10.95 (+20) the set marginal can rely on a sin-gle high-
+ []
+
+
+
+[5]
+
+(./main.bbl
+LaTeX Font Info:    Font shape `T1/zi4/m/n' will be
+(Font)              scaled to size 10.0pt on input line 13.
+)
+
+[6] (./main.aux)
  ***********
 LaTeX2e <2024-11-01> patch level 2
 L3 programming layer <2025-01-18>
  ***********
 Package rerunfilecheck Info: File `main.out' has not changed.
-(rerunfilecheck)             Checksum: E3E8825F83F6224CFD7894D9F7581765;2572.
+(rerunfilecheck)             Checksum: 9833E10CF80FFE7E9D09445C60574C0F;3235.
  ) 
 Here is how much of TeX's memory you used:
- 15234 strings out of 473190
- 241909 string characters out of 5715801
- 713189 words of memory out of 5000000
- 37959 multiletter control sequences out of 15000+600000
- 626323 words of font info for 275 fonts, out of 8000000 for 9000
+ 15444 strings out of 473190
+ 244594 string characters out of 5715801
+ 708653 words of memory out of 5000000
+ 38030 multiletter control sequences out of 15000+600000
+ 650278 words of font info for 352 fonts, out of 8000000 for 9000
  1141 hyphenation exceptions out of 8191
- 84i,11n,93p,1001b,567s stack positions out of 10000i,1000n,20000p,200000b,200000s
+ 84i,11n,93p,1001b,531s stack positions out of 10000i,1000n,20000p,200000b,200000s
 </usr/local/texlive/2025/texmf-dist/fonts/type1/public/inconsolata/Inconsolat
 a-zi4r.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/c
 mex10.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cm
 mi10.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmm
-i8.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi9
-.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmr10.p
-fb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmr8.pfb>
-</usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmr9.pfb></u
-sr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy10.pfb></us
-r/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy6.pfb></usr/
-local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy8.pfb></usr/lo
-cal/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy9.pfb></usr/loca
-l/texlive/2025/texmf-dist/fonts/type1/urw/helvetic/uhvb8a.pfb></usr/local/texli
-ve/2025/texmf-dist/fonts/type1/urw/times/utmb8a.pfb></usr/local/texlive/2025/te
-xmf-dist/fonts/type1/urw/times/utmr8a.pfb></usr/local/texlive/2025/texmf-dist/f
-onts/type1/urw/times/utmri8a.pfb>
-Output written on main.pdf (4 pages, 197740 bytes).
+i6.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi7
+.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi8.p
+fb></usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi9.pfb
+></usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmr10.pfb><
+/usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmr6.pfb></us
+r/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmr7.pfb></usr/l
+ocal/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmr8.pfb></usr/loca
+l/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmr9.pfb></usr/local/t
+exlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy10.pfb></usr/local/te
+xlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy7.pfb></usr/local/texl
+ive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy8.pfb></usr/local/texliv
+e/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy9.pfb></usr/local/texlive/
+2025/texmf-dist/fonts/type1/urw/helvetic/uhvb8a.pfb></usr/local/texlive/2025/te
+xmf-dist/fonts/type1/urw/times/utmb8a.pfb></usr/local/texlive/2025/texmf-dist/f
+onts/type1/urw/times/utmr8a.pfb></usr/local/texlive/2025/texmf-dist/fonts/type1
+/urw/times/utmri8a.pfb>
+Output written on main.pdf (6 pages, 246787 bytes).
 PDF statistics:
- 208 PDF objects out of 1000 (max. 8388607)
- 166 compressed objects within 2 object streams
- 33 named destinations out of 1000 (max. 500000)
- 60009 words of extra memory for PDF output out of 61914 (max. 10000000)
+ 303 PDF objects out of 1000 (max. 8388607)
+ 252 compressed objects within 3 object streams
+ 58 named destinations out of 1000 (max. 500000)
+ 83625 words of extra memory for PDF output out of 89155 (max. 10000000)
 

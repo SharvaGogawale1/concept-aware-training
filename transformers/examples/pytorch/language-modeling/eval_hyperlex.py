@@ -63,15 +63,14 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from sequence_ncp_trainer import encode_candidate_continuation, sequence_log_probs_from_logits
+from checkpoint_loading import load_causal_lm
 
 # Directional templates. Each maps (hyponym x, hypernym y) -> (context, continuation).
 # Mixed Hearst-style and copular frames; the mean over templates is the score.
 TEMPLATES: List[Tuple[str, str]] = [
-    ("A {x} is a type of", "{y}"),
-    ("A {x} is a kind of", "{y}"),
+    ("In this context, {x} is a type of", "{y}"),
     ("{x} and other", "{y}"),
-    ("{x} or some other", "{y}"),
-    ("The {x} is a", "{y}"),
+    ("A more general term for {x} is", "{y}"),
 ]
 NEUTRAL_CONTEXT = "The word is"  # frequency baseline for the PMI correction
 
@@ -90,6 +89,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoints", nargs="+", required=True)
     parser.add_argument("--tokenizer_path", required=True)
+    parser.add_argument("--base_model", default=None,
+                        help="base model override when a checkpoint is a PEFT adapter")
     parser.add_argument("--hyperlex", required=True, help="a hyperlex-*.txt / split file")
     parser.add_argument("--results_json", required=True)
     parser.add_argument("--pos", nargs="+", default=["N"], choices=["N", "V"],
@@ -257,6 +258,7 @@ def evaluate_checkpoint(model: Any, tokenizer: Any, rows: Sequence[Dict[str, Any
         ),
         "by_type": {},
         "template_metrics": [],
+        "by_pos": {},
     }
 
     grouped: Dict[str, List[int]] = defaultdict(list)
@@ -269,6 +271,16 @@ def evaluate_checkpoint(model: Any, tokenizer: Any, rows: Sequence[Dict[str, Any
             "n": len(positions),
             "mean_score": statistics.fmean(score[p] for p in positions),
             "mean_gold": statistics.fmean(gold[p] for p in positions),
+        }
+
+    for pos in sorted({rows[i]["pos"] for i in usable}):
+        positions = [p for p, i in enumerate(usable) if rows[i]["pos"] == pos]
+        result["by_pos"][pos] = {
+            "n": len(positions),
+            "spearman_gold": spearman(
+                [score[p] for p in positions], [gold[p] for p in positions]
+            ),
+            "mean_score": statistics.fmean(score[p] for p in positions),
         }
 
     # Directionality: on a true hypernym pair, does x -> y outscore y -> x?
@@ -370,7 +382,9 @@ def main() -> None:
     results = []
     for checkpoint in args.checkpoints:
         print(f"\n=== {checkpoint} ===")
-        model = AutoModelForCausalLM.from_pretrained(checkpoint, torch_dtype=dtype).to(device).eval()
+        model = load_causal_lm(
+            checkpoint, dtype=dtype, device=device, base_model=args.base_model
+        )
         model.config.pad_token_id = tokenizer.pad_token_id
         record = {"checkpoint": checkpoint, **evaluate_checkpoint(model, tokenizer, rows, args, device)}
         print(f"  spearman(gold)          = {record['spearman_gold']}")

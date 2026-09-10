@@ -25,12 +25,15 @@ from sequence_ncp_trainer import (
     parse_candidate_list,
     sequence_log_probs_from_logits,
 )
+from checkpoint_loading import load_causal_lm
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoints", nargs="+", required=True)
     parser.add_argument("--tokenizer_path", required=True)
+    parser.add_argument("--base_model", default=None,
+                        help="base model override when a checkpoint is a PEFT adapter")
     parser.add_argument(
         "--concept_csv",
         nargs="+",
@@ -369,9 +372,12 @@ def main() -> None:
     results = []
     for checkpoint in args.checkpoints:
         print(f"\n=== Evaluating {checkpoint} ===")
-        model = AutoModelForCausalLM.from_pretrained(
-            checkpoint, torch_dtype=_dtype(args.torch_dtype, device)
-        ).to(device).eval()
+        model = load_causal_lm(
+            checkpoint,
+            dtype=_dtype(args.torch_dtype, device),
+            device=device,
+            base_model=args.base_model,
+        )
         model.config.pad_token_id = tokenizer.pad_token_id
         if vanilla_paths is None:
             ntp: Dict[str, Any] = evaluate_ntp(

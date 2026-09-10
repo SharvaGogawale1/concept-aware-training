@@ -1,15 +1,36 @@
-\begin{thebibliography}{2}
+\begin{thebibliography}{5}
 \providecommand{\natexlab}[1]{#1}
 
-\bibitem[{Iyer et~al.(2026)}]{iyer2026beyond}
-Laya Iyer et~al. 2026.
-\newblock Beyond tokens: Concept-aware language model training.
+\bibitem[{Grattafiori et~al.(2024)}]{grattafiori2024llama}
+Aaron Grattafiori et~al. 2024.
+\newblock The {Llama 3} herd of models.
+\newblock \emph{arXiv preprint arXiv:2407.21783}.
+
+\bibitem[{Ivan(2024)}]{ivan2024bmsemlex}
+Ioana Ivan. 2024.
+\newblock bm-semlex: Benchmarking lexical substitution with {SemCor} and
+  {WordNet}.
+\newblock \url{https://github.com/ioana-ivan/bm-semlex}.
+\newblock Accessed at commit 2677b1e.
+
+\bibitem[{Iyer et~al.(2026)Iyer, Somani, Guo, Jurafsky, and
+  Shani}]{iyer2026beyond}
+Laya Iyer, Pranav Somani, Alice Guo, Dan Jurafsky, and Chen Shani. 2026.
+\newblock Beyond tokens: Concept-level training objectives for {LLM}s.
 \newblock \emph{arXiv preprint arXiv:2601.11791}.
 
 \bibitem[{Lee et~al.(2021)Lee, Donahue, Iyer, Jia, and Liang}]{lee2021swords}
 Mina Lee, Chris Donahue, Robin Iyer, Robin Jia, and Percy Liang. 2021.
-\newblock Swords: A benchmark for lexical substitution with improved data
+\newblock {SWORDS}: A benchmark for lexical substitution with improved data
   coverage and quality.
-\newblock In \emph{Proceedings of NAACL-HLT}.
+\newblock In \emph{Proceedings of the 2021 Conference of the North American
+  Chapter of the Association for Computational Linguistics: Human Language
+  Technologies}.
+
+\bibitem[{Vuli{\'c} et~al.(2017)Vuli{\'c}, Gerz, Kiela, Hill, and
+  Korhonen}]{vulic2017hyperlex}
+Ivan Vuli{\'c}, Daniela Gerz, Douwe Kiela, Felix Hill, and Anna Korhonen. 2017.
+\newblock {HyperLex}: A large-scale evaluation of graded lexical entailment.
+\newblock \emph{Computational Linguistics}, 43(4):781--835.
 
 \end{thebibliography}

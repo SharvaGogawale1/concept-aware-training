@@ -50,12 +50,15 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from sequence_ncp_trainer import encode_candidate_continuation, sequence_log_probs_from_logits
+from checkpoint_loading import load_causal_lm
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoints", nargs="+", required=True)
     parser.add_argument("--tokenizer_path", required=True)
+    parser.add_argument("--base_model", default=None,
+                        help="base model override when a checkpoint is a PEFT adapter")
     parser.add_argument("--data", required=True, help="curated_200.tsv")
     parser.add_argument("--results_json", required=True)
     parser.add_argument("--modes", nargs="+", default=["left", "full"], choices=["left", "full"])
@@ -198,7 +201,9 @@ def main() -> None:
     results = []
     for checkpoint in args.checkpoints:
         print(f"\n=== {checkpoint} ===")
-        model = AutoModelForCausalLM.from_pretrained(checkpoint, torch_dtype=dtype).to(device).eval()
+        model = load_causal_lm(
+            checkpoint, dtype=dtype, device=device, base_model=args.base_model
+        )
         model.config.pad_token_id = tokenizer.pad_token_id
         record = {"checkpoint": checkpoint, **evaluate_checkpoint(model, tokenizer, rows, args, device)}
         for mode in args.modes:
