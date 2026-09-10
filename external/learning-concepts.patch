@@ -521,7 +521,7 @@ index 0000000..b498df5
 +if __name__ == "__main__":
 +    main()
 diff --git a/data/embedding_synonyms.py b/data/embedding_synonyms.py
-index bc223d3..d26bccb 100644
+index bc223d3..0ecda32 100644
 --- a/data/embedding_synonyms.py
 +++ b/data/embedding_synonyms.py
 @@ -65,6 +65,22 @@ NEXT_TOKEN_STARTS = (
@@ -547,7 +547,17 @@ index bc223d3..d26bccb 100644
  class EmbeddingSynonymExtractor:
      def __init__(self, config: TrainingConfig):
          self.config = config
-@@ -94,6 +110,9 @@ class EmbeddingSynonymExtractor:
+@@ -81,6 +97,9 @@ class EmbeddingSynonymExtractor:
+         tokenizer.padding_side = "right"
+ 
+         quantization_config = None
++        if not self.config.use_4bit:
++            # Log both branches: the absence of a line is not evidence of bf16.
++            logger.info("Loading in bf16 (extraction precision: NOT quantized)")
+         if self.config.use_4bit:
+             logger.info("Using 4-bit quantization")
+             quantization_config = BitsAndBytesConfig(
+@@ -94,6 +113,9 @@ class EmbeddingSynonymExtractor:
          model = AutoModelForCausalLM.from_pretrained(
              self.config.model_name,
              quantization_config=quantization_config,
@@ -557,7 +567,7 @@ index bc223d3..d26bccb 100644
              device_map="auto",
              trust_remote_code=True,
          )
-@@ -144,7 +163,7 @@ class EmbeddingSynonymExtractor:
+@@ -144,7 +166,7 @@ class EmbeddingSynonymExtractor:
                  )
                  for k, v in zip(keys, values)
              )
@@ -566,7 +576,7 @@ index bc223d3..d26bccb 100644
              attn_mask = torch.ones(b, idx + 1, device=device, dtype=torch.long)
              position_ids = torch.full((b, 1), idx, device=device, dtype=torch.long)
              cache_position = torch.tensor([idx], device=device, dtype=torch.long)
-@@ -164,7 +183,7 @@ class EmbeddingSynonymExtractor:
+@@ -164,7 +186,7 @@ class EmbeddingSynonymExtractor:
      def _rank_target(self, input_ids, logits, hidden_last, past_kv, idx, word):
          """Rank candidates for one target by cosine sim to the contextual rep.
  
@@ -575,7 +585,7 @@ index bc223d3..d26bccb 100644
            - `pairs`: top POS_CHECK_TOP `(cand_word_clean, score)` sorted desc.
            - `topk_words`: the full filtered candidate pool (≤TOPK_LOGITS, post
              alphanumeric + whole-word + ≠target filter), stripped.
-@@ -177,7 +196,7 @@ class EmbeddingSynonymExtractor:
+@@ -177,7 +199,7 @@ class EmbeddingSynonymExtractor:
                  f"Target '{word}' at idx {idx} does not match decoded token "
                  f"'{decoded_target}'; skipping."
              )
@@ -584,7 +594,7 @@ index bc223d3..d26bccb 100644
  
          prev_logits = logits[0, idx - 1, :]
          topk = torch.topk(prev_logits, k=TOPK_LOGITS)
-@@ -203,7 +222,7 @@ class EmbeddingSynonymExtractor:
+@@ -203,7 +225,7 @@ class EmbeddingSynonymExtractor:
              for t in decoded
          ]
          if not any(keep):
@@ -593,7 +603,7 @@ index bc223d3..d26bccb 100644
          keep_t = torch.tensor(keep, device=cand_ids.device)
          cand_ids = cand_ids[keep_t]
          decoded = [t for t, k in zip(decoded, keep) if k]
-@@ -220,7 +239,7 @@ class EmbeddingSynonymExtractor:
+@@ -220,7 +242,7 @@ class EmbeddingSynonymExtractor:
              if sims_list[i] >= MIN_COSINE
          ]
          pairs.sort(key=lambda x: -x[1])
@@ -602,7 +612,7 @@ index bc223d3..d26bccb 100644
  
      def analyze_sequence(self, row, save_path, topk_save_path):
          input_text = row["input_sequence"]
-@@ -265,16 +284,17 @@ class EmbeddingSynonymExtractor:
+@@ -265,16 +287,17 @@ class EmbeddingSynonymExtractor:
                  targets.append({
                      "word": word, "idx": idx,
                      "word_start": None, "word_end": None,
@@ -622,7 +632,7 @@ index bc223d3..d26bccb 100644
              })
  
          # Phase 2: batch every spaCy parse for this sequence into one pipe call.
-@@ -320,6 +340,7 @@ class EmbeddingSynonymExtractor:
+@@ -320,6 +343,7 @@ class EmbeddingSynonymExtractor:
              responses.append({
                  "word": t["word"],
                  "position": t["idx"],
@@ -630,7 +640,7 @@ index bc223d3..d26bccb 100644
                  "synonyms": [w for w, _ in survivors],
                  "scores": [round(s, 4) for _, s in survivors],
              })
-@@ -332,8 +353,14 @@ class EmbeddingSynonymExtractor:
+@@ -332,8 +356,14 @@ class EmbeddingSynonymExtractor:
              }) + "\n")
  
          topk_records = [
@@ -647,7 +657,7 @@ index bc223d3..d26bccb 100644
          ]
          os.makedirs(os.path.dirname(topk_save_path), exist_ok=True)
          with open(topk_save_path, "a") as f:
-@@ -344,10 +371,17 @@ class EmbeddingSynonymExtractor:
+@@ -344,10 +374,17 @@ class EmbeddingSynonymExtractor:
          return 1
  
  
@@ -666,7 +676,7 @@ index bc223d3..d26bccb 100644
      extractor = EmbeddingSynonymExtractor(config)
  
      base_dir = dataset_dir(dataset, config.model_name)
-@@ -383,5 +417,9 @@ if __name__ == "__main__":
+@@ -383,5 +420,9 @@ if __name__ == "__main__":
      parser.add_argument("--start", type=int, default=None, help="Start line index (0-based, inclusive)")
      parser.add_argument("--end", type=int, default=None, help="End line index (0-based, exclusive)")
      parser.add_argument("--model", type=str, default=None, help="HuggingFace model name; overrides TrainingConfig.model_name")
