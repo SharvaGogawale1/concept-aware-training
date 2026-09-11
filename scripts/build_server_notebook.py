@@ -31,8 +31,9 @@ print("transformers", transformers.__version__, "| torch", torch.__version__,
 
 SETUP = r'''
 import os
-# Pick a free GPU BEFORE torch initialises CUDA.  nvidia-smi showed 2 and 3 busy.
-GPU_ID = "0"
+# Pick a free GPU BEFORE torch initialises CUDA.  Override without editing this
+# file:  GPU_ID=1 jupyter nbconvert --execute ...
+GPU_ID = os.environ.get("GPU_ID", "0")
 os.environ["CUDA_VISIBLE_DEVICES"] = GPU_ID
 
 from pathlib import Path
