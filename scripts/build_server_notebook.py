@@ -58,6 +58,14 @@ RUN_MULTISEED = False
 SEEDS = [PRIMARY_SEED] + ([123, 2024] if RUN_MULTISEED else [])
 UPSTREAM_COMMIT = "b1d414143d11c8ed988b4cccbb06626cc8272bbe"
 
+# Capture an existing `huggingface-cli login` BEFORE redirecting HF_HOME.  The
+# token lives under the DEFAULT HF_HOME, so once we move HF_HOME into the project
+# directory a freshly spawned child finds no token and gated downloads 401 --
+# even though the parent, which imported huggingface_hub earlier, looks fine.
+# Exporting HF_TOKEN makes auth explicit and inherited by every subprocess.
+_cli_token = Path.home() / ".cache" / "huggingface" / "token"
+if not os.environ.get("HF_TOKEN") and _cli_token.is_file():
+    os.environ["HF_TOKEN"] = _cli_token.read_text().strip()
 os.environ["HF_HOME"] = str(WORK / "hf_cache")
 
 RUN_DATA = True
@@ -209,14 +217,20 @@ run([sys.executable, MAIN / "builddataset/verify_task14_data.py",
 (OUTPUTS / "environment_freeze.txt").write_text(
     subprocess.check_output([sys.executable, "-m", "pip", "freeze"], text=True))
 
-# Gated model.  Either export HF_TOKEN before launching Jupyter, or run
-# `huggingface-cli login` once on this machine.
-if os.environ.get("HF_TOKEN"):
-    from huggingface_hub import login
-    login(token=os.environ["HF_TOKEN"], add_to_git_credential=False)
-    print("logged in from HF_TOKEN")
-else:
-    print("No HF_TOKEN set; relying on a previous `huggingface-cli login`.")
+# Llama-3.2-1B is gated.  Fail here rather than 20 minutes later inside a child
+# process: a missing token surfaces as a 401 on config.json from a subprocess
+# whose traceback says nothing about authentication.
+from huggingface_hub import login, whoami
+assert os.environ.get("HF_TOKEN"), (
+    "No Hugging Face token.  Run `huggingface-cli login` on this machine, or "
+    "export HF_TOKEN before starting Jupyter, then re-run this cell.")
+login(token=os.environ["HF_TOKEN"], add_to_git_credential=False)
+print("Hugging Face:", whoami()["name"])
+subprocess.run([sys.executable, "-c",
+                "from transformers import AutoConfig;"
+                "AutoConfig.from_pretrained('meta-llama/Llama-3.2-1B');"
+                "print('gated repo reachable from a subprocess')"],
+               env={**os.environ}, check=True)
 '''
 
 RENAME = [
