@@ -194,16 +194,19 @@ else:
     run(["git", "-C", str(MAIN), "pull", "--ff-only"])
 if not EXT.exists():
     run(["git", "clone", "https://github.com/christine-zhang1/learning-concepts.git", EXT])
-run(["git", "checkout", "--detach", UPSTREAM_COMMIT], cwd=EXT)
+# Reset to the pinned commit and wipe every patch artefact before re-applying.
+# Testing "does it apply, else does it reverse-apply" only worked while the patch
+# never changed: once MAIN pulls a newer one, the old patch is applied, neither
+# direction matches, and the run dies on an assertion.  Resetting is idempotent
+# and always ends in the same state.  EXT holds upstream code only -- the corpus
+# lives in DATA, outside it -- so clean -fd is safe.
+run(["git", "-C", str(EXT), "reset", "--hard", UPSTREAM_COMMIT])
+run(["git", "-C", str(EXT), "clean", "-fdq"])
 
 patch_file = MAIN / "external" / "learning-concepts.patch"
 assert patch_file.exists(), f"{patch_file} missing; push it before running here."
-check = subprocess.run(["git", "apply", "--check", str(patch_file)], cwd=EXT)
-if check.returncode == 0:
-    run(["git", "apply", str(patch_file)], cwd=EXT)
-else:
-    reverse = subprocess.run(["git", "apply", "--reverse", "--check", str(patch_file)], cwd=EXT)
-    assert reverse.returncode == 0, "External checkout is neither clean nor exactly patched."
+run(["git", "apply", str(patch_file)], cwd=EXT)
+print("patch applied onto", UPSTREAM_COMMIT[:7])
 
 run([sys.executable, "-m", "pip", "install", "-q", "-e", str(EXT), "--no-deps"])
 
