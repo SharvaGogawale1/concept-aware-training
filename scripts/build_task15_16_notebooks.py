@@ -365,7 +365,16 @@ if RUN_DATA:
     # The extraction is the longest stage.  Ten independent 1k shards are
     # cached after completion, so a Colab disconnect loses at most one shard.
     restore_dataset_from_drive(LEAF)
+    # get_content_words.py streams into combined.jsonl, so an interrupted pass
+    # leaves a SHORT file behind.  Existence is not completion: check the line
+    # count, or extraction silently runs on a truncated corpus and only the merge
+    # notices, hours later.
     combined = LEAF.parent / "combined.jsonl"
+    if combined.is_file():
+        rows = sum(1 for _ in combined.open())
+        if rows != EXTRACT_SEQUENCES:
+            print(f"combined.jsonl has {rows} rows, expected {EXTRACT_SEQUENCES}; regenerating")
+            combined.unlink()
     if not combined.is_file():
         run([sys.executable, "data/get_content_words.py", "--model", BASE_MODEL,
              "--dataset", "c4", "--max_length", "256"], cwd=EXT)
