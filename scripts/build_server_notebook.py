@@ -23,6 +23,9 @@ INSTALL = r'''
 # DynamicCache.from_legacy_cache, which transformers removed in v5.
 %pip install -q accelerate peft bitsandbytes datasets spacy "mteb>=1.12" nltk scipy scikit-learn seaborn pandas pytest wandb
 %pip install -q "transformers>=4.51,<4.58"
+# peft raises on torchao < 0.16 from inside PeftModel.from_pretrained, which is
+# how every evaluator loads an adapter.
+%pip install -q -U "torchao>=0.16"
 !python -m spacy download en_core_web_sm
 import transformers, torch
 print("transformers", transformers.__version__, "| torch", torch.__version__,

@@ -289,6 +289,12 @@ run([sys.executable, "-m", "pip", "install", "-q", "accelerate",
 # Colab image installs v5 and the first shard dies with AttributeError.  The
 # 4.5x line keeps that API and still satisfies our Task-14 evaluators.
 run([sys.executable, "-m", "pip", "install", "-q", "transformers>=4.51,<4.58"])
+# Colab ships torchao 0.10, but peft requires >=0.16 and RAISES from
+# is_torchao_available() rather than degrading.  That call sits inside
+# PeftModel.from_pretrained, which every evaluator uses to load an adapter, so
+# without this the failure lands hours later at evaluation rather than here.
+# get_peft_model takes a different path, which is why training itself succeeds.
+run([sys.executable, "-m", "pip", "install", "-q", "-U", "torchao>=0.16"])
 import transformers as _tf
 print("transformers", _tf.__version__)
 run([sys.executable, "-m", "spacy", "download", "en_core_web_sm"])
