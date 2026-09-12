@@ -362,19 +362,23 @@ The audit hard-fails on split overlap, target misalignment, empty sets, or any c
 MODEL_TAG = BASE_MODEL.split("/")[-1].lower()
 LEAF = DATA / "c4" / MODEL_TAG / "embedding"
 if RUN_DATA:
-    # The extraction is the longest stage.  Ten independent 1k shards are
-    # cached after completion, so a Colab disconnect loses at most one shard.
+    # The extraction is the longest stage.  Each 1k shard is cached to Drive once
+    # it completes, so a disconnect costs at most the shard in progress.
     restore_dataset_from_drive(LEAF)
     # get_content_words.py streams into combined.jsonl, so an interrupted pass
-    # leaves a SHORT file behind.  Existence is not completion: check the line
-    # count, or extraction silently runs on a truncated corpus and only the merge
-    # notices, hours later.
+    # leaves a SHORT file behind and existence alone does not mean completion.
+    # Test for "enough rows", not "exactly EXTRACT_SEQUENCES": MAX_SAMPLES is
+    # hardcoded to 10000 in that script, so the file legitimately holds 10000 rows
+    # even when we only extract the first 4000, and an equality test would delete
+    # and regenerate it on every resume.
     combined = LEAF.parent / "combined.jsonl"
     if combined.is_file():
         rows = sum(1 for _ in combined.open())
-        if rows != EXTRACT_SEQUENCES:
-            print(f"combined.jsonl has {rows} rows, expected {EXTRACT_SEQUENCES}; regenerating")
+        if rows < EXTRACT_SEQUENCES:
+            print(f"combined.jsonl has {rows} rows, need {EXTRACT_SEQUENCES}; regenerating")
             combined.unlink()
+        else:
+            print(f"combined.jsonl has {rows} rows, using the first {EXTRACT_SEQUENCES}")
     if not combined.is_file():
         run([sys.executable, "data/get_content_words.py", "--model", BASE_MODEL,
              "--dataset", "c4", "--max_length", "256"], cwd=EXT)
