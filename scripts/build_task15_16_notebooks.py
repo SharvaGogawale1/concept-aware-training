@@ -417,6 +417,8 @@ if RUN_DATA:
          "--validation", LEAF / "synonyms_val.jsonl",
          "--test", LEAF / "synonyms_test.jsonl",
          "--tokenizer", BASE_MODEL,
+         "--expected-train", SPLIT_TRAIN, "--expected-validation", SPLIT_VAL,
+         "--expected-test", SPLIT_TEST,
          "--report", DRIVE_RESULTS / "data_audit.json"], cwd=EXT)
 '''),
         md('''## Unit tests and eight-row GPU smoke run

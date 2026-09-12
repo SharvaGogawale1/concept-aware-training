@@ -99,10 +99,10 @@ index 0000000..c86ef1f
 +    return torch.stack(scores)
 diff --git a/data/audit_concept_data.py b/data/audit_concept_data.py
 new file mode 100644
-index 0000000..aaee0a4
+index 0000000..28ffac1
 --- /dev/null
 +++ b/data/audit_concept_data.py
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,96 @@
 +"""Hard-fail audit for the 8k/1k/1k Zhang concept splits."""
 +
 +import argparse
@@ -155,13 +155,22 @@ index 0000000..aaee0a4
 +    parser.add_argument("--tokenizer", required=True)
 +    parser.add_argument("--report", required=True)
 +    parser.add_argument("--allow-nonstandard-sizes", action="store_true")
++    # The split sizes follow EXTRACT_SEQUENCES in the notebook, so they are not
++    # always the paper's 8000/1000/1000.  Take them as arguments rather than
++    # hardcoding, so the size check stays meaningful at any scale instead of
++    # being switched off with --allow-nonstandard-sizes.
++    parser.add_argument("--expected-train", type=int, default=8000)
++    parser.add_argument("--expected-validation", type=int, default=1000)
++    parser.add_argument("--expected-test", type=int, default=1000)
 +    args = parser.parse_args()
 +    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
 +    all_rows, reports = {}, []
 +    for name, path in [("train", args.train), ("validation", args.validation), ("test", args.test)]:
 +        all_rows[name], report = audit_split(name, path, tokenizer)
 +        reports.append(report)
-+    expected = {"train": 8000, "validation": 1000, "test": 1000}
++    expected = {"train": args.expected_train,
++                "validation": args.expected_validation,
++                "test": args.expected_test}
 +    sizes = {r["split"]: r["rows"] for r in reports}
 +    if sizes != expected and not args.allow_nonstandard_sizes:
 +        raise AssertionError(f"expected {expected}, observed {sizes}")
