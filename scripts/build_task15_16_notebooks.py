@@ -429,6 +429,12 @@ if RUN_SMOKE:
     run([sys.executable, "-m", "pytest", "-q", "tests"], cwd=EXT)
     # No map-style preprocessing cache is used. Two independent loads must
     # still produce identical candidate supervision.
+    # pip install -e EXT only installs the conceptlib PACKAGE (all pyproject
+    # declares); train.py is a loose top-level module, so importing it in-process
+    # needs EXT on sys.path.  The subprocess calls are unaffected -- they pass
+    # cwd=EXT -- which is why this only bites the in-notebook import.
+    if str(EXT) not in sys.path:
+        sys.path.insert(0, str(EXT))
     from train import ConceptDataset
     from transformers import AutoTokenizer, AutoModelForCausalLM
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
