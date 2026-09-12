@@ -87,8 +87,9 @@ EXTRACT_SEQUENCES = 4000
 SPLIT_TRAIN = int(EXTRACT_SEQUENCES * 0.8)
 SPLIT_VAL = SPLIT_TEST = int(EXTRACT_SEQUENCES * 0.1)
 
-_BAR = re.compile(r"\b(\d+)/(\d+)\s*\[")   # tqdm counter, e.g. "  200/1000 ["
-PROGRESS_EVERY = 100                        # print one progress line per this many items
+_BAR = re.compile(r"\b(\d+)/(\d+)\s*\[")     # bounded tqdm: "  200/1000 ["
+_BAR_OPEN = re.compile(r"\b(\d+)it\s*\[")     # unbounded tqdm: "  3200it [00:49"
+PROGRESS_EVERY = 100                          # one line per this many items
 
 def run(argv, cwd=None, env=None):
     """Run a child process, streaming its output into the cell.
@@ -116,6 +117,13 @@ def run(argv, cwd=None, env=None):
         if hit:
             done, total = int(hit.group(1)), int(hit.group(2))
             if done % PROGRESS_EVERY and done != total:
+                continue
+        else:
+            # Dataset loading has no total ("3200it [00:49"), so there is no final
+            # count to anchor on.  Thin it ten times harder; it is pure noise and
+            # seven training runs would otherwise emit tens of thousands of lines.
+            loose = _BAR_OPEN.search(line)
+            if loose and int(loose.group(1)) % (PROGRESS_EVERY * 10):
                 continue
         print(line, end="", flush=True)
     code = process.wait()
