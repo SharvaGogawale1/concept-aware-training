@@ -39,6 +39,17 @@ from getpass import getpass
 import hashlib, json, os, re, shutil, subprocess, sys, torch
 
 BASE_MODEL = "meta-llama/Llama-3.2-1B"
+# Every per-model artifact -- data, adapters, manifests, results -- is keyed on
+# this tag.  Nothing about a model may share a path with another model: adapters
+# are restored from Drive by path, so a collision would silently hand one model's
+# weights to another and the run would look like it succeeded.
+MODEL_TAG = BASE_MODEL.split("/")[-1].lower()
+# combined.jsonl depends only on the tokenizer (plus spaCy), so a model that
+# shares a vocabulary with one already extracted produces a byte-identical file.
+# Llama-3.2 1B and 3B do.  Naming the donor here skips the POS pass, which is the
+# most expensive stage of extraction; the vocabularies are compared before the
+# copy and the run aborts if they differ.
+REUSE_CONTENT_WORDS_FROM = None
 PRIMARY_SEED = 42
 # One seed first.  Seed 42 alone screens the pipeline and shows the direction of
 # every effect, but it CANNOT support a claim: the pre-registered rule needs all
@@ -189,6 +200,13 @@ def restore_dataset_from_drive(leaf):
     print(f"restored {copied} dataset files from", DATA_CACHE / model_root.relative_to(DATA))
     return (embedding_source / "synonyms_train.jsonl").is_file()
 
+# The 1B reproduction wrote these names before the study covered more than one
+# model; they stay as they are so that work still resolves, and every other model
+# gets its own suffix rather than overwriting it.
+_TAG_SUFFIX = "" if MODEL_TAG == "llama-3.2-1b" else f"_{MODEL_TAG}"
+RESULT_DIR = f"task15_reproduction{_TAG_SUFFIX}"
+LOG_DIR = f"task15_logs{_TAG_SUFFIX}"
+
 RUN_MANIFEST = DRIVE_RESULTS / "run_manifests"
 
 def save_runs(runs, name):
@@ -255,9 +273,24 @@ ADAPTER_CACHE = DRIVE_PROJECT / "task15_16_adapters"
 ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors",
                  "training_history.jsonl", "run_config.json")
 
+def adapter_cache_dirs(path):
+    """Drive locations for one adapter, most current first.
+
+    The second entry is the layout used before adapters were keyed on the model,
+    so the seed-42 arms trained then still resume instead of silently retraining.
+    """
+    relative = Path(path).relative_to(RUNS)
+    locations = [ADAPTER_CACHE / relative]
+    # The pre-tag layout was written by the 1B reproduction and by nothing else,
+    # so only that model may look there.  Offering it to every model would let 3B
+    # restore 1B's weights and report them as a 3B result.
+    if not _TAG_SUFFIX:
+        locations.append(ADAPTER_CACHE / Path(*relative.parts[1:]))
+    return locations
+
 def cache_adapter_to_drive(path):
     """Copy one finished adapter to Drive so a later session can resume."""
-    destination = ADAPTER_CACHE / Path(path).relative_to(RUNS)
+    destination = adapter_cache_dirs(path)[0]
     destination.mkdir(parents=True, exist_ok=True)
     for name in ADAPTER_FILES:
         source = Path(path) / name
@@ -267,15 +300,16 @@ def cache_adapter_to_drive(path):
 
 def restore_adapter_from_drive(path):
     """Return True when a completed adapter for `path` was restored from Drive."""
-    source = ADAPTER_CACHE / Path(path).relative_to(RUNS)
-    if not (source / "adapter_config.json").is_file():
-        return False
-    Path(path).mkdir(parents=True, exist_ok=True)
-    for name in ADAPTER_FILES:
-        candidate = source / name
-        if candidate.is_file():
-            shutil.copy2(candidate, Path(path) / name)
-    return True
+    for source in adapter_cache_dirs(path):
+        if not (source / "adapter_config.json").is_file():
+            continue
+        Path(path).mkdir(parents=True, exist_ok=True)
+        for name in ADAPTER_FILES:
+            candidate = source / name
+            if candidate.is_file():
+                shutil.copy2(candidate, Path(path) / name)
+        return True
+    return False
 
 DATA.mkdir(parents=True, exist_ok=True)
 RUNS.mkdir(parents=True, exist_ok=True)
@@ -355,7 +389,7 @@ LEAF = DATA / "c4" / MODEL_TAG / "embedding"
 restore_dataset_from_drive(LEAF)
 
 def adapter_path(method, seed, value):
-    path = RUNS / method / f"seed_{seed}" / str(value)
+    path = RUNS / MODEL_TAG / method / f"seed_{seed}" / str(value)
     assert_ephemeral(path)
     return path
 
@@ -412,7 +446,6 @@ Primary reproduction evidence is nine-task mean STS, content-word NTP, and globa
 
 The audit hard-fails on split overlap, target misalignment, empty sets, or any concept that is not a complete single token. The observed target is part of every set by construction.'''),
         code(r'''
-MODEL_TAG = BASE_MODEL.split("/")[-1].lower()
 LEAF = DATA / "c4" / MODEL_TAG / "embedding"
 if RUN_DATA:
     # The extraction is the longest stage.  Each 1k shard is cached to Drive once
@@ -425,6 +458,19 @@ if RUN_DATA:
     # even when we only extract the first 4000, and an equality test would delete
     # and regenerate it on every resume.
     combined = LEAF.parent / "combined.jsonl"
+    if not combined.is_file() and REUSE_CONTENT_WORDS_FROM:
+        from transformers import AutoTokenizer
+        assert (AutoTokenizer.from_pretrained(BASE_MODEL).get_vocab()
+                == AutoTokenizer.from_pretrained(REUSE_CONTENT_WORDS_FROM).get_vocab()), (
+            f"{BASE_MODEL} and {REUSE_CONTENT_WORDS_FROM} do not share a vocabulary, "
+            "so their content words differ and must be regenerated")
+        donor_tag = REUSE_CONTENT_WORDS_FROM.split("/")[-1].lower()
+        donor = DATA / "c4" / donor_tag / "combined.jsonl"
+        if not donor.is_file():
+            restore_dataset_from_drive(DATA / "c4" / donor_tag / "embedding")
+        combined.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(donor, combined)
+        print("reused content words from", REUSE_CONTENT_WORDS_FROM)
     if combined.is_file():
         rows = sum(1 for _ in combined.open())
         if rows < EXTRACT_SEQUENCES:
@@ -440,7 +486,9 @@ if RUN_DATA:
     # mere existence does not mean the shard finished.  Record completion in a
     # Drive-side manifest instead; embedding_synonyms.py truncates both files when
     # it restarts a shard, so a re-run is always clean.
-    shards_done = load_runs("task15_shards")
+    # One manifest per model: a shared name would let the 1B shards mark the 3B
+    # ones as finished, and extraction would be skipped entirely.
+    shards_done = load_runs(f"task15_shards{_TAG_SUFFIX}")
     for start in range(0, EXTRACT_SEQUENCES, 1000):
         end = start + 1000
         key = f"{start}_{end}"
@@ -455,7 +503,7 @@ if RUN_DATA:
              *([] if EXTRACT_4BIT else ["--no-4bit"])], cwd=EXT)
         cache_dataset_to_drive(LEAF)
         shards_done[key] = synonym_part
-        save_runs(shards_done, "task15_shards")
+        save_runs(shards_done, f"task15_shards{_TAG_SUFFIX}")
     run([sys.executable, "data/merge_synonym_parts.py", "--train-size", SPLIT_TRAIN,
          "--val-size", SPLIT_VAL, "--test-size", SPLIT_TEST, "--expected-count", "2", "--force"], cwd=EXT)
     run([sys.executable, "data/augment_synonyms.py", "--base-dir", DATA,
@@ -518,7 +566,7 @@ if RUN_SMOKE:
 Seed 42 gets the complete $\lambda\in\{0.25,0.5,0.75,1\}$ curve. The headline NTP, one-epoch augmented NTP, randomized $\lambda=.25$, and concept-marginal $\lambda=1$ settings are then confirmed with seeds 42, 123, and 2024. Released effective batch size is logged. If the headline fails, only seed 42 is rerun with the paper-stated batch before any diagnosis.'''),
         code(TRAIN_HELPER),
         code(r'''
-REPRO_RUNS = load_runs("task15")
+REPRO_RUNS = load_runs(f"task15{_TAG_SUFFIX}")
 if RUN_SCREEN:
     REPRO_RUNS["ntp_seed42"] = train_flat("ntp", 42, 0.0)
     for lam in [0.25, 0.5, 0.75, 1.0]:
@@ -538,7 +586,7 @@ if RUN_CONFIRM:
     # adapter_path() maps both calls to the same directory.  Two dict keys pointing at
     # one adapter would score it twice and report it as two arms.
     REPRO_RUNS.pop("zhang_lambda1.0_seed42", None)
-save_runs(REPRO_RUNS, "task15")
+save_runs(REPRO_RUNS, f"task15{_TAG_SUFFIX}")
 
 # Use only if the released-batch seed-42 reproduction misses the stated trend.
 # This is a named sensitivity run, never a replacement or a cherry-picked row.
@@ -555,7 +603,7 @@ if RUN_EVAL:
     # A fresh session has the manifest but not the weights; pull them back first.
     REPRO_RUNS = restore_all(REPRO_RUNS)
     checkpoints = [BASE_MODEL, *map(str, REPRO_RUNS.values())]
-    result_dir = DRIVE_RESULTS / "task15_reproduction"
+    result_dir = DRIVE_RESULTS / RESULT_DIR
     result_dir.mkdir(parents=True, exist_ok=True)
     # Each evaluator is skipped only when its own output already scores every
     # checkpoint of this pass, so a disconnect costs at most one evaluator
@@ -617,7 +665,7 @@ if RUN_EVAL:
     run([sys.executable, MAIN / "scripts/summarize_concept_experiments.py",
          "--manifest", result_dir / "manifest.json", "--result-dir", result_dir,
          "--output", result_dir / "flat_main_table.csv"], cwd=MAIN)
-    for label, path in REPRO_RUNS.items(): sync_small_artifacts(path, f"task15_logs/{label}")
+    for label, path in REPRO_RUNS.items(): sync_small_artifacts(path, f"{LOG_DIR}/{label}")
     audit_no_drive_weights()
 '''),
         code(r'''
@@ -655,7 +703,7 @@ else:
         axis.set_xlabel(x); axis.set_title(title, fontsize=10); axis.grid(alpha=.25, lw=.5)
     axes[0].legend(fontsize=7, frameon=False, ncol=2)
     plt.tight_layout()
-    plt.savefig(DRIVE_RESULTS / "task15_reproduction" / "training_curves.png", dpi=180)
+    plt.savefig(DRIVE_RESULTS / RESULT_DIR / "training_curves.png", dpi=180)
     plt.show()
 '''),
         md(r'''## Reproduction gate
