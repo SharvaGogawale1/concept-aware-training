@@ -442,7 +442,7 @@ This notebook answers one question first: **can we reproduce Zhang, Jurafsky, an
 
 Primary reproduction evidence is nine-task mean STS, content-word NTP, and global NTP. The untouched model need not lose to NTP on every STS task.'''),
         code(COMMON_SETUP), code(BOOTSTRAP),
-        md('''## Rebuild and audit the exact 8k/1k/1k data
+        md('''## Rebuild and audit the concept data for this model
 
 The audit hard-fails on split overlap, target misalignment, empty sets, or any concept that is not a complete single token. The observed target is part of every set by construction.'''),
         code(r'''
@@ -1036,7 +1036,7 @@ if RUN_SCALE_3B:
     assert ONE_BILLION_GATE_PASSED, "Record the signed-off 1B table before scaling."
     assert SELECTED_GAMMA in {0.1, 0.25, 0.5}
     # Concepts are tokenizer/model specific: regenerate the same 10k C4 sample
-    # for 3B, audit 8k/1k/1k, and rebuild hierarchy labels before training.
+    # for 3B, audit the splits, and rebuild hierarchy labels before training.
     run([sys.executable, "data/get_content_words.py", "--model", SCALE_MODEL,
          "--dataset", "c4", "--max_length", "256"], cwd=EXT)
     run([sys.executable, "data/embedding_synonyms.py", "c4",
