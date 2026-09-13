@@ -53,6 +53,18 @@ RUNS = WORK / "runs"                       # adapters (small at r=4, kept)
 OUTPUTS = BASE / "outputs"                 # everything you download for analysis
 
 BASE_MODEL = "meta-llama/Llama-3.2-1B"
+# Every per-model artifact is keyed on this tag.  Two models must never share a
+# path: adapters resume by path, so a collision hands one model's weights to
+# another and the run still looks like it succeeded.
+MODEL_TAG = BASE_MODEL.split("/")[-1].lower()
+# combined.jsonl depends only on the tokenizer, so a model sharing a vocabulary
+# with one already extracted produces a byte-identical file (Llama-3.2 1B and 3B
+# do).  Naming the donor here skips the POS pass; the vocabularies are compared
+# before the copy and the run aborts if they differ.
+REUSE_CONTENT_WORDS_FROM = None
+_TAG_SUFFIX = "" if MODEL_TAG == "llama-3.2-1b" else f"_{MODEL_TAG}"
+RESULT_DIR = f"task15_reproduction{_TAG_SUFFIX}"
+LOG_DIR = f"task15_logs{_TAG_SUFFIX}"
 PRIMARY_SEED = 42
 # One seed screens the pipeline and shows the direction of every effect, but it
 # CANNOT support a claim: the pre-registered rule needs all three to agree in
@@ -177,6 +189,38 @@ def restore_all(runs):
 def eval_done(marker):
     return Path(marker).is_file() and RESUME_FINISHED_RUNS
 
+def eval_covered(path, checkpoints):
+    """True when `path` already scores every checkpoint of THIS pass.
+
+    Coverage, not mere existence: adding a seed grows `checkpoints`, the old file
+    stops covering it, and the evaluator reruns.  A plain existence check would
+    report the previous pass's table as if it were this one's.
+    """
+    if not (RESUME_FINISHED_RUNS and Path(path).is_file()):
+        return False
+    try:
+        rows = json.loads(Path(path).read_text())
+    except (json.JSONDecodeError, OSError):
+        return False              # truncated by a killed job mid-write; redo it
+    if not isinstance(rows, list):
+        return False
+    scored = {str(row.get("checkpoint")) for row in rows if isinstance(row, dict)}
+    return set(map(str, checkpoints)) <= scored
+
+def sts_covered(path):
+    """True when one STS pass already wrote its nine task rows to `path`."""
+    if not (RESUME_FINISHED_RUNS and Path(path).is_file()):
+        return False
+    with open(path, encoding="utf-8") as handle:
+        return sum(1 for line in handle if line.strip()) >= 10   # header + 9 tasks
+
+def guarded(path, checkpoints, argv, cwd, what):
+    """Run one evaluator unless its output already covers every checkpoint."""
+    if eval_covered(path, checkpoints):
+        print(f"resume: {what} already covers {len(checkpoints)} checkpoints, skipping")
+        return
+    run(argv, cwd=cwd)
+
 def assert_under_base(path):
     resolved = Path(path).resolve()
     assert str(resolved).startswith(str(BASE)), f"{resolved} escapes {BASE}"
@@ -269,6 +313,60 @@ for index, cell in enumerate(source["cells"]):
     for old, new in RENAME:
         text = text.replace(old, new)
     cells.append(code(text) if cell["cell_type"] == "code" else md(text))
+
+def undefined_names(notebook_cells):
+    """Names the notebook loads but never binds.
+
+    The server setup cell is written by hand while the experiment body is copied
+    from the Colab notebook, so a helper added to the Colab setup silently fails
+    to reach here and the copied body NameErrors at runtime.  Locals are
+    over-approximated (every parameter and assignment target anywhere counts as
+    bound) so this reports only names that are genuinely nowhere.
+    """
+    import ast, builtins
+    bound, loaded = set(dir(builtins)), set()
+    trees = []
+    for cell in notebook_cells:
+        if cell["cell_type"] != "code":
+            continue
+        text = "".join(cell["source"])
+        # %pip / ! lines are notebook magics, not Python.
+        text = "\n".join("" if line.lstrip().startswith(("%", "!")) else line
+                          for line in text.splitlines())
+        trees.append(ast.parse(text))
+    for tree in trees:
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                bound.add(node.name)
+                bound.update(a.arg for a in getattr(node, "args", ast.arguments(
+                    posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[])).args)
+                for extra in ("posonlyargs", "kwonlyargs"):
+                    bound.update(a.arg for a in getattr(getattr(node, "args", None), extra, []) or [])
+                for attr in ("vararg", "kwarg"):
+                    arg = getattr(getattr(node, "args", None), attr, None)
+                    if arg: bound.add(arg.arg)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                bound.add(node.id)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                bound.update((a.asname or a.name).split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                bound.add(node.name)
+            elif isinstance(node, ast.Global):
+                bound.update(node.names)
+    for tree in trees:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                loaded.add(node.id)
+    return sorted(loaded - bound)
+
+
+missing = undefined_names(cells)
+if missing:
+    raise SystemExit(
+        "refusing to write a notebook that would NameError at runtime.\n"
+        "These names are used but never bound -- the hand-written server setup\n"
+        "has drifted behind the Colab COMMON_SETUP it mirrors:\n  "
+        + "\n  ".join(missing))
 
 TARGET.write_text(json.dumps({
     "cells": cells,
