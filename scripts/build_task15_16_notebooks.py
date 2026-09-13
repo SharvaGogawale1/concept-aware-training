@@ -581,6 +581,12 @@ if RUN_CONFIRM:
         REPRO_RUNS[f"augmented_ntp_seed{seed}"] = train_flat("augmented_ntp", seed, 0.0,
             epochs=1, train_file=LEAF / "synonyms_train_aug5x.jsonl", data_augmentation=True)
         REPRO_RUNS[f"randomized_seed{seed}"] = train_flat("randomized", seed, 0.25, randomized=True)
+        # Zhang runs the semantic control at lambda=0.25 while the headline
+        # concept arm runs at lambda=1.0.  Any claim that concept training does
+        # or does not beat the control needs it at the SAME weight, otherwise the
+        # comparison confounds the candidate sets with the mixing weight.
+        REPRO_RUNS[f"randomized_lambda1.0_seed{seed}"] = train_flat(
+            "randomized", seed, 1.0, randomized=True)
         REPRO_RUNS[f"zhang_seed{seed}"] = train_flat("zhang_marginal", seed, 1.0)
     # The lambda sweep already trained zhang_marginal at lambda=1.0 on seed 42, and
     # adapter_path() maps both calls to the same directory.  Two dict keys pointing at
@@ -689,18 +695,26 @@ else:
     # scatter as if it were training dynamics.
     train_rows = frame.dropna(subset=["loss"])
     eval_rows = frame.dropna(subset=["eval_loss"])
-    panels = [(train_rows, "step", "loss", "training loss"),
+    panels = [(train_rows, "step", "loss", "training loss (NOT comparable across arms:\n"
+               "each minimises a different mix of the two terms)"),
               (eval_rows, "epoch", "ce_loss", "validation NTP cross-entropy"),
               (eval_rows, "epoch", "concept_loss", "validation concept loss")]
-    figure, axes = plt.subplots(1, 3, figsize=(12, 3.4))
+    # One fixed colour per method.  Letting matplotlib assign them per panel makes
+    # the colours shift wherever an arm is dropped for having no concept loss,
+    # while the legend sits on the first panel only -- so the same colour means
+    # different arms in different panels.
+    methods = sorted(frame["method"].unique())
+    colours = dict(zip(methods, plt.cm.tab10.colors * (1 + len(methods) // 10)))
+    figure, axes = plt.subplots(1, 3, figsize=(13, 3.8))
     for axis, (rows, x, y, title) in zip(axes, panels):
         if y not in rows:
             continue
-        for label, group in rows.groupby("method"):
-            group = group.dropna(subset=[y])
+        for label in methods:
+            group = rows[rows["method"] == label].dropna(subset=[y])
             if not group.empty and group[y].abs().sum() > 0:
-                axis.plot(group[x], group[y], marker="o", ms=3, lw=1.4, label=label)
-        axis.set_xlabel(x); axis.set_title(title, fontsize=10); axis.grid(alpha=.25, lw=.5)
+                axis.plot(group[x], group[y], marker="o", ms=3, lw=1.4,
+                          color=colours[label], label=label)
+        axis.set_xlabel(x); axis.set_title(title, fontsize=9); axis.grid(alpha=.25, lw=.5)
     axes[0].legend(fontsize=7, frameon=False, ncol=2)
     plt.tight_layout()
     plt.savefig(DRIVE_RESULTS / RESULT_DIR / "training_curves.png", dpi=180)
