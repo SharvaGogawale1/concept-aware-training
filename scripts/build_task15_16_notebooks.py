@@ -217,6 +217,40 @@ def eval_done(marker):
     """True when a completed evaluation artifact is already on Drive."""
     return Path(marker).is_file() and RESUME_FINISHED_RUNS
 
+def eval_covered(path, checkpoints):
+    """True when `path` already scores every checkpoint of THIS pass.
+
+    Each JSON evaluator writes a list of {"checkpoint": ..., ...}.  Testing
+    coverage rather than mere existence is what makes this safe to resume:
+    adding a seed grows `checkpoints`, the old file no longer covers it, and the
+    evaluator reruns.  A plain "file exists" check would instead report the
+    previous pass's table as if it were this one's.
+    """
+    if not (RESUME_FINISHED_RUNS and Path(path).is_file()):
+        return False
+    try:
+        rows = json.loads(Path(path).read_text())
+    except (json.JSONDecodeError, OSError):
+        return False              # truncated by a disconnect mid-write; redo it
+    if not isinstance(rows, list):
+        return False
+    scored = {str(row.get("checkpoint")) for row in rows if isinstance(row, dict)}
+    return set(map(str, checkpoints)) <= scored
+
+def sts_covered(path):
+    """True when one STS pass already wrote its nine task rows to `path`."""
+    if not (RESUME_FINISHED_RUNS and Path(path).is_file()):
+        return False
+    with open(path, encoding="utf-8") as handle:
+        return sum(1 for line in handle if line.strip()) >= 10   # header + 9 tasks
+
+def guarded(path, checkpoints, argv, cwd, what):
+    """Run one evaluator unless its output already covers every checkpoint."""
+    if eval_covered(path, checkpoints):
+        print(f"resume: {what} already covers {len(checkpoints)} checkpoints, skipping")
+        return
+    run(argv, cwd=cwd)
+
 ADAPTER_CACHE = DRIVE_PROJECT / "task15_16_adapters"
 ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors",
                  "training_history.jsonl", "run_config.json")
@@ -523,32 +557,46 @@ if RUN_EVAL:
     checkpoints = [BASE_MODEL, *map(str, REPRO_RUNS.values())]
     result_dir = DRIVE_RESULTS / "task15_reproduction"
     result_dir.mkdir(parents=True, exist_ok=True)
-    run([sys.executable, "eval/eval_perplexity_explicit.py", "--checkpoints", *checkpoints,
-         "--base-model", BASE_MODEL, "--test-jsonl", LEAF / "synonyms_test.jsonl",
-         "--output", result_dir / "perplexity.json"], cwd=EXT)
-    run([sys.executable, "eval/eval_concept_sets.py", "--checkpoints", *checkpoints,
-         "--base-model", BASE_MODEL, "--test-jsonl", LEAF / "synonyms_test.jsonl",
-         "--output", result_dir / "concept_sets.json"], cwd=EXT)
+    # Each evaluator is skipped only when its own output already scores every
+    # checkpoint of this pass, so a disconnect costs at most one evaluator
+    # instead of the whole section.
+    guarded(result_dir / "perplexity.json", checkpoints,
+            [sys.executable, "eval/eval_perplexity_explicit.py", "--checkpoints", *checkpoints,
+             "--base-model", BASE_MODEL, "--test-jsonl", LEAF / "synonyms_test.jsonl",
+             "--output", result_dir / "perplexity.json"], EXT, "perplexity")
+    guarded(result_dir / "concept_sets.json", checkpoints,
+            [sys.executable, "eval/eval_concept_sets.py", "--checkpoints", *checkpoints,
+             "--base-model", BASE_MODEL, "--test-jsonl", LEAF / "synonyms_test.jsonl",
+             "--output", result_dir / "concept_sets.json"], EXT, "concept sets")
     for label, checkpoint in {"pretrained": BASE_MODEL, **REPRO_RUNS}.items():
         display_label = label.replace("_", " ")
+        csv_output = result_dir / f"sts_{display_label}.csv"
+        # STS writes one CSV per checkpoint, so it resumes per checkpoint.
+        if sts_covered(csv_output):
+            print("resume: STS already scored, skipping", display_label)
+            continue
         mteb_args = [sys.executable, "eval/eval_mteb.py", "--base-model", BASE_MODEL,
                      "--dataset", "c4", "--dataset-type", "embedding", "--tasks", "sts",
                      "--run-label", display_label,
-                     "--csv-output", result_dir / f"sts_{display_label}.csv",
+                     "--csv-output", csv_output,
                      "--mteb-output-root", result_dir / "mteb_raw"]
         mteb_args += ["--no-adapter"] if checkpoint == BASE_MODEL else ["--adapter-path", checkpoint]
         run(mteb_args, cwd=EXT)
-    run([sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/eval_swords.py",
-         "--checkpoints", *checkpoints, "--tokenizer_path", BASE_MODEL, "--base_model", BASE_MODEL,
-         "--swords_json", MAIN / "data/swords/swords-v1.1_dev.json.gz",
-         "--results_json", result_dir / "swords_zero_shot.json", "--modes", "left", "full"], cwd=MAIN)
+    guarded(result_dir / "swords_zero_shot.json", checkpoints,
+            [sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/eval_swords.py",
+             "--checkpoints", *checkpoints, "--tokenizer_path", BASE_MODEL, "--base_model", BASE_MODEL,
+             "--swords_json", MAIN / "data/swords/swords-v1.1_dev.json.gz",
+             "--results_json", result_dir / "swords_zero_shot.json", "--modes", "left", "full"],
+            MAIN, "SWORDS")
+    # Seconds to run, and it must always match the SWORDS file it reads.
     run([sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/paired_benchmark_ci.py",
          "--kind", "swords", "--results-json", result_dir / "swords_zero_shot.json",
          "--baseline-index", "0", "--output", result_dir / "swords_paired_ci_vs_pretrained.json"], cwd=MAIN)
-    run([sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/eval_bm_semlex.py",
-         "--checkpoints", *checkpoints, "--tokenizer_path", BASE_MODEL, "--base_model", BASE_MODEL,
-         "--data", MAIN / "data/bm_semlex/curated_200.tsv",
-         "--results_json", result_dir / "bm_semlex.json"], cwd=MAIN)
+    guarded(result_dir / "bm_semlex.json", checkpoints,
+            [sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/eval_bm_semlex.py",
+             "--checkpoints", *checkpoints, "--tokenizer_path", BASE_MODEL, "--base_model", BASE_MODEL,
+             "--data", MAIN / "data/bm_semlex/curated_200.tsv",
+             "--results_json", result_dir / "bm_semlex.json"], MAIN, "bm-semlex")
     manifest = {"pretrained": BASE_MODEL, **{label.replace("_", " "): str(path) for label, path in REPRO_RUNS.items()}}
     (result_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
     run([sys.executable, MAIN / "scripts/summarize_concept_experiments.py",
@@ -559,7 +607,7 @@ if RUN_EVAL:
 '''),
         code(r'''
 # Plot only scalar learning curves; adapters remain under /content.
-import pandas as pd, seaborn as sns
+import pandas as pd
 from matplotlib import pyplot as plt
 curves = []
 for label, path in REPRO_RUNS.items():
@@ -568,11 +616,32 @@ for label, path in REPRO_RUNS.items():
         frame = pd.read_json(history, lines=True)
         frame["method"] = label
         curves.append(frame)
-if curves:
+if not curves:
+    print("no training_history.jsonl found; nothing to plot")
+else:
     frame = pd.concat(curves, ignore_index=True)
-    value = "loss" if "loss" in frame else "ce_loss"
-    sns.lineplot(frame, x="step", y=value, hue="method")
-    plt.tight_layout(); plt.savefig(DRIVE_RESULTS / "task15_reproduction" / "training_loss.png", dpi=180)
+    # The trainer logs ce_loss and concept_loss once per EVAL BATCH, two or three
+    # rows sharing one global_step.  Only the row that also carries eval_loss is
+    # the aggregate over the validation set; plotting the rest draws intra-eval
+    # scatter as if it were training dynamics.
+    train_rows = frame.dropna(subset=["loss"])
+    eval_rows = frame.dropna(subset=["eval_loss"])
+    panels = [(train_rows, "step", "loss", "training loss"),
+              (eval_rows, "epoch", "ce_loss", "validation NTP cross-entropy"),
+              (eval_rows, "epoch", "concept_loss", "validation concept loss")]
+    figure, axes = plt.subplots(1, 3, figsize=(12, 3.4))
+    for axis, (rows, x, y, title) in zip(axes, panels):
+        if y not in rows:
+            continue
+        for label, group in rows.groupby("method"):
+            group = group.dropna(subset=[y])
+            if not group.empty and group[y].abs().sum() > 0:
+                axis.plot(group[x], group[y], marker="o", ms=3, lw=1.4, label=label)
+        axis.set_xlabel(x); axis.set_title(title, fontsize=10); axis.grid(alpha=.25, lw=.5)
+    axes[0].legend(fontsize=7, frameon=False, ncol=2)
+    plt.tight_layout()
+    plt.savefig(DRIVE_RESULTS / "task15_reproduction" / "training_curves.png", dpi=180)
+    plt.show()
 '''),
         md(r'''## Reproduction gate
 
