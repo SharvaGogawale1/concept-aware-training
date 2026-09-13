@@ -588,10 +588,21 @@ if RUN_EVAL:
              "--swords_json", MAIN / "data/swords/swords-v1.1_dev.json.gz",
              "--results_json", result_dir / "swords_zero_shot.json", "--modes", "left", "full"],
             MAIN, "SWORDS")
-    # Seconds to run, and it must always match the SWORDS file it reads.
-    run([sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/paired_benchmark_ci.py",
-         "--kind", "swords", "--results-json", result_dir / "swords_zero_shot.json",
-         "--baseline-index", "0", "--output", result_dir / "swords_paired_ci_vs_pretrained.json"], cwd=MAIN)
+    # Seconds to run, and each must always match the SWORDS file it reads, so
+    # these are never skipped.  Pretrained is the reference row; NTP and
+    # augmented NTP are the matched controls the causal claims are stated
+    # against.  The index is looked up by label rather than hardcoded: RUN_CONFIRM
+    # pops zhang_lambda1.0_seed42, so positions shift once seeds are added and a
+    # literal index would quietly compare against the wrong arm.
+    baselines = {"pretrained": BASE_MODEL}
+    for label in ("ntp_seed42", "augmented_ntp_seed42"):
+        if label in REPRO_RUNS:
+            baselines[label] = str(REPRO_RUNS[label])
+    for label, reference in baselines.items():
+        run([sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/paired_benchmark_ci.py",
+             "--kind", "swords", "--results-json", result_dir / "swords_zero_shot.json",
+             "--baseline-index", checkpoints.index(reference),
+             "--output", result_dir / f"swords_paired_ci_vs_{label}.json"], cwd=MAIN)
     guarded(result_dir / "bm_semlex.json", checkpoints,
             [sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/eval_bm_semlex.py",
              "--checkpoints", *checkpoints, "--tokenizer_path", BASE_MODEL, "--base_model", BASE_MODEL,

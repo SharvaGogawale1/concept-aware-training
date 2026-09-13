@@ -12,6 +12,21 @@ index 95f3ea2..88fd96d 100644
      use_weighted_ce: bool = False
      ce_concept_token_weight: float = 5.0
  
+diff --git a/conceptlib/paths.py b/conceptlib/paths.py
+index 386a9b1..c34c4f0 100644
+--- a/conceptlib/paths.py
++++ b/conceptlib/paths.py
+@@ -24,6 +24,10 @@ Directory conventions (relative to the roots above):
+ where {model} is the lowercased final path segment of the HF model name and
+ {dataset_type} is one of {"embedding", "prompting"}.
+ """
++
++# `str | None` in the signatures below is 3.10+ syntax; this makes the module
++# importable on 3.9 too, so the loss tests can run without the GPU stack.
++from __future__ import annotations
+ import os
+ 
+ DATA_ROOT = os.environ.get("CONCEPT_DATA_ROOT", "datasets")
 diff --git a/conceptlib/sequence_scoring.py b/conceptlib/sequence_scoring.py
 new file mode 100644
 index 0000000..c86ef1f
@@ -696,6 +711,75 @@ index bc223d3..0ecda32 100644
      args = parser.parse_args()
 -    run(args.dataset, args.start, args.end, model=args.model)
 +    run(args.dataset, args.start, args.end, model=args.model, use_4bit=args.use_4bit)
+diff --git a/data/get_content_words.py b/data/get_content_words.py
+index 5ac3bfe..ac73b90 100644
+--- a/data/get_content_words.py
++++ b/data/get_content_words.py
+@@ -37,7 +37,34 @@ if tokenizer.pad_token is None:
+     tokenizer.pad_token = tokenizer.eos_token
+     tokenizer.pad_token_id = tokenizer.eos_token_id
+ 
+-nlp = spacy.load("en_core_web_sm")
++# pos_ is produced by tagger -> attribute_ruler, so both must stay enabled;
++# the parser, NER and lemmatizer are pure overhead for this script.
++nlp = spacy.load("en_core_web_sm", disable=["parser", "ner", "lemmatizer"])
++
++# token string -> (text, pos) for words spaCy tokenizes the same way the model
++# does, and None for the ones it does not.  C4 vocabulary saturates within a few
++# hundred sequences, so almost every lookup after the start is a cache hit.
++# Previously each sequence re-tagged its own ~380 candidate words from scratch,
++# which is where the bulk of the per-sequence extraction cost went.  The cache is
++# keyed on the token string alone and spaCy carries no state between one-word
++# documents, so this cannot change the output.
++_POS_CACHE = {}
++
++
++def tag_words(word_strings):
++    """Return {token string: (text, pos) or None}, tagging only unseen strings."""
++    unseen = [w for w in word_strings if w not in _POS_CACHE]
++    for word, doc in zip(unseen, nlp.pipe(unseen, batch_size=256)):
++        if word.startswith(" "):
++            # Skip when the model and spaCy tokenize the word differently.
++            matched = len(doc) == 2 and word == " " + doc[1].text
++            token = doc[1] if matched else None
++        else:
++            matched = len(doc) == 1 and word == doc[0].text
++            token = doc[0] if matched else None
++        _POS_CACHE[word] = (token.text, token.pos_) if matched else None
++    return _POS_CACHE
++
+ 
+ content_word_lengths = []
+ 
+@@ -106,20 +133,14 @@ with open(out_path, "w") as f:
+             if s.strip() and s.startswith(" ")
+             and (i + 1 == len(token_strs) or token_strs[i + 1].startswith(next_token_starts))
+         }
+-        docs = list(nlp.pipe(list(words.keys())))
+-        for i, (word, token_idx) in enumerate(words.items()):
+-            d = docs[i]
+-            if word.startswith(" "):
+-                # Skip when the model and spaCy tokenize the word differently.
+-                if len(d) != 2 or word != " " + d[1].text:
+-                    continue
+-                spacy_tok = d[1]
+-            else:
+-                if len(d) != 1 or word != d[0].text:
+-                    continue
+-                spacy_tok = d[0]
+-            if spacy_tok.pos_ in ["NOUN", "VERB", "ADJ"]:
+-                content_words.append(spacy_tok.text)
++        tagged = tag_words(words.keys())
++        for word, token_idx in words.items():
++            entry = tagged[word]
++            if entry is None:
++                continue
++            text, pos = entry
++            if pos in ["NOUN", "VERB", "ADJ"]:
++                content_words.append(text)
+                 content_word_indices.append(token_idx)
+ 
+         content_word_lengths.append(len(content_words))
 diff --git a/eval/eval_concept_sets.py b/eval/eval_concept_sets.py
 new file mode 100644
 index 0000000..2066e29
@@ -1007,10 +1091,10 @@ index 0000000..2977b2c
 +        assert "terrier" in prompt
 diff --git a/tests/test_objectives.py b/tests/test_objectives.py
 new file mode 100644
-index 0000000..cdd845b
+index 0000000..e57cc32
 --- /dev/null
 +++ b/tests/test_objectives.py
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,206 @@
 +import torch
 +import torch.nn.functional as F
 +from types import SimpleNamespace
@@ -1118,6 +1202,7 @@ index 0000000..cdd845b
 +    trainer.max_synonyms_per_content_word = None
 +    trainer.max_content_words = None
 +    trainer.randomized_synonyms = False
++    trainer.exclude_target = False
 +    trainer.state = SimpleNamespace(global_step=0)
 +    trainer.args = SimpleNamespace(seed=42)
 +    words = [{"shift_position": 0, "target_token_id": 5, "synonym_token_ids": [6, 7]},
@@ -1125,8 +1210,99 @@ index 0000000..cdd845b
 +    _, shifts, concepts, _ = trainer._build_concept_targets([words], 1, 4)
 +    assert shifts == [0, 2]
 +    assert concepts == [[5, 6, 7], [8, 9]]
++
++
++def _flattener(exclude_target):
++    """A trainer stub with only the attributes _build_concept_targets reads."""
++    trainer = ConceptLossTrainer.__new__(ConceptLossTrainer)
++    trainer.max_synonyms_per_content_word = None
++    trainer.max_content_words = None
++    trainer.randomized_synonyms = False
++    trainer.exclude_target = exclude_target
++    trainer.state = SimpleNamespace(global_step=0)
++    trainer.args = SimpleNamespace(seed=42)
++    return trainer
++
++
++def _scorer(objective, exclude_target, target_mass=0.6):
++    """A trainer stub with only the attributes the concept loss reads."""
++    trainer = ConceptLossTrainer.__new__(ConceptLossTrainer)
++    trainer.concept_objective = objective
++    trainer.exclude_target = exclude_target
++    trainer.target_mass = target_mass
++    trainer.contrast_beta = 0.0
++    return trainer
++
++
++# One slot carrying two alternatives, and one slot whose only candidate is the
++# observed token -- the case exclusion has to handle.
++_TWO_SLOTS = [[{"shift_position": 0, "target_token_id": 5, "synonym_token_ids": [7, 9]},
++               {"shift_position": 1, "target_token_id": 3, "synonym_token_ids": []}]]
++
++
++def test_exclude_target_drops_the_observed_token():
++    inclusive = _flattener(False)._build_concept_targets(_TWO_SLOTS, 1, 4)
++    exclusive = _flattener(True)._build_concept_targets(_TWO_SLOTS, 1, 4)
++    assert inclusive[2] == [[5, 7, 9], [3]]
++    assert exclusive[2] == [[7, 9], []]
++
++
++def test_exclusion_keeps_the_slot_count_so_lambda_is_comparable():
++    """An emptied slot is kept, not dropped.
++
++    The concept loss is a mean over content slots.  Dropping gold-only slots
++    would shrink the denominator, so the same lambda would apply a larger
++    effective concept weight in this arm than in the gold-inclusive arms it is
++    compared against, and the comparison would no longer be controlled.
++    """
++    inclusive = _flattener(False)._build_concept_targets(_TWO_SLOTS, 1, 4)
++    exclusive = _flattener(True)._build_concept_targets(_TWO_SLOTS, 1, 4)
++    assert len(inclusive[0]) == len(exclusive[0]) == 2
++
++
++def test_emptied_slot_contributes_exactly_zero():
++    torch.manual_seed(0)
++    logits = torch.randn(1, 4, 11)
++    flat = _flattener(True)._build_concept_targets(_TWO_SLOTS, 1, 4)
++    scorer = _scorer("uniform", True)
++    rows = [scorer._compute_concept_losses_vectorized(
++        logits, [flat[0][i]], [flat[1][i]], [flat[2][i]], [flat[3][i]])[0]
++        for i in range(2)]
++    assert torch.isclose(rows[1], torch.tensor(0.0))
++    total = scorer._compute_concept_losses_vectorized(logits, *flat)[0]
++    assert torch.isclose(total, (rows[0] + rows[1]) / 2)
++
++
++def test_set_marginal_stays_finite_when_exclusion_empties_a_slot():
++    """Without the guard this row has zero mass and -log(0) is infinite."""
++    torch.manual_seed(0)
++    logits = torch.randn(1, 4, 11)
++    flat = _flattener(True)._build_concept_targets(_TWO_SLOTS, 1, 4)
++    loss = _scorer("set_marginal", True)._compute_concept_losses_vectorized(logits, *flat)[0]
++    assert torch.isfinite(loss)
++
++
++def test_single_candidate_uniform_reduces_to_cross_entropy():
++    torch.manual_seed(0)
++    logits = torch.randn(1, 4, 11)
++    words = [[{"shift_position": 0, "target_token_id": 5, "synonym_token_ids": []}]]
++    flat = _flattener(False)._build_concept_targets(words, 1, 4)
++    loss = _scorer("uniform", False)._compute_concept_losses_vectorized(logits, *flat)[0]
++    assert torch.allclose(loss, F.cross_entropy(logits[0, 0:1].float(), torch.tensor([5])),
++                          atol=1e-5)
++
++
++def test_exclusion_pushes_mass_off_the_gold_and_onto_alternatives():
++    """The sign is why this arm must be paired with --slot-ntp-weight 1.0."""
++    torch.manual_seed(0)
++    logits = torch.randn(1, 4, 11, requires_grad=True)
++    flat = _flattener(True)._build_concept_targets(_TWO_SLOTS, 1, 4)
++    _scorer("uniform", True)._compute_concept_losses_vectorized(logits, *flat)[0].backward()
++    assert logits.grad[0, 0, 5] > 0          # gold logit pushed down
++    assert logits.grad[0, 0, 7] < 0          # alternatives pushed up
++    assert logits.grad[0, 0, 9] < 0
 diff --git a/train.py b/train.py
-index 0778a31..7c95104 100644
+index 0778a31..083fa35 100644
 --- a/train.py
 +++ b/train.py
 @@ -132,20 +132,47 @@ class ConceptDataset(Dataset):
@@ -1186,7 +1362,7 @@ index 0778a31..7c95104 100644
                  })
  
          if max_samples and max_samples > 0:
-@@ -175,14 +203,31 @@ class ConceptDataset(Dataset):
+@@ -175,14 +203,32 @@ class ConceptDataset(Dataset):
              'input_ids': item['input_ids'],
              'attention_mask': item['attention_mask'],
              'content_words': item['content_words'],
@@ -1211,6 +1387,7 @@ index 0778a31..7c95104 100644
 +        concept_objective="set_marginal",
 +        slot_ntp_weight=None,
 +        contrast_beta=0.0,
++        exclude_target=False,
 +        **kwargs,
 +    ):
          super().__init__(**kwargs)
@@ -1219,7 +1396,7 @@ index 0778a31..7c95104 100644
          self.concept_loss_weight = concept_loss_weight
          self.max_synonyms_per_content_word = max_synonyms_per_content_word
          self.max_content_words = max_content_words
-@@ -197,6 +242,12 @@ class ConceptLossTrainer(Trainer):
+@@ -197,6 +243,17 @@ class ConceptLossTrainer(Trainer):
          self._is_evaluating = False
          self._last_eval_metrics = {}
          self.randomized_synonyms = randomized_synonyms
@@ -1229,10 +1406,15 @@ index 0778a31..7c95104 100644
 +        # observed-token term used by our uniform objective.
 +        self.slot_ntp_weight = slot_ntp_weight
 +        self.contrast_beta = float(contrast_beta)
++        # Gold-exclusive supervision.  The released objective always includes the
++        # observed token in the candidate set, which lets the loss be satisfied by
++        # the mass NTP already puts there; excluding it forces the alternatives to
++        # be learned on their own.  This is the P1_fixed arm from task 14.
++        self.exclude_target = bool(exclude_target)
  
      def get_eval_dataloader(self, eval_dataset=None):
          """Create eval dataloader that adds labels for loss computation."""
-@@ -258,7 +309,11 @@ class ConceptLossTrainer(Trainer):
+@@ -258,7 +315,11 @@ class ConceptLossTrainer(Trainer):
  
          # Skip concept-loss work entirely when its weight is 0 and we're not in
          # weighted-CE mode (which needs concept timesteps for its own weighting).
@@ -1245,7 +1427,7 @@ index 0778a31..7c95104 100644
  
          if skip_concept_work:
              concept_loss = torch.tensor(0.0, device=logits.device)
-@@ -266,12 +321,16 @@ class ConceptLossTrainer(Trainer):
+@@ -266,12 +327,16 @@ class ConceptLossTrainer(Trainer):
              ce_loss = (per_token_ce * valid.float()).sum() / N_total
              training_loss = ce_loss
          else:
@@ -1265,7 +1447,7 @@ index 0778a31..7c95104 100644
              )
  
              if self.use_weighted_ce:
-@@ -282,7 +341,7 @@ class ConceptLossTrainer(Trainer):
+@@ -282,7 +347,7 @@ class ConceptLossTrainer(Trainer):
                      ce_weights[b_t, s_t] = self.ce_concept_token_weight
                  denom = (ce_weights * valid.float()).sum().clamp(min=1e-8)
                  ce_loss = (per_token_ce * ce_weights * valid.float()).sum() / denom
@@ -1274,7 +1456,7 @@ index 0778a31..7c95104 100644
              else:
                  target_mask = torch.zeros(batch_size, shift_len, dtype=torch.bool, device=logits.device)
                  if flat_b_idx:
-@@ -301,10 +360,23 @@ class ConceptLossTrainer(Trainer):
+@@ -301,10 +366,23 @@ class ConceptLossTrainer(Trainer):
                  ce_loss_non_targets = (per_token_ce * non_target_valid.float()).sum() / N_non_target.clamp(min=1e-8)
                  ce_loss_targets = (per_token_ce * target_valid.float()).sum() / N_target.clamp(min=1e-8)
  
@@ -1300,7 +1482,7 @@ index 0778a31..7c95104 100644
  
          ce_loss_val = ce_loss.detach().item()
          concept_loss_val = concept_loss.detach().item()
-@@ -319,6 +391,7 @@ class ConceptLossTrainer(Trainer):
+@@ -319,6 +397,7 @@ class ConceptLossTrainer(Trainer):
                  self.log({
                      "ce_loss": ce_loss_val,
                      "concept_loss": concept_loss_val,
@@ -1308,7 +1490,7 @@ index 0778a31..7c95104 100644
                      "perplexity": perplexity,
                  })
  
-@@ -343,18 +416,33 @@ class ConceptLossTrainer(Trainer):
+@@ -343,18 +422,33 @@ class ConceptLossTrainer(Trainer):
          flat_b_idx = []
          flat_shift_idx = []
          flat_concept_ids = []
@@ -1344,7 +1526,35 @@ index 0778a31..7c95104 100644
                  content_words = rng.sample(content_words, k)
  
              for tw in content_words:
-@@ -382,10 +470,25 @@ class ConceptLossTrainer(Trainer):
+@@ -368,6 +462,14 @@ class ConceptLossTrainer(Trainer):
+                     # max_synonyms + 1 synonyms.
+                     limit = (max_synonyms + 1) if max_synonyms is not None else None
+                     ids = list(synonyms[:limit]) if limit is not None else list(synonyms)
++                elif self.exclude_target:
++                    # Gold-exclusive: alternatives only.  A synonym list that
++                    # happens to repeat the observed token is de-duplicated, so
++                    # the gold can never re-enter through the back door.
++                    target_id = int(tw['target_token_id'])
++                    limit = max_synonyms
++                    pool = synonyms[:limit] if limit is not None else synonyms
++                    ids = [int(t) for t in pool if int(t) != target_id]
+                 else:
+                     ids = [tw['target_token_id']]
+                     limit = max_synonyms
+@@ -376,16 +478,37 @@ class ConceptLossTrainer(Trainer):
+                     else:
+                         ids.extend(synonyms)
+ 
+-                if not ids:
++                # A slot whose only candidate was the gold becomes empty under
++                # exclusion.  It is kept and contributes exactly zero, never
++                # dropped: the concept loss is a mean over content slots, so
++                # dropping these rows would shrink the denominator and silently
++                # make lambda mean something different in this arm than in the
++                # gold-inclusive ones it is being compared against.
++                if not ids and not self.exclude_target:
+                     continue
+ 
                  flat_b_idx.append(b)
                  flat_shift_idx.append(shift_pos)
                  flat_concept_ids.append(ids)
@@ -1374,7 +1584,7 @@ index 0778a31..7c95104 100644
          """
          Vectorized concept loss:
            - Gather logits only at target shift positions: [num_targets, V].
-@@ -394,7 +497,8 @@ class ConceptLossTrainer(Trainer):
+@@ -394,7 +517,8 @@ class ConceptLossTrainer(Trainer):
            - Apply margin (hinge) loss at target_mass.
          """
          if not flat_b_idx:
@@ -1384,7 +1594,7 @@ index 0778a31..7c95104 100644
  
          device = logits.device
          b_t = torch.tensor(flat_b_idx, device=device, dtype=torch.long)
-@@ -402,7 +506,7 @@ class ConceptLossTrainer(Trainer):
+@@ -402,10 +526,11 @@ class ConceptLossTrainer(Trainer):
  
          # logits[b, shift_pos] = logits at index shift_pos predicts token at shift_pos+1.
          target_logits = logits[b_t, s_t]                    # [num_targets, V]
@@ -1392,8 +1602,13 @@ index 0778a31..7c95104 100644
 +        target_log_probs = F.log_softmax(target_logits.float(), dim=-1)
  
          num_targets = len(flat_concept_ids)
-         max_concept = max(len(ids) for ids in flat_concept_ids)
-@@ -413,18 +517,45 @@ class ConceptLossTrainer(Trainer):
+-        max_concept = max(len(ids) for ids in flat_concept_ids)
++        # max(1, ...) keeps the gather well-formed when exclusion empties a row.
++        max_concept = max(1, max(len(ids) for ids in flat_concept_ids))
+         padded_ids = torch.zeros(num_targets, max_concept, dtype=torch.long, device=device)
+         valid_mask = torch.zeros(num_targets, max_concept, dtype=torch.bool, device=device)
+         for i, ids in enumerate(flat_concept_ids):
+@@ -413,18 +538,53 @@ class ConceptLossTrainer(Trainer):
              padded_ids[i, :n] = torch.tensor(ids, dtype=torch.long, device=device)
              valid_mask[i, :n] = True
  
@@ -1403,14 +1618,13 @@ index 0778a31..7c95104 100644
 +        gathered_log = gathered_log.masked_fill(~valid_mask, float("-inf"))
 +        log_mass = torch.logsumexp(gathered_log, dim=1)
 +        mass = log_mass.exp()
++        # Rows emptied by --exclude-target: -inf mass would make set_marginal
++        # infinite, so they are forced to zero below in either objective.
++        has_candidate = valid_mask.any(dim=1)
  
          # Margin loss: zero contribution above target_mass, -log(mass) below.
          # torch.where evaluates both branches; clamp keeps log finite either way.
 -        neg_log = -torch.log(mass.clamp(min=1e-9))
--        loss_per_target = torch.where(
--            mass >= self.target_mass,
--            torch.zeros_like(mass),
--            neg_log,
 +        if self.concept_objective == "set_marginal":
 +            neg_log = -log_mass
 +            loss_per_target = torch.where(
@@ -1425,12 +1639,20 @@ index 0778a31..7c95104 100644
 +            safe_log = gathered_log.masked_fill(~valid_mask, 0.0)
 +            loss_per_target = -(safe_log.sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1))
 +
+         loss_per_target = torch.where(
+-            mass >= self.target_mass,
+-            torch.zeros_like(mass),
+-            neg_log,
++            has_candidate, loss_per_target, torch.zeros_like(loss_per_target))
++
 +        contrast_losses = []
 +        if self.contrast_beta:
 +            for row, negative_ids in enumerate(flat_negative_ids):
 +                if not negative_ids:
 +                    continue
 +                neg_ids = torch.tensor(negative_ids, device=device, dtype=torch.long)
++                if not bool(has_candidate[row]):
++                    continue
 +                negative_log = target_log_probs[row].gather(0, neg_ids)
 +                positive_log = gathered_log[row][valid_mask[row]]
 +                all_log = torch.cat([positive_log, negative_log])
@@ -1447,7 +1669,7 @@ index 0778a31..7c95104 100644
  
      def compute_metrics(self, eval_pred):
          """Compute and return evaluation metrics from accumulated values."""
-@@ -512,6 +643,19 @@ class EvalMetricsCallback(TrainerCallback):
+@@ -512,6 +672,19 @@ class EvalMetricsCallback(TrainerCallback):
                  logger.warning("wandb.run is None, cannot log metrics")
  
  
@@ -1467,7 +1689,7 @@ index 0778a31..7c95104 100644
  def collate_fn(examples, tokenizer):
      """Custom collate function for concept dataset."""
      input_ids = pad_sequence(
-@@ -527,11 +671,13 @@ def collate_fn(examples, tokenizer):
+@@ -527,11 +700,13 @@ def collate_fn(examples, tokenizer):
  
      # List of lists: content_words_list[b] = [{word, position, synonyms}, ...] for sequence b
      content_words_list = [ex['content_words'] for ex in examples]
@@ -1481,7 +1703,7 @@ index 0778a31..7c95104 100644
      }
  
  
-@@ -627,6 +773,42 @@ def parse_args():
+@@ -627,6 +802,47 @@ def parse_args():
          default=None,
          help='Weight for concept loss (default: use value from config)'
      )
@@ -1496,6 +1718,11 @@ index 0778a31..7c95104 100644
 +        type=float,
 +        default=None,
 +        help='Explicit CE weight at concept slots. Omit to preserve 1-lambda.',
++    )
++    parser.add_argument(
++        '--exclude-target',
++        action='store_true',
++        help='Drop the observed token from the candidate set (gold-exclusive).',
 +    )
 +    parser.add_argument(
 +        '--contrast-beta',
@@ -1524,7 +1751,7 @@ index 0778a31..7c95104 100644
      parser.add_argument(
          '--model-name',
          type=str,
-@@ -684,7 +866,7 @@ def parse_args():
+@@ -684,7 +900,7 @@ def parse_args():
      )
      parser.add_argument(
          '--num-train-epochs',
@@ -1533,7 +1760,7 @@ index 0778a31..7c95104 100644
          default=None,
          help='Number of train epochs (default: use value from config)'
      )
-@@ -707,6 +889,22 @@ def main():
+@@ -707,6 +923,24 @@ def main():
      if args.concept_loss_weight is not None:
          logger.info(f"Overriding concept_loss_weight from command line: {args.concept_loss_weight}")
          config.concept_loss_weight = args.concept_loss_weight
@@ -1541,6 +1768,8 @@ index 0778a31..7c95104 100644
 +        config.concept_objective = args.concept_objective
 +    if args.slot_ntp_weight is not None:
 +        config.slot_ntp_weight = args.slot_ntp_weight
++    if args.exclude_target:
++        config.exclude_target = True
 +    if args.contrast_beta is not None:
 +        config.contrast_beta = args.contrast_beta
 +    if args.seed is not None:
@@ -1556,7 +1785,7 @@ index 0778a31..7c95104 100644
  
      if args.model_name is not None:
          logger.info(f"Overriding model_name from command line: {args.model_name}")
-@@ -753,7 +951,7 @@ def main():
+@@ -753,7 +987,7 @@ def main():
      content_word_tag = "all_content_words" if config.max_content_words is None else f"{config.max_content_words}_content_words"
  
      data_base_dir = dataset_dir(dataset_name, config.model_name, dataset_type)
@@ -1565,7 +1794,7 @@ index 0778a31..7c95104 100644
  
      # Pick the training file and a short run-name tag for the active ablation.
      if config.randomized_synonyms:
-@@ -772,17 +970,29 @@ def main():
+@@ -772,17 +1006,29 @@ def main():
          train_path = os.path.join(data_base_dir, "synonyms_train.jsonl")
          run_tag = None
  
@@ -1606,7 +1835,7 @@ index 0778a31..7c95104 100644
  
      run_name_parts = [dataset_name, suffix, dataset_type, content_word_tag]
      if run_tag:
-@@ -793,6 +1003,10 @@ def main():
+@@ -793,6 +1039,10 @@ def main():
      os.makedirs(config.output_dir, exist_ok=True)
  
      logger.info(f"Using concept_loss_weight: {config.concept_loss_weight}")
@@ -1617,7 +1846,7 @@ index 0778a31..7c95104 100644
      logger.info(f"Using model_name: {config.model_name}")
      logger.info(f"Using dataset: {config.dataset}")
      logger.info(f"Using randomized_synonyms: {config.randomized_synonyms}")
-@@ -807,6 +1021,10 @@ def main():
+@@ -807,6 +1057,10 @@ def main():
      logger.info(f"Using max_train_samples: {config.max_train_samples}")
      logger.info(f"Using num_train_epochs: {config.num_train_epochs}")
      logger.info(f"Using use_data_augmentation: {args.use_data_augmentation}")
@@ -1628,7 +1857,7 @@ index 0778a31..7c95104 100644
  
      if args.use_data_augmentation:
          assert config.concept_loss_weight == 0, (
-@@ -877,7 +1095,7 @@ def main():
+@@ -877,7 +1131,7 @@ def main():
          optim="adamw_torch_fused",
      )
  
@@ -1637,17 +1866,18 @@ index 0778a31..7c95104 100644
      if eval_dataset and config.early_stopping:
          callbacks.append(
              EarlyStoppingCallback(
-@@ -904,6 +1122,9 @@ def main():
+@@ -904,6 +1158,10 @@ def main():
          randomized_synonyms=config.randomized_synonyms,
          use_weighted_ce=config.use_weighted_ce,
          ce_concept_token_weight=config.ce_concept_token_weight,
 +        concept_objective=config.concept_objective,
++        exclude_target=getattr(config, "exclude_target", False),
 +        slot_ntp_weight=config.slot_ntp_weight,
 +        contrast_beta=config.contrast_beta,
          callbacks=callbacks,
      )
  
-@@ -916,6 +1137,27 @@ def main():
+@@ -916,6 +1174,27 @@ def main():
      logger.info(f"\nSaving final model to {config.output_dir}...")
      trainer.save_model(config.output_dir)
      tokenizer.save_pretrained(config.output_dir)
