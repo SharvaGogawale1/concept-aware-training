@@ -83,11 +83,15 @@ if not os.environ.get("HF_TOKEN") and _cli_token.is_file():
     os.environ["HF_TOKEN"] = _cli_token.read_text().strip()
 os.environ["HF_HOME"] = str(WORK / "hf_cache")
 
-RUN_DATA = True
-RUN_SMOKE = True
-RUN_SCREEN = True
+# Turn on one gate at a time.  These MUST default to False, as they do in the
+# Colab notebook: opening this file to check the directory layout and hitting Run
+# All should not start extraction, a smoke train, seven training runs and the
+# whole evaluation suite.
+RUN_DATA = False
+RUN_SMOKE = False
+RUN_SCREEN = False
 RUN_CONFIRM = False
-RUN_EVAL = True
+RUN_EVAL = False
 # Skip any run whose artefacts already exist.  A killed job resumes from here.
 RESUME_FINISHED_RUNS = True
 
@@ -109,7 +113,8 @@ EXTRACT_SHARD = 500
 SPLIT_TRAIN = int(EXTRACT_SEQUENCES * 0.8)
 SPLIT_VAL = SPLIT_TEST = int(EXTRACT_SEQUENCES * 0.1)
 
-_BAR = re.compile(r"\b(\d+)/(\d+)\s*\[")   # tqdm counter, e.g. "  200/1000 ["
+_BAR = re.compile(r"\b(\d+)/(\d+)\s*\[")     # bounded tqdm: "  200/1000 ["
+_BAR_OPEN = re.compile(r"\b(\d+)it\s*\[")     # unbounded tqdm: "  3200it [00:49"
 PROGRESS_EVERY = 100
 
 def run(argv, cwd=None, env=None):
@@ -132,6 +137,13 @@ def run(argv, cwd=None, env=None):
         if hit:
             done, total = int(hit.group(1)), int(hit.group(2))
             if done % PROGRESS_EVERY and done != total:
+                continue
+        else:
+            # Dataset loading has no total ("3200it [00:49"), so there is no final
+            # count to anchor on.  Thin it ten times harder; it is pure noise and
+            # a full sweep would otherwise emit tens of thousands of lines.
+            loose = _BAR_OPEN.search(line)
+            if loose and int(loose.group(1)) % (PROGRESS_EVERY * 10):
                 continue
         print(line, end="", flush=True)
     code = process.wait()
