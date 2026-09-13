@@ -594,8 +594,12 @@ if RUN_EVAL:
     # against.  The index is looked up by label rather than hardcoded: RUN_CONFIRM
     # pops zhang_lambda1.0_seed42, so positions shift once seeds are added and a
     # literal index would quietly compare against the wrong arm.
+    # randomized is the one that decides whether the SWORDS gain is semantic:
+    # it is trained with the same objective on meaningless candidate sets, so a
+    # concept arm that does not separate from it there is buying its GAP with
+    # distributional smoothing rather than with concept content.
     baselines = {"pretrained": BASE_MODEL}
-    for label in ("ntp_seed42", "augmented_ntp_seed42"):
+    for label in ("ntp_seed42", "augmented_ntp_seed42", "randomized_seed42"):
         if label in REPRO_RUNS:
             baselines[label] = str(REPRO_RUNS[label])
     for label, reference in baselines.items():
