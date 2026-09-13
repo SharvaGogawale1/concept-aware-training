@@ -96,9 +96,16 @@ RESUME_FINISHED_RUNS = True
 # sequence; measured on an L4, bf16 was ~25% faster and avoids quantisation
 # noise in the top-100 pool and the 0.75 cosine threshold the method depends on.
 EXTRACT_4BIT = False
-# Full paper spec: 10,000 sequences split 8000/1000/1000.  merge_synonym_parts
-# hard-fails unless the split sizes sum to the rows the shards actually cover.
-EXTRACT_SEQUENCES = 10000
+# Must match the Colab notebook: the two variants feed one study, and a model
+# extracted here on 10,000 sequences could not be compared with one extracted
+# there on 4,000.  Zhang et al. Fig. 8 reports STS unchanged at a quarter of the
+# data; 4,000 keeps the 80/10/10 ratio.  Raise BOTH to 10000 for the strict
+# reproduction.  merge_synonym_parts hard-fails unless the split sizes sum to the
+# rows the shards actually cover.
+EXTRACT_SEQUENCES = 4000
+# Sequences per extraction shard, and so exactly what a killed job costs: a shard
+# is only recorded as finished once it completes.
+EXTRACT_SHARD = 500
 SPLIT_TRAIN = int(EXTRACT_SEQUENCES * 0.8)
 SPLIT_VAL = SPLIT_TEST = int(EXTRACT_SEQUENCES * 0.1)
 

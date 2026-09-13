@@ -95,6 +95,11 @@ EXTRACT_4BIT = False
 # sum to the number of sequences the shards actually cover, and the 3B scaling
 # stage uses the same count so size comparisons are not confounded by data volume.
 EXTRACT_SEQUENCES = 4000
+# Sequences per extraction shard.  A shard is the unit of resume: it is cached to
+# Drive only once it completes, so this is exactly what a disconnect costs.  At
+# 3B's measured 10 s/sequence a 1000-shard is nearly three hours of exposure;
+# 500 halves that for one extra model load per shard, about 30 seconds.
+EXTRACT_SHARD = 500
 SPLIT_TRAIN = int(EXTRACT_SEQUENCES * 0.8)
 SPLIT_VAL = SPLIT_TEST = int(EXTRACT_SEQUENCES * 0.1)
 
@@ -489,8 +494,8 @@ if RUN_DATA:
     # One manifest per model: a shared name would let the 1B shards mark the 3B
     # ones as finished, and extraction would be skipped entirely.
     shards_done = load_runs(f"task15_shards{_TAG_SUFFIX}")
-    for start in range(0, EXTRACT_SEQUENCES, 1000):
-        end = start + 1000
+    for start in range(0, EXTRACT_SEQUENCES, EXTRACT_SHARD):
+        end = start + EXTRACT_SHARD
         key = f"{start}_{end}"
         synonym_part = LEAF / f"synonyms_{start}_{end}.jsonl"
         topk_part = LEAF.parent / "prompting" / f"topk_{start}_{end}.jsonl"
