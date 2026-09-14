@@ -525,7 +525,10 @@ if RUN_DATA:
          "--tokenizer", BASE_MODEL,
          "--expected-train", SPLIT_TRAIN, "--expected-validation", SPLIT_VAL,
          "--expected-test", SPLIT_TEST,
-         "--report", DRIVE_RESULTS / "data_audit.json"], cwd=EXT)
+         # Per model: a shared name means the second model's audit silently
+         # overwrites the first's, and the provenance of the finished data is
+         # exactly what an audit report exists to preserve.
+         "--report", DRIVE_RESULTS / f"data_audit{_TAG_SUFFIX}.json"], cwd=EXT)
 '''),
         md('''## Unit tests and eight-row GPU smoke run
 
