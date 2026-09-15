@@ -44,7 +44,24 @@ import hashlib, json, re, shutil, subprocess, sys, torch
 
 # Every clone, dataset, checkpoint and result lives under BASE, so the whole
 # experiment is one directory to archive or copy off the server.
-BASE = Path(os.environ.get("CONCEPT_BASE", Path.cwd())).resolve()
+def _notebook_base():
+    """Directory the notebook itself lives in, so `outputs/` lands beside it.
+
+    CONCEPT_BASE wins when set.  Otherwise prefer JPY_SESSION_NAME, which Jupyter
+    sets to the notebook's own path: the working directory is the notebook's
+    directory only when the kernel happened to start there, so `jupyter nbconvert
+    --execute` invoked from anywhere else would scatter a second outputs/ tree
+    next to wherever it was run from.
+    """
+    override = os.environ.get("CONCEPT_BASE")
+    if override:
+        return Path(override)
+    session = os.environ.get("JPY_SESSION_NAME", "")
+    if session.endswith(".ipynb") and Path(session).parent.is_dir():
+        return Path(session).parent
+    return Path.cwd()
+
+BASE = _notebook_base().resolve()
 WORK = BASE / "concept_aware"
 MAIN = WORK / "concept-aware-training"     # our repo: patch, evaluators, scripts
 EXT = WORK / "learning-concepts"           # upstream, pinned
@@ -52,19 +69,34 @@ DATA = WORK / "data"                       # CONCEPT_DATA_ROOT
 RUNS = WORK / "runs"                       # adapters (small at r=4, kept)
 OUTPUTS = BASE / "outputs"                 # everything you download for analysis
 
-BASE_MODEL = "meta-llama/Llama-3.2-1B"
+# ONE model per pass.  Every artefact below is keyed on the model tag and the
+# resume logic reads finished work back by path, so the model is selected from the
+# environment rather than looped over here -- which is also what lets two models
+# share the machine without sharing a GPU.  See the cell above for the commands.
+BASE_MODEL = os.environ.get("CONCEPT_MODEL", "Qwen/Qwen2.5-1.5B")
 # Every per-model artifact is keyed on this tag.  Two models must never share a
 # path: adapters resume by path, so a collision hands one model's weights to
-# another and the run still looks like it succeeded.
+# another and the run still looks like it succeeded.  conceptlib.paths derives
+# the same tag the same way, so the data directories line up with these.
 MODEL_TAG = BASE_MODEL.split("/")[-1].lower()
 # combined.jsonl depends only on the tokenizer, so a model sharing a vocabulary
-# with one already extracted produces a byte-identical file (Llama-3.2 1B and 3B
-# do).  Naming the donor here skips the POS pass; the vocabularies are compared
-# before the copy and the run aborts if they differ.
-REUSE_CONTENT_WORDS_FROM = None
-_TAG_SUFFIX = "" if MODEL_TAG == "llama-3.2-1b" else f"_{MODEL_TAG}"
-RESULT_DIR = f"task15_reproduction{_TAG_SUFFIX}"
-LOG_DIR = f"task15_logs{_TAG_SUFFIX}"
+# with one already extracted produces a byte-identical file.  Naming the donor
+# skips the spaCy POS pass; the vocabularies are compared before the copy and the
+# run aborts if they differ.  Each pair shares a tokenizer WITHIN its family and
+# never across families, which is why this is a table and not a size heuristic.
+VOCAB_DONOR = {"Qwen/Qwen2.5-3B": "Qwen/Qwen2.5-1.5B",
+               "meta-llama/Llama-3.2-3B": "meta-llama/Llama-3.2-1B"}
+REUSE_CONTENT_WORDS_FROM = os.environ.get("CONCEPT_REUSE_FROM") or VOCAB_DONOR.get(BASE_MODEL)
+
+# outputs/<model tag>/{data_audit.json,results,logs,run_manifests}, plus one
+# shared directory for the two model-independent reports.  Unlike the Colab
+# notebook there is no legacy unsuffixed path to preserve here, so EVERY model
+# gets its own directory -- including the first one.
+MODEL_OUT = OUTPUTS / MODEL_TAG
+RESULT_DIR = MODEL_OUT / "results"
+LOG_DIR = MODEL_OUT / "logs"
+SHARED = OUTPUTS / "shared"
+DATA_AUDIT = MODEL_OUT / "data_audit.json"
 PRIMARY_SEED = 42
 # One seed screens the pipeline and shows the direction of every effect, but it
 # CANNOT support a claim: the pre-registered rule needs all three to agree in
@@ -155,8 +187,8 @@ def run(argv, cwd=None, env=None):
 def sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
-def sync_small_artifacts(source, label):
-    destination = OUTPUTS / label
+def sync_small_artifacts(source, destination):
+    destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
     for path in Path(source).rglob("*"):
         if path.is_file() and path.suffix.lower() in {".json", ".jsonl", ".csv", ".png", ".log"}:
@@ -185,7 +217,10 @@ def cache_adapter(path): return Path(path)
 def restore_adapter(path):
     return (Path(path) / "adapter_config.json").is_file()
 
-RUN_MANIFEST = OUTPUTS / "run_manifests"
+# Inside THIS model's output directory.  A manifest shared between models would
+# name another model's adapters, and restore_all would load them without
+# complaint -- the resume path has no way to tell whose weights it just read.
+RUN_MANIFEST = MODEL_OUT / "run_manifests"
 
 def save_runs(runs, name):
     RUN_MANIFEST.mkdir(parents=True, exist_ok=True)
@@ -244,11 +279,13 @@ def assert_under_base(path):
     resolved = Path(path).resolve()
     assert str(resolved).startswith(str(BASE)), f"{resolved} escapes {BASE}"
 
-for directory in (WORK, DATA, RUNS, OUTPUTS):
+for directory in (WORK, DATA, RUNS, OUTPUTS, MODEL_OUT, RESULT_DIR, LOG_DIR, SHARED):
     directory.mkdir(parents=True, exist_ok=True)
-print("BASE    ", BASE)
-print("OUTPUTS ", OUTPUTS)
-print("GPU     ", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "NONE")
+print("BASE      ", BASE)
+print("MODEL     ", BASE_MODEL, "->", MODEL_TAG)
+print("REUSE FROM", REUSE_CONTENT_WORDS_FROM or "(nothing: full extraction)")
+print("OUTPUTS   ", MODEL_OUT)
+print("GPU       ", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "NONE")
 '''
 
 BOOTSTRAP = r'''
@@ -282,27 +319,126 @@ nltk.download("omw-1.4", quiet=True)
 
 run([sys.executable, MAIN / "builddataset/verify_task14_data.py",
      "--repo_root", MAIN, "--download_missing",
-     "--report_json", OUTPUTS / "external_benchmark_integrity.json"], cwd=MAIN)
-(OUTPUTS / "environment_freeze.txt").write_text(
+     "--report_json", SHARED / "external_benchmark_integrity.json"], cwd=MAIN)
+(SHARED / "environment_freeze.txt").write_text(
     subprocess.check_output([sys.executable, "-m", "pip", "freeze"], text=True))
 
-# Llama-3.2-1B is gated.  Fail here rather than 20 minutes later inside a child
-# process: a missing token surfaces as a 401 on config.json from a subprocess
-# whose traceback says nothing about authentication.
+# Prove the model is reachable FROM A SUBPROCESS, which is where every download
+# actually happens.  The parent can hold credentials a freshly spawned child does
+# not inherit, and the failure then surfaces 20 minutes later as a bare 401 on
+# config.json whose traceback says nothing about authentication.
+# The token is optional because gating is: Qwen2.5 is openly licensed, Llama-3.2
+# is gated.  Demanding a token unconditionally would block a Qwen-only run for no
+# reason, so let the reachability probe be the thing that decides.
 from huggingface_hub import login, whoami
-assert os.environ.get("HF_TOKEN"), (
-    "No Hugging Face token.  Run `huggingface-cli login` on this machine, or "
-    "export HF_TOKEN before starting Jupyter, then re-run this cell.")
-login(token=os.environ["HF_TOKEN"], add_to_git_credential=False)
-print("Hugging Face:", whoami()["name"])
-subprocess.run([sys.executable, "-c",
-                "from transformers import AutoConfig;"
-                "AutoConfig.from_pretrained('meta-llama/Llama-3.2-1B');"
-                "print('gated repo reachable from a subprocess')"],
-               env={**os.environ}, check=True)
+if os.environ.get("HF_TOKEN"):
+    login(token=os.environ["HF_TOKEN"], add_to_git_credential=False)
+    print("Hugging Face:", whoami()["name"])
+else:
+    print("No HF_TOKEN set; continuing on the assumption this model is ungated.")
+_probe = subprocess.run(
+    [sys.executable, "-c",
+     "import sys; from transformers import AutoConfig;"
+     "AutoConfig.from_pretrained(sys.argv[1]);"
+     "print('model repo reachable from a subprocess')", BASE_MODEL],
+    env={**os.environ}, capture_output=True, text=True)
+assert _probe.returncode == 0, (
+    f"{BASE_MODEL} is not reachable from a child process.  If it is a gated repo, "
+    "run `huggingface-cli login` on this machine or export HF_TOKEN before "
+    f"starting Jupyter, then re-run this cell.\n{_probe.stderr[-2000:]}")
+print(_probe.stdout.strip())
+'''
+
+HEADER = r'''
+# Task 15 (server) — reproduce concept training before extending it
+
+Server twin of `research_tasks_15_zhang_reproduction.ipynb` (Colab). Same
+objective, same schedule, same evaluators; the difference is that the filesystem
+persists, so nothing round-trips through Drive.
+
+**One model per pass.** Every artefact is keyed on the model tag and the resume
+logic reads finished work back by path, so the model is chosen with an
+environment variable rather than a loop:
+
+```bash
+# sequentially, one GPU
+CONCEPT_MODEL=Qwen/Qwen2.5-1.5B GPU_ID=0 jupyter nbconvert --execute --to notebook \
+    --inplace --ExecutePreprocessor.timeout=-1 reproducibilty_15.ipynb
+CONCEPT_MODEL=Qwen/Qwen2.5-3B   GPU_ID=0 jupyter nbconvert --execute ...
+
+# or both at once, one GPU each
+CONCEPT_MODEL=Qwen/Qwen2.5-1.5B GPU_ID=0 ... &
+CONCEPT_MODEL=Qwen/Qwen2.5-3B   GPU_ID=1 ... &
+```
+
+`Qwen/Qwen2.5-3B` reuses `Qwen/Qwen2.5-1.5B`'s content words when that model has
+already been extracted, which skips the spaCy POS pass; the two tokenizers are
+compared before the copy and the run aborts if they differ. Run them in parallel
+and 3B simply pays that pass itself, so either order is safe.
+
+## Layout
+
+Everything lands under the directory the notebook itself lives in — clones and
+checkpoints in `concept_aware/`, reports in `outputs/`:
+
+```
+outputs/
+├── qwen2.5-1.5b/
+│   ├── data_audit.json
+│   ├── results/         flat_main_table.csv, sts_*.csv, *_ci_*.json, mteb_raw/
+│   ├── logs/            per-arm training_history.jsonl
+│   └── run_manifests/   label -> adapter path, extraction shard completion
+├── qwen2.5-3b/          same shape
+└── shared/              pip freeze, benchmark integrity (model-independent)
+```
+
+That is the layout the local analysis copy already uses, so a finished model
+directory is copied off the server as-is with no renaming.
+
+## Before the long run
+
+Set the `RUN_*` gates in the setup cell — they all default to `False` so that
+opening this file and hitting Run All does nothing expensive. Then watch the
+**first extraction shard**: this server measured 49 s/sequence in August against
+Colab's 5.6, and at that rate 4,000 sequences is days, not hours. Shards resume,
+so interrupting after the first costs nothing.
 '''
 
 RENAME = [
+    # Layout: outputs/<model tag>/{data_audit.json,results,logs,run_manifests}.  The
+    # Colab body keys everything on _TAG_SUFFIX because its 1B run predates the
+    # per-model layout; the server has no such legacy, so every model gets its own
+    # directory and the suffix has no meaning.  These must run BEFORE the generic
+    # DRIVE_RESULTS rename below, since they match the original spelling.
+    ('DRIVE_RESULTS / f"data_audit{_TAG_SUFFIX}.json"', "DATA_AUDIT"),
+    ('load_runs(f"task15_shards{_TAG_SUFFIX}")', 'load_runs("task15_shards")'),
+    ('save_runs(shards_done, f"task15_shards{_TAG_SUFFIX}")', 'save_runs(shards_done, "task15_shards")'),
+    ('load_runs(f"task15{_TAG_SUFFIX}")', 'load_runs("task15")'),
+    ('save_runs(REPRO_RUNS, f"task15{_TAG_SUFFIX}")', 'save_runs(REPRO_RUNS, "task15")'),
+    ("result_dir = DRIVE_RESULTS / RESULT_DIR", "result_dir = RESULT_DIR"),
+    ('sync_small_artifacts(path, f"{LOG_DIR}/{label}")', "sync_small_artifacts(path, LOG_DIR / label)"),
+    ('plt.savefig(DRIVE_RESULTS / RESULT_DIR / "training_curves.png"', 'plt.savefig(RESULT_DIR / "training_curves.png"'),
+    # Wording that is true of Colab and false of a persistent filesystem.
+    ("# Unconditional: /content is wiped between sessions and the smoke run in the next\n"
+     "# section reads synonyms_train.jsonl directly.  Whenever the data was generated in\n"
+     "# an EARLIER session -- the normal case for every model after the first -- RUN_DATA\n"
+     "# is off, and restoring only inside that branch left the smoke run to die on a\n"
+     "# missing file before any training started.",
+     "# A cheap existence check here; kept unconditional so the body stays identical\n"
+     "# to the Colab notebook's, where it is a real restore from Drive."),
+    ("Each 1k shard is cached to Drive once\n    # it completes, so a disconnect costs at most the shard in progress.",
+     "A shard is recorded as finished only\n    # once it completes, so a killed job costs at most the shard in progress."),
+    ("# One manifest per model: a shared name would let the 1B shards mark the 3B\n"
+     "    # ones as finished, and extraction would be skipped entirely.",
+     "# The manifest lives in this model's own output directory, so one model's\n"
+     "    # finished shards can never mark another's as done and skip extraction."),
+    ("# Per model: a shared name means the second model's audit silently\n"
+     "         # overwrites the first's, and the provenance of the finished data is\n"
+     "         # exactly what an audit report exists to preserve.",
+     "# Inside this model's directory: a shared path means the second model's\n"
+     "         # audit silently overwrites the first's, and the provenance of the\n"
+     "         # finished data is exactly what an audit report exists to preserve."),
+    ("exists locally or on Drive", "is on disk"),
     ("DRIVE_RESULTS", "OUTPUTS"),
     ("cache_dataset_to_drive", "cache_dataset"),
     ("restore_dataset_from_drive", "restore_dataset"),
@@ -319,11 +455,7 @@ RENAME = [
 ]
 
 source = json.loads(SOURCE.read_text())
-cells = [md("# Task 15 (server) — reproduce concept training before extending it\n\n"
-            "Everything lives under the directory this notebook runs from: clones in\n"
-            "`concept_aware/`, results in `outputs/`.  Set `GPU_ID` in the setup cell to a\n"
-            "free GPU before running."),
-         code(INSTALL), code(SETUP), code(BOOTSTRAP)]
+cells = [md(HEADER.strip("\n")), code(INSTALL), code(SETUP), code(BOOTSTRAP)]
 
 for index, cell in enumerate(source["cells"]):
     if index in (0, 1, 2):          # title, Colab setup, Colab bootstrap

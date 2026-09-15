@@ -405,7 +405,7 @@ def finished(path):
     return restore_adapter_from_drive(path)
 
 def train_flat(method, seed, concept_weight, *, objective="set_marginal",
-               slot_ntp_weight=None, contrast_beta=0.0,
+               slot_ntp_weight=None, contrast_beta=0.0, exclude_target=False,
                randomized=False, data_augmentation=False, epochs=5, train_file=None,
                max_samples=None, batch=8, accum=2):
     out = adapter_path(method, seed, f"lambda_{concept_weight}_beta_{contrast_beta}")
@@ -417,6 +417,11 @@ def train_flat(method, seed, concept_weight, *, objective="set_marginal",
             "--per-device-train-batch-size", batch,
             "--gradient-accumulation-steps", accum]
     if slot_ntp_weight is not None: args += ["--slot-ntp-weight", slot_ntp_weight]
+    # Drops the observed target from the concept set, so the loss cannot be paid
+    # with the mass NTP already put there.  Pair it with slot_ntp_weight=1.0 or
+    # the observed target is pushed down.  adapter_path() does not encode this
+    # flag, so the METHOD name must differ from the target-inclusive arm's.
+    if exclude_target: args += ["--exclude-target"]
     if randomized: args += ["--randomized-synonyms"]
     if data_augmentation: args += ["--use-data-augmentation"]
     if train_file: args += ["--train-file", train_file]
@@ -435,7 +440,7 @@ def task15():
     cells = [
         md('''# Task 15 — Reproduce concept training before extending it
 
-This notebook answers one question first: **can we reproduce Zhang, Jurafsky, and Shani on the released C4 setup?** It keeps the released gold-inclusive set-marginal objective unchanged. Our uniform and contrastive losses are not run here.
+This notebook answers one question first: **can we reproduce Zhang, Jurafsky, and Shani on the released C4 setup?** It keeps the released target-inclusive set-marginal objective unchanged. Our uniform and contrastive losses are not run here.
 
 | Readable method | What changes |
 |---|---|
@@ -452,10 +457,15 @@ Primary reproduction evidence is nine-task mean STS, content-word NTP, and globa
 The audit hard-fails on split overlap, target misalignment, empty sets, or any concept that is not a complete single token. The observed target is part of every set by construction.'''),
         code(r'''
 LEAF = DATA / "c4" / MODEL_TAG / "embedding"
+# Unconditional: /content is wiped between sessions and the smoke run in the next
+# section reads synonyms_train.jsonl directly.  Whenever the data was generated in
+# an EARLIER session -- the normal case for every model after the first -- RUN_DATA
+# is off, and restoring only inside that branch left the smoke run to die on a
+# missing file before any training started.
+restore_dataset_from_drive(LEAF)
 if RUN_DATA:
     # The extraction is the longest stage.  Each 1k shard is cached to Drive once
     # it completes, so a disconnect costs at most the shard in progress.
-    restore_dataset_from_drive(LEAF)
     # get_content_words.py streams into combined.jsonl, so an interrupted pass
     # leaves a SHORT file behind and existence alone does not mean completion.
     # Test for "enough rows", not "exactly EXTRACT_SEQUENCES": MAX_SAMPLES is
@@ -464,18 +474,26 @@ if RUN_DATA:
     # and regenerate it on every resume.
     combined = LEAF.parent / "combined.jsonl"
     if not combined.is_file() and REUSE_CONTENT_WORDS_FROM:
-        from transformers import AutoTokenizer
-        assert (AutoTokenizer.from_pretrained(BASE_MODEL).get_vocab()
-                == AutoTokenizer.from_pretrained(REUSE_CONTENT_WORDS_FROM).get_vocab()), (
-            f"{BASE_MODEL} and {REUSE_CONTENT_WORDS_FROM} do not share a vocabulary, "
-            "so their content words differ and must be regenerated")
         donor_tag = REUSE_CONTENT_WORDS_FROM.split("/")[-1].lower()
         donor = DATA / "c4" / donor_tag / "combined.jsonl"
         if not donor.is_file():
             restore_dataset_from_drive(DATA / "c4" / donor_tag / "embedding")
-        combined.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(donor, combined)
-        print("reused content words from", REUSE_CONTENT_WORDS_FROM)
+        # The donor is a shortcut, never a requirement.  If it has not been
+        # extracted yet, fall through and generate this model's own content words
+        # rather than dying in shutil.copy2 -- which is also what lets two models
+        # of one family run concurrently on separate GPUs: whichever starts first
+        # simply pays the POS pass itself.
+        if not donor.is_file():
+            print("donor", donor, "not extracted yet; generating content words here")
+        else:
+            from transformers import AutoTokenizer
+            assert (AutoTokenizer.from_pretrained(BASE_MODEL).get_vocab()
+                    == AutoTokenizer.from_pretrained(REUSE_CONTENT_WORDS_FROM).get_vocab()), (
+                f"{BASE_MODEL} and {REUSE_CONTENT_WORDS_FROM} do not share a vocabulary, "
+                "so their content words differ and must be regenerated")
+            combined.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(donor, combined)
+            print("reused content words from", REUSE_CONTENT_WORDS_FROM)
     if combined.is_file():
         rows = sum(1 for _ in combined.open())
         if rows < EXTRACT_SEQUENCES:
@@ -611,7 +629,7 @@ if RERUN_PAPER_STATED_BATCH:
 '''),
         md('''## Evaluation and learning curves
 
-Every checkpoint is scored by the same evaluators. “Global NLL” covers every next-token position; “content-word NLL” covers the semantic slots; “set mass” is total probability assigned to the gold-inclusive valid set. SWORDS and bm-semlex are zero-shot here.'''),
+Every checkpoint is scored by the same evaluators. “Global NLL” covers every next-token position; “content-word NLL” covers the semantic slots; “set mass” is total probability assigned to the target-inclusive valid set. SWORDS and bm-semlex are zero-shot here.'''),
         code(r'''
 if RUN_EVAL:
     # A fresh session has the manifest but not the weights; pull them back first.
@@ -737,111 +755,348 @@ Proceed only if Zhang concept marginal beats NTP and augmented NTP on mean STS, 
 
 def task15b():
     cells = [
-        md('''# Task 15b — Uniform concept pressure and conservative contrastive separation
+        md(r"""# Task 15b — Alternative-only concept supervision and contrastive calibration
 
-This notebook starts **only after Task 15 passes**. It compares two additions to the same Zhang C4 pipeline:
+This notebook starts **only after Task 15 passes**. It adds two objectives to the same Zhang C4 pipeline and scores them against every Task 15 arm.
+
+Terminology used throughout (the word "gold" is not used):
+
+- **observed target** — the token that appeared in the C4 sentence (`chaos` in *"The room descended into chaos."*)
+- **generated alternatives** — the extractor's substitute candidates (`turmoil, mayhem, disorder`)
+- **human-accepted alternatives** — SWORDS substitutes accepted by annotators
+- **target-inclusive set** — `{chaos, turmoil, mayhem, disorder}`; what Zhang's set-marginal supervises
+- **alternative-only set** — `{turmoil, mayhem, disorder}`; what our concept term supervises. The observed target is still trained, by ordinary NTP at the slot (`--slot-ntp-weight 1.0`).
 
 | Method | Question |
 |---|---|
-| Uniform concept + retention | Does raising every accepted alternative, while retaining ordinary NTP at the observed slot, improve robust concept coverage? |
-| Uniform + retention + contrastive | Does explicitly separating accepted from conservative invalid candidates improve SWORDS AUROC? |
+| Alternative-only uniform | Raise every generated alternative equally, with the observed target trained only by NTP: does probability transfer to *human-accepted* alternatives without the entropy cost the randomized control pays? |
+| Target-inclusive uniform (ablation) | Same loss with the observed target inside the concept set: does excluding it matter? |
+| Alternative-only + contrastive | Add InfoNCE over alternatives ∪ conservative same-POS negatives: does the model learn which plausible candidates should *not* receive that probability (SWORDS AUROC)? |
 
-The contrastive term is joint token-level training. It is not DPO and not sentence-level SimCSE.'''),
+$$L = L_{\mathrm{NTP}} + \alpha\Big(-\tfrac{1}{|A(x)|}\sum_{a\in A(x)}\log p(a\mid x)\Big) + \beta\Big[\log\!\!\sum_{c\in A(x)\cup N(x)}\!\!e^{s(c)} - \log\!\sum_{a\in A(x)}e^{s(a)}\Big]$$
+
+The contrastive term is joint token-level training; it is not DPO and not sentence-level SimCSE. Its positive set is the same filtered candidate set the concept term uses, so `--exclude-target` makes both alternative-only at once.
+
+Why this and not more set-marginal: at 3B, Zhang's set-marginal matches a low-weight *randomized* control on SWORDS GAP and AUROC (paired CI crosses zero) and does not lower NLL on human-accepted alternatives at all (−0.05, n.s.), while the randomized arm lowers it by a full nat by flattening everything. The metrics that separate them are STS and perplexity, not SWORDS ranking. The method here has to move human-accepted alternatives without that entropy cost, and has to beat the randomized control, not merely NTP.
+
+Every table carries Task 15's arms — pretrained, NTP, augmented NTP, randomized at $\lambda=.25$ and at the matched $\lambda=1$, and set-marginal at $\lambda=1$ — read from that notebook's manifest."""),
         code(COMMON_SETUP), code(BOOTSTRAP), code(TRAIN_HELPER),
-        md('''## Build conservative negatives
+        md("""## Build conservative negatives, and a 50-row sample to read by hand
 
-Candidates must occur in the model’s top-100 next-token pool, match POS, lie outside the accepted set, share no WordNet synset, not be morphological variants, and fall below the contextual-similarity ceiling. Coverage and every rejection reason are reported.'''),
-        code(r'''
+Candidates must occur in the model’s top-100 next-token pool, match POS, lie outside the alternative set, share no WordNet synset with any alternative, not be a morphological variant, and fall below the contextual-similarity ceiling. Coverage and every rejection reason are reported. The 50-row sample is an error analysis, not an annotation project: read it before trusting any contrastive number."""),
+        code(r"""
 MODEL_TAG = BASE_MODEL.split("/")[-1].lower()
 LEAF = DATA / "c4" / MODEL_TAG / "embedding"
 NEG_TRAIN = LEAF / "synonyms_train_conservative_negatives.jsonl"
+SCREEN_DIR = DRIVE_RESULTS / f"task15b_screen{_TAG_SUFFIX}"
+SCREEN_DIR.mkdir(parents=True, exist_ok=True)
 if RUN_DATA:
     run([sys.executable, "data/build_contrastive_negatives.py",
          "--source", LEAF / "synonyms_train.jsonl",
          "--topk", DATA / "c4" / MODEL_TAG / "prompting" / "topk_*.jsonl",
          "--output", NEG_TRAIN,
-         "--report", DRIVE_RESULTS / "contrastive_negative_report.json",
+         # Per model: a shared name would let the 3B pass overwrite the 1B report.
+         "--report", DRIVE_RESULTS / f"contrastive_negative_report{_TAG_SUFFIX}.json",
          "--max-cosine", "0.35", "--max-negatives", "20"], cwd=EXT)
     cache_dataset_to_drive(LEAF)
-'''),
-        md(r'''## Screen only seed 42
+    # Stratified by POS and alternative-set size so the sample cannot be all easy
+    # nouns with large sets.  Fixed seed: the same 50 rows every time it is rerun.
+    import csv, random
+    buckets = {}
+    with NEG_TRAIN.open(encoding="utf-8") as handle:
+        for line in handle:
+            row = json.loads(line)
+            for target in row.get("content_word_responses", []):
+                if not target.get("negatives"):
+                    continue
+                key = (target.get("pos") or "?", "small" if len(target.get("synonyms", [])) <= 2 else "large")
+                buckets.setdefault(key, []).append({
+                    "pos": key[0], "set_size": key[1], "context": row["input_sequence"],
+                    "observed_target": target["word"],
+                    "alternatives": " | ".join(target.get("synonyms", [])),
+                    "negatives": " | ".join(target["negatives"]),
+                    "negative_scores": " | ".join(f"{s:.3f}" for s in target.get("negative_scores", []))})
+    rng = random.Random(42)
+    picked, per_bucket = [], max(1, 50 // max(1, len(buckets)))
+    for key in sorted(buckets):
+        picked += rng.sample(buckets[key], min(per_bucket, len(buckets[key])))
+    remainder = [item for key in sorted(buckets) for item in buckets[key] if item not in picked]
+    picked += rng.sample(remainder, min(50 - len(picked), len(remainder)))
+    sample_path = SCREEN_DIR / "negative_sample_50.csv"
+    with sample_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(picked[0].keys()) if picked else ["context"])
+        writer.writeheader(); writer.writerows(picked)
+    print(f"wrote {len(picked)} rows across {len(buckets)} strata to", sample_path)
+"""),
+        md(r"""## Screen on seed 42
 
-$\alpha\in\{.5,1,2,4\}$ controls uniform pressure. We set the concept-slot NTP weight to 1, so the observed-token term is never removed. Select the largest concept improvement whose global NLL is at most 0.20 above matched NTP. Then hold $\alpha$ fixed and screen $\beta\in\{.25,.5,1\}$.'''),
-        code(r'''
-OBJECTIVE_RUNS = load_runs("task15b")
+$\alpha\in\{.25,.5,1\}$ controls concept pressure on the alternative-only set; the concept-slot NTP weight is 1 in every arm, so the observed target is always trained. Uniform (mean-log) losses are roughly an order of magnitude larger per slot than set-marginal at the same weight, which is why this grid starts lower than Zhang's.
+
+$\alpha$ is selected on **C4 validation** (lowest alternative NLL subject to the global-NLL, observed-target-NLL and collapse gates printed by the decision cell). Only then is one target-inclusive ablation trained at that $\alpha$, and $\beta\in\{.25,.5,1\}$ screened on **SWORDS dev**. SWORDS test is never read during tuning."""),
+        code(r"""
+OBJECTIVE_RUNS = load_runs(f"task15b{_TAG_SUFFIX}")
 if RUN_SCREEN:
-    for alpha in [0.5, 1.0, 2.0, 4.0]:
-        OBJECTIVE_RUNS[f"uniform_alpha{alpha}_seed42"] = train_flat(
-            "uniform_retention", 42, alpha, objective="uniform", slot_ntp_weight=1.0)
+    for alpha in [0.25, 0.5, 1.0]:
+        OBJECTIVE_RUNS[f"alternative_uniform_alpha{alpha}_seed42"] = train_flat(
+            "alternative_uniform", 42, alpha, objective="uniform", slot_ntp_weight=1.0,
+            exclude_target=True)
 
-# Set this only after the NLL/set-mass screen printed below.
+# Set this ONLY from the alpha gate printed by the decision cell below.
 SELECTED_ALPHA = None
 if RUN_SCREEN and SELECTED_ALPHA is not None:
+    # The one ablation that isolates the exclusion: identical loss, observed
+    # target back inside the concept set.  Not a headline method.
+    OBJECTIVE_RUNS[f"inclusive_uniform_alpha{SELECTED_ALPHA}_seed42"] = train_flat(
+        "inclusive_uniform", 42, SELECTED_ALPHA, objective="uniform", slot_ntp_weight=1.0)
     for beta in [0.25, 0.5, 1.0]:
         OBJECTIVE_RUNS[f"contrast_alpha{SELECTED_ALPHA}_beta{beta}_seed42"] = train_flat(
-            "uniform_contrastive", 42, SELECTED_ALPHA, objective="uniform",
-            slot_ntp_weight=1.0, contrast_beta=beta, train_file=NEG_TRAIN)
-'''),
-        md('''## Screen evaluation and locked confirmation
+            "alternative_contrastive", 42, SELECTED_ALPHA, objective="uniform",
+            slot_ntp_weight=1.0, exclude_target=True, contrast_beta=beta, train_file=NEG_TRAIN)
+"""),
+        md("""## Evaluation
 
-Contrastive is promoted only when it improves SWORDS acceptable/rejected AUROC over the identical uniform model while preserving STS and NTP. It is not promoted for a better training loss alone.'''),
-        code(r'''
+Every checkpoint of this pass — Task 15's arms and this notebook's — is scored by the same evaluators. A validation pass of the perplexity and concept-set evaluators exists only for choosing $\\alpha$; every other number is C4 test, SWORDS dev, the nine STS tasks and bm-semlex."""),
+        code(r"""
 if RUN_EVAL:
     OBJECTIVE_RUNS = restore_all(OBJECTIVE_RUNS)
-    result_dir = DRIVE_RESULTS / "task15b_screen"; result_dir.mkdir(parents=True, exist_ok=True)
-    checkpoints = [str(x) for x in OBJECTIVE_RUNS.values()]
-    run([sys.executable, "eval/eval_perplexity_explicit.py", "--checkpoints", *checkpoints,
-         "--base-model", BASE_MODEL, "--test-jsonl", LEAF / "synonyms_test.jsonl",
-         "--output", result_dir / "perplexity.json"], cwd=EXT)
-    run([sys.executable, "eval/eval_concept_sets.py", "--checkpoints", *checkpoints,
-         "--base-model", BASE_MODEL, "--test-jsonl", LEAF / "synonyms_test.jsonl",
-         "--output", result_dir / "concept_sets.json"], cwd=EXT)
-    run([sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/eval_swords.py",
-         "--checkpoints", *checkpoints, "--tokenizer_path", BASE_MODEL, "--base_model", BASE_MODEL,
-         "--swords_json", MAIN / "data/swords/swords-v1.1_dev.json.gz",
-         "--results_json", result_dir / "swords.json", "--modes", "left", "full"], cwd=MAIN)
-    # Set this index to the locked uniform run when evaluating the beta screen.
-    PAIRED_BASELINE_INDEX = 0
-    run([sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/paired_benchmark_ci.py",
-         "--kind", "swords", "--results-json", result_dir / "swords.json",
-         "--baseline-index", PAIRED_BASELINE_INDEX,
-         "--output", result_dir / "swords_paired_ci.json"], cwd=MAIN)
-    for label, checkpoint in OBJECTIVE_RUNS.items():
+    # The question is "does this beat Zhang", so Zhang's arms sit IN this table:
+    # pretrained as the reference row, NTP and augmented NTP as matched controls,
+    # randomized at both weights as the semantic control, and set-marginal at
+    # lambda=1 as the method being improved on.  They come from Task 15's manifest;
+    # an arm Task 15 never trained is reported as absent, never retrained here.
+    task15_runs = restore_all(load_runs(f"task15{_TAG_SUFFIX}"))
+    BASELINE_LABELS = ("ntp_seed42", "augmented_ntp_seed42", "randomized_seed42",
+                       "randomized_lambda1.0_seed42", "zhang_seed42", "zhang_lambda1.0_seed42")
+    baseline_runs = {label: task15_runs[label] for label in BASELINE_LABELS if label in task15_runs}
+    # RUN_CONFIRM in Task 15 pops zhang_lambda1.0_seed42 in favour of zhang_seed42;
+    # both name ONE adapter, so keep whichever exists and never both.
+    if "zhang_seed42" in baseline_runs:
+        baseline_runs.pop("zhang_lambda1.0_seed42", None)
+    for label in BASELINE_LABELS[:-1]:
+        if label not in baseline_runs and not (label == "zhang_seed42" and "zhang_lambda1.0_seed42" in baseline_runs):
+            print("Task 15 never trained this baseline; the table will lack it:", label)
+    all_runs = {**baseline_runs, **OBJECTIVE_RUNS}
+    checkpoints = [BASE_MODEL, *map(str, all_runs.values())]
+    result_dir = SCREEN_DIR
+    # Each evaluator is skipped only when its own output already scores every
+    # checkpoint of this pass, so a disconnect costs at most one evaluator.
+    # VALIDATION pass first: this is the only thing the alpha choice may read.
+    guarded(result_dir / "val_perplexity.json", checkpoints,
+            [sys.executable, "eval/eval_perplexity_explicit.py", "--checkpoints", *checkpoints,
+             "--base-model", BASE_MODEL, "--test-jsonl", LEAF / "synonyms_val.jsonl",
+             "--output", result_dir / "val_perplexity.json"], EXT, "validation perplexity")
+    guarded(result_dir / "val_concept_sets.json", checkpoints,
+            [sys.executable, "eval/eval_concept_sets.py", "--checkpoints", *checkpoints,
+             "--base-model", BASE_MODEL, "--test-jsonl", LEAF / "synonyms_val.jsonl",
+             "--output", result_dir / "val_concept_sets.json"], EXT, "validation concept sets")
+    guarded(result_dir / "perplexity.json", checkpoints,
+            [sys.executable, "eval/eval_perplexity_explicit.py", "--checkpoints", *checkpoints,
+             "--base-model", BASE_MODEL, "--test-jsonl", LEAF / "synonyms_test.jsonl",
+             "--output", result_dir / "perplexity.json"], EXT, "perplexity")
+    guarded(result_dir / "concept_sets.json", checkpoints,
+            [sys.executable, "eval/eval_concept_sets.py", "--checkpoints", *checkpoints,
+             "--base-model", BASE_MODEL, "--test-jsonl", LEAF / "synonyms_test.jsonl",
+             "--output", result_dir / "concept_sets.json"], EXT, "concept sets")
+    task15_dir = DRIVE_RESULTS / RESULT_DIR
+    for label, checkpoint in {"pretrained": BASE_MODEL, **all_runs}.items():
         display_label = label.replace("_", " ")
-        run([sys.executable, "eval/eval_mteb.py", "--base-model", BASE_MODEL,
-             "--dataset", "c4", "--dataset-type", "embedding", "--tasks", "sts",
-             "--run-label", display_label, "--csv-output", result_dir / f"sts_{display_label}.csv",
-             "--mteb-output-root", result_dir / "mteb_raw",
-             "--adapter-path", checkpoint], cwd=EXT)
-    run([sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/eval_bm_semlex.py",
-         "--checkpoints", *checkpoints, "--tokenizer_path", BASE_MODEL, "--base_model", BASE_MODEL,
-         "--data", MAIN / "data/bm_semlex/curated_200.tsv",
-         "--results_json", result_dir / "bm_semlex.json"], cwd=MAIN)
-    manifest = {label.replace("_", " "): str(path) for label, path in OBJECTIVE_RUNS.items()}
+        csv_output = result_dir / f"sts_{display_label}.csv"
+        # STS is deterministic per checkpoint and Task 15 already scored the
+        # baselines, so reuse its file rather than spending 3.5 min re-deriving it.
+        previous = task15_dir / csv_output.name
+        if not csv_output.is_file() and previous.is_file():
+            shutil.copy2(previous, csv_output)
+        if sts_covered(csv_output):
+            print("resume: STS already scored, skipping", display_label)
+            continue
+        mteb_args = [sys.executable, "eval/eval_mteb.py", "--base-model", BASE_MODEL,
+                     "--dataset", "c4", "--dataset-type", "embedding", "--tasks", "sts",
+                     "--run-label", display_label, "--csv-output", csv_output,
+                     "--mteb-output-root", result_dir / "mteb_raw"]
+        mteb_args += ["--no-adapter"] if checkpoint == BASE_MODEL else ["--adapter-path", checkpoint]
+        run(mteb_args, cwd=EXT)
+    guarded(result_dir / "swords.json", checkpoints,
+            [sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/eval_swords.py",
+             "--checkpoints", *checkpoints, "--tokenizer_path", BASE_MODEL, "--base_model", BASE_MODEL,
+             "--swords_json", MAIN / "data/swords/swords-v1.1_dev.json.gz",
+             "--results_json", result_dir / "swords.json", "--modes", "left", "full"], MAIN, "SWORDS")
+    # One paired interval per reference, looked up by label so an index can never
+    # drift onto the wrong arm.  vs zhang is the headline; vs randomized is what
+    # says whether a gain is semantic rather than distributional; vs the selected
+    # alternative-uniform arm is the only fair test of the contrastive term itself.
+    references = {"pretrained": BASE_MODEL, **{label: str(path) for label, path in baseline_runs.items()}}
+    if SELECTED_ALPHA is not None and f"alternative_uniform_alpha{SELECTED_ALPHA}_seed42" in OBJECTIVE_RUNS:
+        key = f"alternative_uniform_alpha{SELECTED_ALPHA}_seed42"
+        references[key] = str(OBJECTIVE_RUNS[key])
+    for label, reference in references.items():
+        run([sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/paired_benchmark_ci.py",
+             "--kind", "swords", "--results-json", result_dir / "swords.json",
+             "--baseline-index", checkpoints.index(reference),
+             "--output", result_dir / f"swords_paired_ci_vs_{label}.json"], cwd=MAIN)
+    guarded(result_dir / "bm_semlex.json", checkpoints,
+            [sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/eval_bm_semlex.py",
+             "--checkpoints", *checkpoints, "--tokenizer_path", BASE_MODEL, "--base_model", BASE_MODEL,
+             "--data", MAIN / "data/bm_semlex/curated_200.tsv",
+             "--results_json", result_dir / "bm_semlex.json"], MAIN, "bm-semlex")
+    manifest = {"pretrained": BASE_MODEL, **{label.replace("_", " "): str(path) for label, path in all_runs.items()}}
     (result_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
     run([sys.executable, MAIN / "scripts/summarize_concept_experiments.py",
          "--manifest", result_dir / "manifest.json", "--result-dir", result_dir,
          "--output", result_dir / "flat_extension_table.csv"], cwd=MAIN)
-'''),
-        code(r'''
-# Lock these from the seed-42 screen; do not choose them per seed.
+"""),
+        md("""## Decision cell
+
+Reads only what the evaluation cell wrote and prints every gate with its number, so the choice is auditable from the notebook output alone. First pass: the $\\alpha$ gate (validation only). After `SELECTED_ALPHA` is set and the $\\beta$ arms are scored: the promotion gates and the headline.
+
+Headline rule: contrastive if it passes every promotion gate; otherwise alternative-only uniform if it passes the same gates minus the vs-itself clause; otherwise this is a negative result and is reported as one."""),
+        code(r"""
+import csv
+GLOBAL_NLL_SLACK, OBSERVED_NLL_SLACK, STS_SLACK, BM_SLACK, MIN_PROB_RATIO = 0.20, 0.10, 0.005, 0.02, 0.5
+result_dir = SCREEN_DIR
+
+def _by_ckpt(name):
+    path = result_dir / name
+    return {str(r["checkpoint"]): r for r in json.loads(path.read_text())} if path.is_file() else {}
+
+def _sts(label):
+    path = result_dir / f"sts_{label.replace('_', ' ')}.csv"
+    if not path.is_file():
+        return None
+    with path.open(encoding="utf-8") as handle:
+        scores = [float(r["main_score"]) for r in csv.DictReader(handle)]
+    return sum(scores) / len(scores) if scores else None
+
+def _paired(reference_label, candidate):
+    path = result_dir / f"swords_paired_ci_vs_{reference_label}.json"
+    if not path.is_file():
+        return {}
+    for entry in json.loads(path.read_text()):
+        if str(entry["candidate"]) == str(candidate):
+            return entry["metrics"]
+    return {}
+
+def _sig(metrics, key, better):
+    # (candidate - reference, True when the 95% CI excludes zero on the good side)
+    value = metrics.get(key)
+    if not value or value.get("candidate_minus_baseline") is None:
+        return None, None
+    lo, hi = value["ci95"]
+    return value["candidate_minus_baseline"], (lo > 0) if better == "up" else (hi < 0)
+
+def _fmt(x):
+    return "n/a" if x is None else f"{x:.4f}"
+
+manifest_path = result_dir / "manifest.json"
+manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
+runs = {label.replace(" ", "_"): str(path) for label, path in manifest.items()}
+ntp = runs.get("ntp_seed42")
+zhang_label = "zhang_seed42" if "zhang_seed42" in runs else "zhang_lambda1.0_seed42"
+zhang, randomized = runs.get(zhang_label), runs.get("randomized_seed42")
+val_c, val_p = _by_ckpt("val_concept_sets.json"), _by_ckpt("val_perplexity.json")
+tst_p, bm = _by_ckpt("perplexity.json"), _by_ckpt("bm_semlex.json")
+
+print("== alpha gate: C4 VALIDATION only ==")
+g_ntp = val_p.get(ntp, {}).get("global", {}).get("mean_nll")
+o_zhang = val_c.get(zhang, {}).get("observed_target_nll")
+mp_zhang = val_c.get(zhang, {}).get("minimum_candidate_probability")
+alpha_rows = []
+for label, ck in runs.items():
+    if not label.startswith("alternative_uniform_alpha"):
+        continue
+    c, p = val_c.get(ck, {}), val_p.get(ck, {})
+    alt, g = c.get("alternative_nll"), p.get("global", {}).get("mean_nll")
+    o, mp = c.get("observed_target_nll"), c.get("minimum_candidate_probability")
+    gates = {"global<=ntp+.20": None if None in (g, g_ntp) else g <= g_ntp + GLOBAL_NLL_SLACK,
+             "observed<=zhang+.10": None if None in (o, o_zhang) else o <= o_zhang + OBSERVED_NLL_SLACK,
+             "min_prob>=.5*zhang": None if None in (mp, mp_zhang) else mp >= MIN_PROB_RATIO * mp_zhang}
+    alpha_rows.append((label, alt, gates))
+    print(f"  {label:38} alt_nll={_fmt(alt)} global={_fmt(g)} observed={_fmt(o)} min_prob={_fmt(mp)}  "
+          + "  ".join(f"{k}:{'n/a' if v is None else ('PASS' if v else 'FAIL')}" for k, v in gates.items()))
+passing = [r for r in alpha_rows if r[1] is not None and all(r[2].values())]
+if passing:
+    best = min(passing, key=lambda r: r[1])
+    print("  -> SELECTED_ALPHA =", best[0].split("alpha", 1)[1].split("_", 1)[0])
+elif alpha_rows:
+    print("  -> no alpha passes every gate.  Report that; do not loosen the gates.")
+else:
+    print("  (no alternative-uniform arms scored yet)")
+
+print("== promotion gates: SWORDS DEV paired intervals, C4 test, STS, bm-semlex ==")
+g_ntp_test = tst_p.get(ntp, {}).get("global", {}).get("mean_nll")
+sts_zhang = _sts(zhang_label)
+acc_zhang = bm.get(zhang, {}).get("left", {}).get("accuracy")
+
+def promotion(label, ck, self_label=None):
+    vz, vr = _paired(zhang_label, ck), _paired("randomized_seed42", ck)
+    vs = _paired(self_label, ck) if self_label else {}
+    g = tst_p.get(ck, {}).get("global", {}).get("mean_nll")
+    sts, acc = _sts(label), bm.get(ck, {}).get("left", {}).get("accuracy")
+    d_gap_z, s_gap_z = _sig(vz, "gap", "up")
+    d_auroc_s, s_auroc_s = _sig(vs, "auroc", "up")
+    d_gap_r, _ = _sig(vr, "gap", "up")
+    _, s_auroc_r = _sig(vr, "auroc", "up")
+    _, s_rms_r = _sig(vr, "rejected_mass_share", "down")
+    d_alt_z, s_alt_z = _sig(vz, "alternatives_nll", "down")
+    gates = {
+        f"GAP > zhang (CI excl 0)  [{_fmt(d_gap_z)}]": None if s_gap_z is None else bool(s_gap_z),
+        f"AUROC > same non-contrastive arm (CI excl 0)  [{_fmt(d_auroc_s)}]": (None if not self_label or s_auroc_s is None else bool(s_auroc_s)),
+        f"GAP >= randomized lambda.25  [{_fmt(d_gap_r)}]": None if d_gap_r is None else d_gap_r >= 0,
+        "AUROC or rejected-mass share better than randomized (CI excl 0)": (None if s_auroc_r is None and s_rms_r is None else bool(s_auroc_r or s_rms_r)),
+        f"human-accepted alt NLL < zhang (CI excl 0)  [{_fmt(d_alt_z)}]": None if s_alt_z is None else bool(s_alt_z),
+        f"global NLL <= ntp+.20  [{_fmt(g)} vs {_fmt(g_ntp_test)}]": None if None in (g, g_ntp_test) else g <= g_ntp_test + GLOBAL_NLL_SLACK,
+        f"STS >= zhang-.005  [{_fmt(sts)} vs {_fmt(sts_zhang)}]": None if None in (sts, sts_zhang) else sts >= sts_zhang - STS_SLACK,
+        f"bm-semlex >= zhang-2pp  [{_fmt(acc)} vs {_fmt(acc_zhang)}]": None if None in (acc, acc_zhang) else acc >= acc_zhang - BM_SLACK,
+    }
+    print(f"  {label}")
+    for name, ok in gates.items():
+        print(f"      {'n/a ' if ok is None else ('PASS' if ok else 'FAIL')}  {name}")
+    known = [ok for ok in gates.values() if ok is not None]
+    return bool(known) and all(known)
+
+winners = {"contrastive": [], "alternative_uniform": []}
+for label, ck in runs.items():
+    if label.startswith("contrast_alpha"):
+        alpha = label.split("alpha", 1)[1].split("_", 1)[0]
+        if promotion(label, ck, self_label=f"alternative_uniform_alpha{alpha}_seed42"):
+            winners["contrastive"].append(label)
+    elif label.startswith("alternative_uniform_alpha"):
+        if promotion(label, ck):
+            winners["alternative_uniform"].append(label)
+print("== headline ==")
+if winners["contrastive"]:
+    print("  contrastive is promoted:", winners["contrastive"], "-> set SELECTED_BETA from the smallest passing beta")
+elif winners["alternative_uniform"]:
+    print("  contrastive NOT promoted; alternative-only uniform passes:", winners["alternative_uniform"])
+else:
+    print("  neither passes every gate: this is a negative result and is reported as one")
+"""),
+        md("""## Locked confirmation
+
+Lock $\\alpha$ and $\\beta$ from the seed-42 screen above; never choose them per seed. Seeds 42, 123, 2024 for the alternative-only uniform arm and, if promoted, the contrastive arm. The seed-42 adapters already exist and resume for free."""),
+        code(r"""
 SELECTED_BETA = None
 if RUN_CONFIRM:
-    assert SELECTED_ALPHA is not None
+    assert SELECTED_ALPHA is not None, "set SELECTED_ALPHA from the alpha gate first"
     for seed in SEEDS:
-        OBJECTIVE_RUNS[f"uniform_seed{seed}"] = train_flat(
-            "uniform_retention", seed, SELECTED_ALPHA, objective="uniform", slot_ntp_weight=1.0)
+        OBJECTIVE_RUNS[f"alternative_uniform_seed{seed}"] = train_flat(
+            "alternative_uniform", seed, SELECTED_ALPHA, objective="uniform", slot_ntp_weight=1.0,
+            exclude_target=True)
         if SELECTED_BETA is not None:
             OBJECTIVE_RUNS[f"contrastive_seed{seed}"] = train_flat(
-                "uniform_contrastive", seed, SELECTED_ALPHA, objective="uniform",
-                slot_ntp_weight=1.0, contrast_beta=SELECTED_BETA, train_file=NEG_TRAIN)
-    for label, path in OBJECTIVE_RUNS.items(): sync_small_artifacts(path, f"task15b_logs/{label}")
+                "alternative_contrastive", seed, SELECTED_ALPHA, objective="uniform",
+                slot_ntp_weight=1.0, exclude_target=True, contrast_beta=SELECTED_BETA, train_file=NEG_TRAIN)
+    # The screen already trained seed 42 at the locked values and adapter_path()
+    # maps both calls to one directory; two keys on one adapter would score it twice.
+    OBJECTIVE_RUNS.pop(f"alternative_uniform_alpha{SELECTED_ALPHA}_seed42", None)
+    if SELECTED_BETA is not None:
+        OBJECTIVE_RUNS.pop(f"contrast_alpha{SELECTED_ALPHA}_beta{SELECTED_BETA}_seed42", None)
+    for label, path in OBJECTIVE_RUNS.items(): sync_small_artifacts(path, f"task15b_logs{_TAG_SUFFIX}/{label}")
     audit_no_drive_weights()
-save_runs(OBJECTIVE_RUNS, "task15b")
-'''),
-        md('''## Decision
+save_runs(OBJECTIVE_RUNS, f"task15b{_TAG_SUFFIX}")
+"""),
+        md("""## Reporting
 
-Keep at most one of these as a headline extension. If contrastive does not beat the same uniform model on human-labelled SWORDS separation, report it as a negative ablation or omit it. Do not expand to 3B here; the hierarchy experiment is next.'''),
+Main table: NTP, augmented NTP, Zhang set-marginal, alternative-only uniform, contrastive (if promoted). Control table: pretrained, randomized $\\lambda=.25$, randomized $\\lambda=1$ (matched weight), target-inclusive uniform ablation. Paired bootstrap intervals on every SWORDS comparison; mean ± sd over three seeds everywhere else. Do not expand to 3B from this notebook until the three-seed 1B result is in; the hierarchy experiment stays deferred."""),
     ]
     write("research_tasks_15b_objective_and_contrastive.ipynb", cells)
 

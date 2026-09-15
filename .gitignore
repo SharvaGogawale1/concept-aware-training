@@ -7,6 +7,9 @@ output/
 outputs/
 checkpoints/
 runs/
+# The server notebook's working tree: two git clones, the HF cache and the
+# adapters, created beside whichever directory it is run from.
+concept_aware/
 
 # Old notebooks with hardcoded tokens — never commit these
 prev_*_old.ipynb
