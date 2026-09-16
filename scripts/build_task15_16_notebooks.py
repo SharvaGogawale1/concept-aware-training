@@ -852,6 +852,13 @@ if RUN_SCREEN and SELECTED_ALPHA is not None:
         OBJECTIVE_RUNS[f"contrast_alpha{SELECTED_ALPHA}_beta{beta}_seed42"] = train_flat(
             "alternative_contrastive", 42, SELECTED_ALPHA, objective="uniform",
             slot_ntp_weight=1.0, exclude_target=True, contrast_beta=beta, train_file=NEG_TRAIN)
+    # Frontier point.  Contrastive arms land between alpha=.5 and alpha=1 on BOTH
+    # axes, so two uniform points cannot say whether they sit above the alpha
+    # curve or merely on it.  Not an alpha-selection candidate: alpha was chosen
+    # on validation from {.25,.5,1} before this ran, and this is scored after.
+    OBJECTIVE_RUNS["alternative_uniform_alpha0.75_seed42"] = train_flat(
+        "alternative_uniform", 42, 0.75, objective="uniform", slot_ntp_weight=1.0,
+        exclude_target=True)
 """),
         md("""## Evaluation
 
@@ -925,9 +932,14 @@ if RUN_EVAL:
     # says whether a gain is semantic rather than distributional; vs the selected
     # alternative-uniform arm is the only fair test of the contrastive term itself.
     references = {"pretrained": BASE_MODEL, **{label: str(path) for label, path in baseline_runs.items()}}
-    if SELECTED_ALPHA is not None and f"alternative_uniform_alpha{SELECTED_ALPHA}_seed42" in OBJECTIVE_RUNS:
-        key = f"alternative_uniform_alpha{SELECTED_ALPHA}_seed42"
-        references[key] = str(OBJECTIVE_RUNS[key])
+    # EVERY alternative-only uniform arm is a reference, not just the selected one.
+    # Contrastive has to beat the cheaper way of buying the same concept pressure,
+    # which is turning alpha up.  A same-alpha comparison alone cannot show that:
+    # it credits the negatives with a gain a larger alpha also delivers, which is
+    # the identical error this paper accuses set-marginal training of.
+    for key, path in OBJECTIVE_RUNS.items():
+        if key.startswith("alternative_uniform_alpha"):
+            references[key] = str(path)
     for label, reference in references.items():
         run([sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/paired_benchmark_ci.py",
              "--kind", "swords", "--results-json", result_dir / "swords.json",
@@ -997,7 +1009,13 @@ tst_p, bm = _by_ckpt("perplexity.json"), _by_ckpt("bm_semlex.json")
 
 print("== alpha gate: C4 VALIDATION only ==")
 g_ntp = val_p.get(ntp, {}).get("global", {}).get("mean_nll")
-o_zhang = val_c.get(zhang, {}).get("observed_target_nll")
+# The observed target is referenced against NTP, never against Zhang.  Zhang's
+# supervised set CONTAINS the observed token, so its objective actively drives
+# that NLL below NTP's; asking an alternative-only arm to match it would be
+# asking it to do the one thing it exists not to do.  NTP is the matched control,
+# and the question here is only "is the observed target damaged?" -- which
+# --slot-ntp-weight 1.0 is what prevents.
+o_ntp = val_c.get(ntp, {}).get("observed_target_nll")
 mp_zhang = val_c.get(zhang, {}).get("minimum_candidate_probability")
 alpha_rows = []
 for label, ck in runs.items():
@@ -1007,7 +1025,7 @@ for label, ck in runs.items():
     alt, g = c.get("alternative_nll"), p.get("global", {}).get("mean_nll")
     o, mp = c.get("observed_target_nll"), c.get("minimum_candidate_probability")
     gates = {"global<=ntp+.20": None if None in (g, g_ntp) else g <= g_ntp + GLOBAL_NLL_SLACK,
-             "observed<=zhang+.10": None if None in (o, o_zhang) else o <= o_zhang + OBSERVED_NLL_SLACK,
+             "observed<=ntp+.10": None if None in (o, o_ntp) else o <= o_ntp + OBSERVED_NLL_SLACK,
              "min_prob>=.5*zhang": None if None in (mp, mp_zhang) else mp >= MIN_PROB_RATIO * mp_zhang}
     alpha_rows.append((label, alt, gates))
     print(f"  {label:38} alt_nll={_fmt(alt)} global={_fmt(g)} observed={_fmt(o)} min_prob={_fmt(mp)}  "
@@ -1037,38 +1055,83 @@ def promotion(label, ck, self_label=None):
     _, s_auroc_r = _sig(vr, "auroc", "up")
     _, s_rms_r = _sig(vr, "rejected_mass_share", "down")
     d_alt_z, s_alt_z = _sig(vz, "alternatives_nll", "down")
-    gates = {
+    # Frontier gate.  An arm is DOMINATED when some uniform arm already matches or
+    # beats its ranking at no greater language-modelling cost -- that arm's gain is
+    # the alpha curve, not the negatives.  Uniform arms that cost MORE global NLL
+    # are excluded: losing to a costlier arm is a trade, not a domination.
+    dominated = []
+    for u_label, u_ck in (runs.items() if self_label else ()):
+        u_global = tst_p.get(u_ck, {}).get("global", {}).get("mean_nll")
+        if not u_label.startswith("alternative_uniform_alpha") or str(u_ck) == str(ck):
+            continue
+        if None in (u_global, g) or u_global > g:
+            continue
+        _, beats = _sig(_paired(u_label, ck), "gap", "up")
+        if beats is not None:
+            dominated.append(not beats)
+    on_frontier = None if not dominated else not any(dominated)
+    # Two groups, reported and decided separately.  DISCRIMINATION is the claim:
+    # does this arm rank human-labelled substitutes better than Zhang, and better
+    # than the randomized control Zhang cannot separate from?  RETENTION is the
+    # price: are STS and language modelling preserved?  Collapsing them into one
+    # verdict turns "wins the claim, pays on STS" -- a reportable trade-off and
+    # the most likely real outcome -- into the same output as "nothing worked".
+    discrimination = {
         f"GAP > zhang (CI excl 0)  [{_fmt(d_gap_z)}]": None if s_gap_z is None else bool(s_gap_z),
         f"AUROC > same non-contrastive arm (CI excl 0)  [{_fmt(d_auroc_s)}]": (None if not self_label or s_auroc_s is None else bool(s_auroc_s)),
         f"GAP >= randomized lambda.25  [{_fmt(d_gap_r)}]": None if d_gap_r is None else d_gap_r >= 0,
         "AUROC or rejected-mass share better than randomized (CI excl 0)": (None if s_auroc_r is None and s_rms_r is None else bool(s_auroc_r or s_rms_r)),
         f"human-accepted alt NLL < zhang (CI excl 0)  [{_fmt(d_alt_z)}]": None if s_alt_z is None else bool(s_alt_z),
+        "GAP > every uniform arm costing no more global NLL (CI excl 0)": on_frontier,
+    }
+    retention = {
         f"global NLL <= ntp+.20  [{_fmt(g)} vs {_fmt(g_ntp_test)}]": None if None in (g, g_ntp_test) else g <= g_ntp_test + GLOBAL_NLL_SLACK,
         f"STS >= zhang-.005  [{_fmt(sts)} vs {_fmt(sts_zhang)}]": None if None in (sts, sts_zhang) else sts >= sts_zhang - STS_SLACK,
         f"bm-semlex >= zhang-2pp  [{_fmt(acc)} vs {_fmt(acc_zhang)}]": None if None in (acc, acc_zhang) else acc >= acc_zhang - BM_SLACK,
     }
     print(f"  {label}")
-    for name, ok in gates.items():
-        print(f"      {'n/a ' if ok is None else ('PASS' if ok else 'FAIL')}  {name}")
-    known = [ok for ok in gates.values() if ok is not None]
-    return bool(known) and all(known)
+    for heading, group in (("discrimination (the claim)", discrimination), ("retention (the price)", retention)):
+        print(f"    {heading}")
+        for name, ok in group.items():
+            print(f"      {'n/a ' if ok is None else ('PASS' if ok else 'FAIL')}  {name}")
+    def _all(group):
+        known = [ok for ok in group.values() if ok is not None]
+        return bool(known) and all(known)
+    return _all(discrimination), _all(retention)
 
 winners = {"contrastive": [], "alternative_uniform": []}
+retained = {}
 for label, ck in runs.items():
     if label.startswith("contrast_alpha"):
         alpha = label.split("alpha", 1)[1].split("_", 1)[0]
-        if promotion(label, ck, self_label=f"alternative_uniform_alpha{alpha}_seed42"):
+        discriminates, retains = promotion(label, ck, self_label=f"alternative_uniform_alpha{alpha}_seed42")
+        if discriminates:
             winners["contrastive"].append(label)
+        retained[label] = retains
     elif label.startswith("alternative_uniform_alpha"):
-        if promotion(label, ck):
+        discriminates, retains = promotion(label, ck)
+        if discriminates:
             winners["alternative_uniform"].append(label)
+        retained[label] = retains
+
+def announce(kind, labels):
+    for label in labels:
+        price = ("and pays nothing: every retention gate holds" if retained.get(label)
+                 else "but FAILS a retention gate above -- that trade-off is a result, report it")
+        print(f"  {kind} wins every discrimination gate: {label} {price}")
+
 print("== headline ==")
 if winners["contrastive"]:
-    print("  contrastive is promoted:", winners["contrastive"], "-> set SELECTED_BETA from the smallest passing beta")
+    announce("contrastive", winners["contrastive"])
+    print("  -> beta is TUNED on SWORDS dev (test is never read here), so any passing")
+    print("     beta is admissible.  Take the smallest unless the frontier margin is")
+    print("     monotone in beta, in which case take the largest that still retains,")
+    print("     and record the choice and its reason before the seeds are run.")
 elif winners["alternative_uniform"]:
-    print("  contrastive NOT promoted; alternative-only uniform passes:", winners["alternative_uniform"])
+    announce("alternative-only uniform", winners["alternative_uniform"])
+    print("  -> contrastive did not separate from it; the uniform arm is the headline candidate")
 else:
-    print("  neither passes every gate: this is a negative result and is reported as one")
+    print("  no arm wins every discrimination gate: this is a negative result and is reported as one")
 """),
         md("""## Locked confirmation
 

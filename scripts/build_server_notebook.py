@@ -26,6 +26,9 @@ INSTALL = r'''
 # peft raises on torchao < 0.16 from inside PeftModel.from_pretrained, which is
 # how every evaluator loads an adapter.
 %pip install -q -U "torchao>=0.16"
+# cupy backs spacy.require_gpu(); without it thinc raises and SPACY_GPU must be
+# set False.  thinc reads cupy's presence at import, so install before spacy loads.
+%pip install -q cupy-cuda12x
 !python -m spacy download en_core_web_sm
 import transformers, torch
 print("transformers", transformers.__version__, "| torch", torch.__version__,
@@ -85,6 +88,7 @@ MODEL_TAG = BASE_MODEL.split("/")[-1].lower()
 # run aborts if they differ.  Each pair shares a tokenizer WITHIN its family and
 # never across families, which is why this is a table and not a size heuristic.
 VOCAB_DONOR = {"Qwen/Qwen2.5-3B": "Qwen/Qwen2.5-1.5B",
+               "Qwen/Qwen3-4B": "Qwen/Qwen3-1.7B",
                "meta-llama/Llama-3.2-3B": "meta-llama/Llama-3.2-1B"}
 REUSE_CONTENT_WORDS_FROM = os.environ.get("CONCEPT_REUSE_FROM") or VOCAB_DONOR.get(BASE_MODEL)
 
@@ -101,7 +105,18 @@ PRIMARY_SEED = 42
 # One seed screens the pipeline and shows the direction of every effect, but it
 # CANNOT support a claim: the pre-registered rule needs all three to agree in
 # sign.  Flip to True for the reportable run; finished arms are skipped.
-RUN_MULTISEED = False
+def _flag(name, default):
+    """Read a run flag from the environment, defaulting to the value here.
+
+    Headless execution is the point: `CONCEPT_MODEL=... RUN_DATA=1 jupyter
+    nbconvert --execute` drives a whole stage without editing this file, so a
+    tmux session survives a dropped VPN and the notebook stays reproducible.
+    """
+    return os.environ.get(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
+
+# Requires cupy (installed below).  Verified output-identical to CPU spaCy.
+SPACY_GPU = _flag("SPACY_GPU", True)
+RUN_MULTISEED = _flag("RUN_MULTISEED", False)
 SEEDS = [PRIMARY_SEED] + ([123, 2024] if RUN_MULTISEED else [])
 UPSTREAM_COMMIT = "b1d414143d11c8ed988b4cccbb06626cc8272bbe"
 
@@ -119,11 +134,11 @@ os.environ["HF_HOME"] = str(WORK / "hf_cache")
 # Colab notebook: opening this file to check the directory layout and hitting Run
 # All should not start extraction, a smoke train, seven training runs and the
 # whole evaluation suite.
-RUN_DATA = False
-RUN_SMOKE = False
-RUN_SCREEN = False
-RUN_CONFIRM = False
-RUN_EVAL = False
+RUN_DATA = _flag("RUN_DATA", False)
+RUN_SMOKE = _flag("RUN_SMOKE", False)
+RUN_SCREEN = _flag("RUN_SCREEN", False)
+RUN_CONFIRM = _flag("RUN_CONFIRM", False)
+RUN_EVAL = _flag("RUN_EVAL", False)
 # Skip any run whose artefacts already exist.  A killed job resumes from here.
 RESUME_FINISHED_RUNS = True
 
@@ -156,7 +171,16 @@ def run(argv, cwd=None, env=None):
     merged = os.environ.copy()
     merged.update({"CONCEPT_DATA_ROOT": str(DATA),
                    "CONCEPT_CHECKPOINT_ROOT": str(RUNS),
-                   "CONCEPT_RESULTS_ROOT": str(OUTPUTS)})
+                   "CONCEPT_RESULTS_ROOT": str(OUTPUTS),
+                   # The POS filter is ~90% of extraction; on GPU it ran 8.5x
+                   # faster on an A40 (42.6 -> 5.0 s/seq) with 12400/12400 POS
+                   # tags identical to CPU.  SPACY_GPU gates it because it needs
+                   # cupy, and because the Colab-produced Llama data did not use it.
+                   "CONCEPT_SPACY_GPU": "1" if SPACY_GPU else "0",
+                   # This machine has no locale set, so Python defaults to ASCII
+                   # and both the child and its captured output die on C4's
+                   # non-ASCII text, partway through a long run.
+                   "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"})
     if env: merged.update(env)
     process = subprocess.Popen(argv, cwd=cwd, env=merged, text=True, bufsize=1,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
