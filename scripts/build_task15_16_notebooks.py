@@ -937,8 +937,11 @@ if RUN_EVAL:
     # which is turning alpha up.  A same-alpha comparison alone cannot show that:
     # it credits the negatives with a gain a larger alpha also delivers, which is
     # the identical error this paper accuses set-marginal training of.
+    # Includes the confirmation arms (alternative_uniform_seed123, ...), so each
+    # contrastive seed has a paired interval against the uniform arm of the SAME
+    # seed -- the one comparison that isolates the contrastive term across seeds.
     for key, path in OBJECTIVE_RUNS.items():
-        if key.startswith("alternative_uniform_alpha"):
+        if key.startswith("alternative_uniform"):
             references[key] = str(path)
     for label, reference in references.items():
         run([sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/paired_benchmark_ci.py",
@@ -1135,7 +1138,7 @@ else:
 """),
         md("""## Locked confirmation
 
-Lock $\\alpha$ and $\\beta$ from the seed-42 screen above; never choose them per seed. Seeds 42, 123, 2024 for the alternative-only uniform arm and, if promoted, the contrastive arm. The seed-42 adapters already exist and resume for free."""),
+Lock $\\alpha$ and $\\beta$ from the seed-42 screen's decision cell further down; never choose them per seed. This cell sits before evaluation on purpose, so one Run All trains the new seeds and then scores them. Seeds 42, 123, 2024 for the alternative-only uniform arm and, if promoted, the contrastive arm. The seed-42 adapters already exist and resume for free."""),
         code(r"""
 SELECTED_BETA = None
 if RUN_CONFIRM:
@@ -1161,6 +1164,18 @@ save_runs(OBJECTIVE_RUNS, f"task15b{_TAG_SUFFIX}")
 
 Main table: NTP, augmented NTP, Zhang set-marginal, alternative-only uniform, contrastive (if promoted). Control table: pretrained, randomized $\\lambda=.25$, randomized $\\lambda=1$ (matched weight), target-inclusive uniform ablation. Paired bootstrap intervals on every SWORDS comparison; mean ± sd over three seeds everywhere else. Do not expand to 3B from this notebook until the three-seed 1B result is in; the hierarchy experiment stays deferred."""),
     ]
+    # Confirmation must TRAIN before evaluation SCORES.  Written in narrative order
+    # -- screen, evaluate, decide, confirm -- a single Run All trained the new seeds
+    # AFTER every evaluator had finished, so they were never scored and the table
+    # silently held seed 42 alone.  The decision cell still reads only the screen
+    # arms, so moving confirmation up changes what gets scored, not what is chosen.
+    def _heading(cell, text):
+        return cell["cell_type"] == "markdown" and "".join(cell["source"]).startswith(text)
+    confirm_at = next(i for i, c in enumerate(cells) if _heading(c, "## Locked confirmation"))
+    confirm = cells[confirm_at:confirm_at + 2]
+    del cells[confirm_at:confirm_at + 2]
+    eval_at = next(i for i, c in enumerate(cells) if _heading(c, "## Evaluation"))
+    cells[eval_at:eval_at] = confirm
     write("research_tasks_15b_objective_and_contrastive.ipynb", cells)
 
 
