@@ -23,9 +23,21 @@ INSTALL = r'''
 # DynamicCache.from_legacy_cache, which transformers removed in v5.
 %pip install -q accelerate peft bitsandbytes datasets spacy "mteb>=1.12" nltk scipy scikit-learn seaborn pandas pytest wandb
 %pip install -q "transformers>=4.51,<4.58"
-# peft raises on torchao < 0.16 from inside PeftModel.from_pretrained, which is
-# how every evaluator loads an adapter.
-%pip install -q -U "torchao>=0.16"
+# torchao is a Colab-era fix: peft raises on torchao < 0.16 from inside
+# PeftModel.from_pretrained.  But a CURRENT torchao evaluates torch.int1 at
+# import, which torch < 2.6 does not define, and transformers imports torchao
+# unconditionally whenever it is installed -- so on an older torch a mismatched
+# torchao makes EVERY model unloadable, with the traceback pointing at the model
+# class rather than at torchao.  Install it only where it helps; remove it
+# otherwise, which is safe because peft only needs it when it is present.
+import subprocess, sys, torch
+_version = tuple(int(part) for part in torch.__version__.split(".")[:2])
+if _version >= (2, 6):
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "torchao>=0.16"], check=False)
+    print("torchao: installed for torch", torch.__version__)
+else:
+    subprocess.run([sys.executable, "-m", "pip", "uninstall", "-q", "-y", "torchao"], check=False)
+    print("torchao: removed, torch", torch.__version__, "predates torch.int1")
 # cupy backs spacy.require_gpu(); without it thinc raises and SPACY_GPU must be
 # set False.  thinc reads cupy's presence at import, so install before spacy loads.
 %pip install -q cupy-cuda12x
