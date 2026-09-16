@@ -38,8 +38,8 @@ print("transformers", transformers.__version__, "| torch", torch.__version__,
 SETUP = r'''
 import os
 # Pick a free GPU BEFORE torch initialises CUDA.  Override without editing this
-# file:  GPU_ID=1 jupyter nbconvert --execute ...
-GPU_ID = os.environ.get("GPU_ID", "0")
+# file:  GPU_ID=2 jupyter nbconvert --execute ...
+GPU_ID = os.environ.get("GPU_ID", "1")
 os.environ["CUDA_VISIBLE_DEVICES"] = GPU_ID
 
 from pathlib import Path
@@ -76,7 +76,7 @@ OUTPUTS = BASE / "outputs"                 # everything you download for analysi
 # resume logic reads finished work back by path, so the model is selected from the
 # environment rather than looped over here -- which is also what lets two models
 # share the machine without sharing a GPU.  See the cell above for the commands.
-BASE_MODEL = os.environ.get("CONCEPT_MODEL", "Qwen/Qwen2.5-1.5B")
+BASE_MODEL = os.environ.get("CONCEPT_MODEL", "Qwen/Qwen3-1.7B")
 # Every per-model artifact is keyed on this tag.  Two models must never share a
 # path: adapters resume by path, so a collision hands one model's weights to
 # another and the run still looks like it succeeded.  conceptlib.paths derives
@@ -130,15 +130,19 @@ if not os.environ.get("HF_TOKEN") and _cli_token.is_file():
     os.environ["HF_TOKEN"] = _cli_token.read_text().strip()
 os.environ["HF_HOME"] = str(WORK / "hf_cache")
 
-# Turn on one gate at a time.  These MUST default to False, as they do in the
-# Colab notebook: opening this file to check the directory layout and hitting Run
-# All should not start extraction, a smoke train, seven training runs and the
-# whole evaluation suite.
-RUN_DATA = _flag("RUN_DATA", False)
-RUN_SMOKE = _flag("RUN_SMOKE", False)
-RUN_SCREEN = _flag("RUN_SCREEN", False)
+# PROVISIONED FOR THE QWEN3-1.7B SERVER RUN: upload and run, no edits.
+# The Colab notebook keeps these False because a stray Run All there costs money
+# and a session slot.  Here the whole point is an unattended pass that survives a
+# dropped VPN, and every stage is resumable, so an accidental start costs the
+# shard in flight and nothing else.  Any of them can still be overridden from the
+# environment:  RUN_DATA=0 jupyter nbconvert --execute ...
+RUN_DATA = _flag("RUN_DATA", True)
+RUN_SMOKE = _flag("RUN_SMOKE", True)
+RUN_SCREEN = _flag("RUN_SCREEN", True)
+# Three seeds are a Colab job for the headline arms only; Qwen is a second-family
+# replication at seed 42, so this stays off.
 RUN_CONFIRM = _flag("RUN_CONFIRM", False)
-RUN_EVAL = _flag("RUN_EVAL", False)
+RUN_EVAL = _flag("RUN_EVAL", True)
 # Skip any run whose artefacts already exist.  A killed job resumes from here.
 RESUME_FINISHED_RUNS = True
 
