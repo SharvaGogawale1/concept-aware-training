@@ -388,18 +388,27 @@ persists, so nothing round-trips through Drive.
 logic reads finished work back by path, so the model is chosen with an
 environment variable rather than a loop:
 
-```bash
-# sequentially, one GPU
-CONCEPT_MODEL=Qwen/Qwen2.5-1.5B GPU_ID=0 jupyter nbconvert --execute --to notebook \
-    --inplace --ExecutePreprocessor.timeout=-1 reproducibilty_15.ipynb
-CONCEPT_MODEL=Qwen/Qwen2.5-3B   GPU_ID=0 jupyter nbconvert --execute ...
+The defaults in the setup cell already say `Qwen/Qwen3-1.7B` on GPU 1, so the
+plain command below needs no variables at all. Name them only to override.
 
-# or both at once, one GPU each
-CONCEPT_MODEL=Qwen/Qwen2.5-1.5B GPU_ID=0 ... &
-CONCEPT_MODEL=Qwen/Qwen2.5-3B   GPU_ID=1 ... &
+```bash
+# this run: upload, then one command under tmux
+export CONCEPT_BASE=$PWD
+jupyter nbconvert --to notebook --execute --ExecutePreprocessor.timeout=-1 \
+    --output executed_qwen17.ipynb reproducibilty_15.ipynb 2>&1 | tee qwen17.log
+
+# afterwards, the 4B pass; it inherits 1.7B's content words
+CONCEPT_MODEL=Qwen/Qwen3-4B jupyter nbconvert --to notebook --execute \
+    --ExecutePreprocessor.timeout=-1 --output executed_qwen4b.ipynb \
+    reproducibilty_15.ipynb 2>&1 | tee qwen4b.log
+
+# or both at once, one card each -- 4B only after 1.7B has written its
+# content words, or both pay the spaCy pass
+CONCEPT_MODEL=Qwen/Qwen3-1.7B GPU_ID=1 ... &
+CONCEPT_MODEL=Qwen/Qwen3-4B   GPU_ID=2 ... &
 ```
 
-`Qwen/Qwen2.5-3B` reuses `Qwen/Qwen2.5-1.5B`'s content words when that model has
+`Qwen/Qwen3-4B` reuses `Qwen/Qwen3-1.7B`'s content words when that model has
 already been extracted, which skips the spaCy POS pass; the two tokenizers are
 compared before the copy and the run aborts if they differ. Run them in parallel
 and 3B simply pays that pass itself, so either order is safe.
