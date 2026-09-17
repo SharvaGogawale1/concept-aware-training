@@ -727,7 +727,7 @@ index bc223d3..4bb4e10 100644
 -    run(args.dataset, args.start, args.end, model=args.model)
 +    run(args.dataset, args.start, args.end, model=args.model, use_4bit=args.use_4bit)
 diff --git a/data/get_content_words.py b/data/get_content_words.py
-index 5ac3bfe..ac73b90 100644
+index 5ac3bfe..5ef53aa 100644
 --- a/data/get_content_words.py
 +++ b/data/get_content_words.py
 @@ -37,7 +37,34 @@ if tokenizer.pad_token is None:
@@ -766,7 +766,7 @@ index 5ac3bfe..ac73b90 100644
  
  content_word_lengths = []
  
-@@ -106,20 +133,14 @@ with open(out_path, "w") as f:
+@@ -106,20 +133,17 @@ with open(out_path, "w") as f:
              if s.strip() and s.startswith(" ")
              and (i + 1 == len(token_strs) or token_strs[i + 1].startswith(next_token_starts))
          }
@@ -789,12 +789,27 @@ index 5ac3bfe..ac73b90 100644
 +            entry = tagged[word]
 +            if entry is None:
 +                continue
-+            text, pos = entry
-+            if pos in ["NOUN", "VERB", "ADJ"]:
-+                content_words.append(text)
++            # NOT `text, pos = entry`: `text` is the loop variable holding this
++            # document, and rebinding it here made every input_sequence written
++            # below the LAST CONTENT WORD instead of the document.
++            word_text, word_pos = entry
++            if word_pos in ["NOUN", "VERB", "ADJ"]:
++                content_words.append(word_text)
                  content_word_indices.append(token_idx)
  
          content_word_lengths.append(len(content_words))
+@@ -128,6 +152,11 @@ with open(out_path, "w") as f:
+         # tokens so spaCy doesn't parse text the model never saw. Special tokens
+         # have span (0, 0); skip those when finding the last real end offset.
+         last_end = max((e for _, e in offsets if e > 0), default=len(text))
++        # Cheap invariant that would have caught the shadowing above immediately:
++        # offsets index into this document, so the last one cannot lie past its end.
++        # Without it the slice silently returned a three-character "document" and
++        # the run failed 6 hours later, in a different script, on an IndexError.
++        assert last_end <= len(text), f"row {sample_idx}: offsets end {last_end} past text {len(text)}"
+         f.write(json.dumps({
+             "input_sequence": text[:last_end],
+             "input_ids": input_ids,
 diff --git a/eval/eval_concept_sets.py b/eval/eval_concept_sets.py
 new file mode 100644
 index 0000000..2066e29
