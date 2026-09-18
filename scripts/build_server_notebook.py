@@ -47,10 +47,56 @@ print("transformers", transformers.__version__, "| torch", torch.__version__,
       "| cuda", torch.cuda.is_available())
 '''
 
+GPU_PICK = r'''
+# Which cards are free.  Pick one with spare memory and no other process, then
+# name it in the control cell below -- BEFORE anything here touches CUDA.
+!nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv
+'''
+
+CONTROL = r'''
+# ==== THE ONLY CELL YOU EDIT.  Set these, then Run All. ======================
+import os
+
+GPU_ID   = "1"                 # from the table above
+MODEL    = "Qwen/Qwen3-1.7B"   # ONE model per pass; the second pass is "Qwen/Qwen3-4B"
+HF_TOKEN = ""                  # gated models only (Llama).  Qwen3 is open: leave empty.
+                               # If you do paste one, CLEAR IT BEFORE SAVING THIS FILE.
+
+RUN_DATA    = True    # extract concept sets from C4 and build the splits (the long stage)
+RUN_SMOKE   = True    # ~20-step objective check before any long training starts
+RUN_SCREEN  = True    # train the seven arms at seed 42
+RUN_CONFIRM = False   # add seeds 123 and 2024; Qwen is a seed-42 replication, so off
+RUN_EVAL    = True    # score every checkpoint: SWORDS, STS, perplexity, bm-semlex
+SPACY_GPU   = True    # 8.5x faster extraction; needs cupy-cuda12x, installed below
+
+# Everything below reads these from the environment, which is also how they reach
+# each child process.  Set any value to None to defer to a variable exported in
+# the shell instead -- that is what the nbconvert commands in the cell above use.
+for _name, _value in {"GPU_ID": GPU_ID, "CONCEPT_MODEL": MODEL, "HF_TOKEN": HF_TOKEN or None,
+                      "RUN_DATA": RUN_DATA, "RUN_SMOKE": RUN_SMOKE, "RUN_SCREEN": RUN_SCREEN,
+                      "RUN_CONFIRM": RUN_CONFIRM, "RUN_EVAL": RUN_EVAL,
+                      "SPACY_GPU": SPACY_GPU}.items():
+    if _value is not None:
+        os.environ[_name] = ("1" if _value else "0") if isinstance(_value, bool) else str(_value)
+
+# CUDA_VISIBLE_DEVICES has to be set before any torch import initialises the
+# driver, and the install cell below imports torch to decide about torchao.  The
+# setup cell sets it too, from GPU_ID -- but by then the choice can already be
+# locked in, and the run would quietly land on card 0.
+os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.setdefault("GPU_ID", "1")
+print("GPU", os.environ["CUDA_VISIBLE_DEVICES"],
+      "|", os.environ.get("CONCEPT_MODEL", "(default)"),
+      "| HF token", "set" if os.environ.get("HF_TOKEN") else "none",
+      "| stages:", " ".join(stage for stage in ("RUN_DATA", "RUN_SMOKE", "RUN_SCREEN",
+                                                "RUN_CONFIRM", "RUN_EVAL")
+                            if os.environ.get(stage) == "1"))
+'''
+
 SETUP = r'''
 import os
-# Pick a free GPU BEFORE torch initialises CUDA.  Override without editing this
-# file:  GPU_ID=2 jupyter nbconvert --execute ...
+# Set in the control cell above; re-applied here so this cell stands alone when
+# it is re-run on its own, and so the headless path (GPU_ID=2 jupyter nbconvert
+# --execute ...) works with the control cell's GPU_ID set to None.
 GPU_ID = os.environ.get("GPU_ID", "1")
 os.environ["CUDA_VISIBLE_DEVICES"] = GPU_ID
 
@@ -85,9 +131,9 @@ RUNS = WORK / "runs"                       # adapters (small at r=4, kept)
 OUTPUTS = BASE / "outputs"                 # everything you download for analysis
 
 # ONE model per pass.  Every artefact below is keyed on the model tag and the
-# resume logic reads finished work back by path, so the model is selected from the
-# environment rather than looped over here -- which is also what lets two models
-# share the machine without sharing a GPU.  See the cell above for the commands.
+# resume logic reads finished work back by path, so the model is selected in the
+# control cell rather than looped over here -- which is also what lets two models
+# share the machine without sharing a GPU.
 BASE_MODEL = os.environ.get("CONCEPT_MODEL", "Qwen/Qwen3-1.7B")
 # Every per-model artifact is keyed on this tag.  Two models must never share a
 # path: adapters resume by path, so a collision hands one model's weights to
@@ -120,9 +166,10 @@ PRIMARY_SEED = 42
 def _flag(name, default):
     """Read a run flag from the environment, defaulting to the value here.
 
-    Headless execution is the point: `CONCEPT_MODEL=... RUN_DATA=1 jupyter
-    nbconvert --execute` drives a whole stage without editing this file, so a
-    tmux session survives a dropped VPN and the notebook stays reproducible.
+    The control cell writes the flags into the environment rather than binding
+    them here, so the same file also runs headless -- `CONCEPT_MODEL=...
+    RUN_DATA=1 jupyter nbconvert --execute` drives one stage under tmux, which
+    survives a dropped VPN, and the notebook stays reproducible either way.
     """
     return os.environ.get(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
 
@@ -136,18 +183,18 @@ UPSTREAM_COMMIT = "b1d414143d11c8ed988b4cccbb06626cc8272bbe"
 # token lives under the DEFAULT HF_HOME, so once we move HF_HOME into the project
 # directory a freshly spawned child finds no token and gated downloads 401 --
 # even though the parent, which imported huggingface_hub earlier, looks fine.
-# Exporting HF_TOKEN makes auth explicit and inherited by every subprocess.
+# Exporting HF_TOKEN makes auth explicit and inherited by every subprocess.  A
+# token pasted into the control cell is already in the environment and wins here.
 _cli_token = Path.home() / ".cache" / "huggingface" / "token"
 if not os.environ.get("HF_TOKEN") and _cli_token.is_file():
     os.environ["HF_TOKEN"] = _cli_token.read_text().strip()
 os.environ["HF_HOME"] = str(WORK / "hf_cache")
 
-# PROVISIONED FOR THE QWEN3-1.7B SERVER RUN: upload and run, no edits.
-# The Colab notebook keeps these False because a stray Run All there costs money
-# and a session slot.  Here the whole point is an unattended pass that survives a
-# dropped VPN, and every stage is resumable, so an accidental start costs the
-# shard in flight and nothing else.  Any of them can still be overridden from the
-# environment:  RUN_DATA=0 jupyter nbconvert --execute ...
+# Defaults for the Qwen3-1.7B server pass; the control cell sets all of them, so
+# these apply only when a flag is left None there or this cell is re-run alone.
+# The Colab notebook keeps them False because a stray Run All there costs money
+# and a session slot.  Here the whole point is an unattended pass, and every
+# stage is resumable, so an accidental start costs the shard in flight.
 RUN_DATA = _flag("RUN_DATA", True)
 RUN_SMOKE = _flag("RUN_SMOKE", True)
 RUN_SCREEN = _flag("RUN_SCREEN", True)
@@ -396,61 +443,88 @@ Server twin of `research_tasks_15_zhang_reproduction.ipynb` (Colab). Same
 objective, same schedule, same evaluators; the difference is that the filesystem
 persists, so nothing round-trips through Drive.
 
-**One model per pass.** Every artefact is keyed on the model tag and the resume
-logic reads finished work back by path, so the model is chosen with an
-environment variable rather than a loop:
+**How to run it.** Upload this one `.ipynb` to the server, open it, read the GPU
+table in §1, edit the single control cell in §2 — GPU, model, HF token, which
+stages run — and Run All. Nothing else is uploaded and no path is edited: the
+notebook clones both repositories itself and keeps every artefact under its own
+directory, so moving the file moves the whole experiment.
 
-The defaults in the setup cell already say `Qwen/Qwen3-1.7B` on GPU 1, so the
-plain command below needs no variables at all. Name them only to override.
+**One model per pass.** Every artefact is keyed on the model tag and the resume
+logic reads finished work back by path, so `MODEL` in the control cell selects
+the pass instead of a loop over models. Qwen3-1.7B first; then change that one
+line to `Qwen/Qwen3-4B`, which reuses 1.7B's content words and skips the spaCy
+POS pass entirely — the two tokenizers are compared before the copy and the run
+aborts if they differ. Running them in parallel on two cards is also fine; 4B
+then simply pays that pass itself, so either order is safe.
+
+**Interruptions are cheap.** Extraction shards, trained adapters and finished
+evaluation tables are all skipped on a re-run. If the kernel dies, reopen the
+notebook and Run All: it picks up at the shard or arm that was in flight.
+
+### Headless alternative, for an unattended pass
+
+A kernel survives a dropped VPN — it runs on the server, not in the browser —
+but the output stream does not always reattach, so a multi-hour pass is easier to
+follow as a log file under `tmux`:
 
 ```bash
-# this run: upload, then one command under tmux
 export CONCEPT_BASE=$PWD
 jupyter nbconvert --to notebook --execute --ExecutePreprocessor.timeout=-1 \
     --output executed_qwen17.ipynb reproducibilty_15.ipynb 2>&1 | tee qwen17.log
-
-# afterwards, the 4B pass; it inherits 1.7B's content words
-CONCEPT_MODEL=Qwen/Qwen3-4B jupyter nbconvert --to notebook --execute \
-    --ExecutePreprocessor.timeout=-1 --output executed_qwen4b.ipynb \
-    reproducibilty_15.ipynb 2>&1 | tee qwen4b.log
-
-# or both at once, one card each -- 4B only after 1.7B has written its
-# content words, or both pay the spaCy pass
-CONCEPT_MODEL=Qwen/Qwen3-1.7B GPU_ID=1 ... &
-CONCEPT_MODEL=Qwen/Qwen3-4B   GPU_ID=2 ... &
 ```
 
-`Qwen/Qwen3-4B` reuses `Qwen/Qwen3-1.7B`'s content words when that model has
-already been extracted, which skips the spaCy POS pass; the two tokenizers are
-compared before the copy and the run aborts if they differ. Run them in parallel
-and 3B simply pays that pass itself, so either order is safe.
+The control cell's values win over the shell, so set one to `None` there to pass
+it in from outside instead — which is how two models share the machine on
+separate cards:
+
+```bash
+CONCEPT_MODEL=Qwen/Qwen3-1.7B GPU_ID=1 jupyter nbconvert ... &
+CONCEPT_MODEL=Qwen/Qwen3-4B   GPU_ID=2 jupyter nbconvert ... &
+```
 
 ## Layout
 
-Everything lands under the directory the notebook itself lives in — clones and
-checkpoints in `concept_aware/`, reports in `outputs/`:
+Everything — both clones, the HF cache, the corpus, the adapters and every
+report — lands under the directory this notebook is sitting in. Nothing is
+written to your home directory, and nothing outside this tree is touched:
 
 ```
-outputs/
-├── qwen2.5-1.5b/
-│   ├── data_audit.json
-│   ├── results/         flat_main_table.csv, sts_*.csv, *_ci_*.json, mteb_raw/
-│   ├── logs/            per-arm training_history.jsonl
-│   └── run_manifests/   label -> adapter path, extraction shard completion
-├── qwen2.5-3b/          same shape
-└── shared/              pip freeze, benchmark integrity (model-independent)
+<the directory holding this notebook>/
+├── reproducibilty_15.ipynb
+├── concept_aware/
+│   ├── concept-aware-training/   our repo, cloned and pulled: patch + evaluators
+│   ├── learning-concepts/        upstream, reset to the pinned commit, patched
+│   ├── hf_cache/                 HF_HOME: model weights and the C4 shards
+│   ├── data/                     extracted concept sets and the splits
+│   └── runs/                     QLoRA adapters (small at r=4, kept for resume)
+└── outputs/                      <- the only directory you copy back
+    ├── qwen3-1.7b/
+    │   ├── data_audit.json
+    │   ├── results/       flat_main_table.csv, sts_*.csv, *_ci_*.json, mteb_raw/
+    │   ├── logs/          per-arm training_history.jsonl
+    │   └── run_manifests/ label -> adapter path, extraction shard completion
+    ├── qwen3-4b/          same shape
+    └── shared/            pip freeze, benchmark integrity (model-independent)
 ```
 
-That is the layout the local analysis copy already uses, so a finished model
-directory is copied off the server as-is with no renaming.
+`outputs/` holds reports only — an assertion fails the run if model weights or
+optimizer state ever reach it — so it stays small enough to `rsync` back. It is
+also the layout the local analysis copy uses, so a finished model directory is
+copied off the server as-is with no renaming.
+
+The base directory is the notebook's own, found through `JPY_SESSION_NAME`, so a
+kernel started somewhere else cannot scatter a second tree. Setting
+`CONCEPT_BASE` overrides it.
 
 ## Before the long run
 
-Set the `RUN_*` gates in the setup cell — they all default to `False` so that
-opening this file and hitting Run All does nothing expensive. Then watch the
-**first extraction shard**: this server measured 49 s/sequence in August against
-Colab's 5.6, and at that rate 4,000 sequences is days, not hours. Shards resume,
-so interrupting after the first costs nothing.
+The control cell in §2 is the whole configuration; everything below it reads
+from the environment it sets. Watch the **first extraction
+shard** anyway: with `SPACY_GPU` the A40 measured **5.0 s/sequence**, and 42.6
+without it, so a rate near 40 means `spacy.require_gpu()` fell back to CPU and
+`cupy-cuda12x` is not installed in this environment. At 5 s/seq the 4,000
+sequences are about 5.5 h; at 40 they are days. Shards are recorded only once
+they finish, so interrupting after the first costs nothing.
 '''
 
 RENAME = [
@@ -504,7 +578,22 @@ RENAME = [
 ]
 
 source = json.loads(SOURCE.read_text())
-cells = [md(HEADER.strip("\n")), code(INSTALL), code(SETUP), code(BOOTSTRAP)]
+# The GPU table and the control cell come FIRST, before the install cell imports
+# torch: CUDA_VISIBLE_DEVICES chosen after the driver initialises is ignored, and
+# the run would land on card 0 while reporting the card you asked for.
+cells = [md(HEADER.strip("\n")),
+         md("## 1. Which GPUs are free\n\n"
+            "Run this first, then name one in the control cell below. Getting it wrong "
+            "means restarting the kernel, not just re-running a cell."),
+         code(GPU_PICK),
+         md("## 2. The one cell to edit\n\n"
+            "GPU, model, HF token and the stage gates. Everything after this reads them "
+            "from the environment, including every child process."),
+         code(CONTROL),
+         md("## 3. Dependencies\n\n"
+            "Once per environment. The `transformers` pin matters: upstream's extractor "
+            "reuses a prefix KV cache through an API removed in v5."),
+         code(INSTALL), code(SETUP), code(BOOTSTRAP)]
 
 for index, cell in enumerate(source["cells"]):
     if index in (0, 1, 2):          # title, Colab setup, Colab bootstrap
