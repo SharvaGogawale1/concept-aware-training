@@ -58,14 +58,21 @@ CONTROL = r'''
 import os
 
 GPU_ID   = "1"                 # from the table above
-MODEL    = "Qwen/Qwen3-1.7B"   # ONE model per pass; the second pass is "Qwen/Qwen3-4B"
+MODEL    = "Qwen/Qwen3-1.7B-Base"   # ONE model per pass; then "Qwen/Qwen3-4B-Base".
+                               # The -Base suffix is NOT cosmetic: a bare Qwen3 name is the
+                               # post-trained chat model, and this study continues PRE-training
+                               # and compares against Llama-3.2-1B, a base model.  (Qwen2.5 named
+                               # them the other way round, which is how this gets picked wrong.)
 HF_TOKEN = ""                  # gated models only (Llama).  Qwen3 is open: leave empty.
                                # If you do paste one, CLEAR IT BEFORE SAVING THIS FILE.
 
 RUN_DATA    = True    # extract concept sets from C4 and build the splits (the long stage)
 RUN_SMOKE   = True    # ~20-step objective check before any long training starts
 RUN_SCREEN  = True    # train the seven arms at seed 42
-RUN_CONFIRM = False   # add seeds 123 and 2024; Qwen is a seed-42 replication, so off
+RUN_CONFIRM = False   # retrain the headline arms across SEEDS; Qwen is a seed-42
+                      # replication, so off.  It needs RUN_MULTISEED too -- on its own
+                      # it loops over [42] alone and every arm is already finished.
+RUN_MULTISEED = False # add seeds 123 and 2024 to SEEDS
 RUN_EVAL    = True    # score every checkpoint: SWORDS, STS, perplexity, bm-semlex
 SPACY_GPU   = True    # 8.5x faster extraction; needs cupy-cuda12x, installed below
 
@@ -75,7 +82,7 @@ SPACY_GPU   = True    # 8.5x faster extraction; needs cupy-cuda12x, installed be
 for _name, _value in {"GPU_ID": GPU_ID, "CONCEPT_MODEL": MODEL, "HF_TOKEN": HF_TOKEN or None,
                       "RUN_DATA": RUN_DATA, "RUN_SMOKE": RUN_SMOKE, "RUN_SCREEN": RUN_SCREEN,
                       "RUN_CONFIRM": RUN_CONFIRM, "RUN_EVAL": RUN_EVAL,
-                      "SPACY_GPU": SPACY_GPU}.items():
+                      "RUN_MULTISEED": RUN_MULTISEED, "SPACY_GPU": SPACY_GPU}.items():
     if _value is not None:
         os.environ[_name] = ("1" if _value else "0") if isinstance(_value, bool) else str(_value)
 
@@ -134,7 +141,7 @@ OUTPUTS = BASE / "outputs"                 # everything you download for analysi
 # resume logic reads finished work back by path, so the model is selected in the
 # control cell rather than looped over here -- which is also what lets two models
 # share the machine without sharing a GPU.
-BASE_MODEL = os.environ.get("CONCEPT_MODEL", "Qwen/Qwen3-1.7B")
+BASE_MODEL = os.environ.get("CONCEPT_MODEL", "Qwen/Qwen3-1.7B-Base")
 # Every per-model artifact is keyed on this tag.  Two models must never share a
 # path: adapters resume by path, so a collision hands one model's weights to
 # another and the run still looks like it succeeded.  conceptlib.paths derives
@@ -146,6 +153,7 @@ MODEL_TAG = BASE_MODEL.split("/")[-1].lower()
 # run aborts if they differ.  Each pair shares a tokenizer WITHIN its family and
 # never across families, which is why this is a table and not a size heuristic.
 VOCAB_DONOR = {"Qwen/Qwen2.5-3B": "Qwen/Qwen2.5-1.5B",
+               "Qwen/Qwen3-4B-Base": "Qwen/Qwen3-1.7B-Base",
                "Qwen/Qwen3-4B": "Qwen/Qwen3-1.7B",
                "meta-llama/Llama-3.2-3B": "meta-llama/Llama-3.2-1B"}
 REUSE_CONTENT_WORDS_FROM = os.environ.get("CONCEPT_REUSE_FROM") or VOCAB_DONOR.get(BASE_MODEL)
@@ -190,7 +198,7 @@ if not os.environ.get("HF_TOKEN") and _cli_token.is_file():
     os.environ["HF_TOKEN"] = _cli_token.read_text().strip()
 os.environ["HF_HOME"] = str(WORK / "hf_cache")
 
-# Defaults for the Qwen3-1.7B server pass; the control cell sets all of them, so
+# Defaults for the Qwen3-1.7B-Base server pass; the control cell sets all of them, so
 # these apply only when a flag is left None there or this cell is re-run alone.
 # The Colab notebook keeps them False because a stray Run All there costs money
 # and a session slot.  Here the whole point is an unattended pass, and every
@@ -451,8 +459,8 @@ directory, so moving the file moves the whole experiment.
 
 **One model per pass.** Every artefact is keyed on the model tag and the resume
 logic reads finished work back by path, so `MODEL` in the control cell selects
-the pass instead of a loop over models. Qwen3-1.7B first; then change that one
-line to `Qwen/Qwen3-4B`, which reuses 1.7B's content words and skips the spaCy
+the pass instead of a loop over models. Qwen3-1.7B-Base first; then change that
+one line to `Qwen/Qwen3-4B-Base`, which reuses 1.7B's content words and skips the spaCy
 POS pass entirely — the two tokenizers are compared before the copy and the run
 aborts if they differ. Running them in parallel on two cards is also fine; 4B
 then simply pays that pass itself, so either order is safe.
@@ -478,8 +486,8 @@ it in from outside instead — which is how two models share the machine on
 separate cards:
 
 ```bash
-CONCEPT_MODEL=Qwen/Qwen3-1.7B GPU_ID=1 jupyter nbconvert ... &
-CONCEPT_MODEL=Qwen/Qwen3-4B   GPU_ID=2 jupyter nbconvert ... &
+CONCEPT_MODEL=Qwen/Qwen3-1.7B-Base GPU_ID=1 jupyter nbconvert ... &
+CONCEPT_MODEL=Qwen/Qwen3-4B-Base   GPU_ID=2 jupyter nbconvert ... &
 ```
 
 ## Layout
@@ -498,12 +506,12 @@ written to your home directory, and nothing outside this tree is touched:
 │   ├── data/                     extracted concept sets and the splits
 │   └── runs/                     QLoRA adapters (small at r=4, kept for resume)
 └── outputs/                      <- the only directory you copy back
-    ├── qwen3-1.7b/
+    ├── qwen3-1.7b-base/
     │   ├── data_audit.json
     │   ├── results/       flat_main_table.csv, sts_*.csv, *_ci_*.json, mteb_raw/
     │   ├── logs/          per-arm training_history.jsonl
     │   └── run_manifests/ label -> adapter path, extraction shard completion
-    ├── qwen3-4b/          same shape
+    ├── qwen3-4b-base/     same shape
     └── shared/            pip freeze, benchmark integrity (model-independent)
 ```
 
