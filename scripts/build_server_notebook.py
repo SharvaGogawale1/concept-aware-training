@@ -518,13 +518,15 @@ kernel started somewhere else cannot scatter a second tree. Setting
 
 ## Before the long run
 
-The control cell in §2 is the whole configuration; everything below it reads
-from the environment it sets. Watch the **first extraction
-shard** anyway: with `SPACY_GPU` the A40 measured **5.0 s/sequence**, and 42.6
-without it, so a rate near 40 means `spacy.require_gpu()` fell back to CPU and
-`cupy-cuda12x` is not installed in this environment. At 5 s/seq the 4,000
-sequences are about 5.5 h; at 40 they are days. Shards are recorded only once
-they finish, so interrupting after the first costs nothing.
+The control cell in §2 is the whole configuration; everything below it reads from
+the environment it sets. Watch the **first extraction shard** anyway: on the A40
+`SPACY_GPU` measured **5.0 s/sequence** against 42.6 on CPU, so at 5 s/seq the
+4,000 sequences take about 5.5 h and at 40 they take days. A rate near 40 means
+`CONCEPT_SPACY_GPU` did not reach the child process — the flag says GPU while
+the work ran on CPU. (Missing cupy is the loud failure, not the slow one:
+`spacy.require_gpu()` raises `No GPU devices detected` rather than falling back.)
+Shards are recorded only once they finish, so interrupting after the first costs
+nothing.
 '''
 
 RENAME = [
