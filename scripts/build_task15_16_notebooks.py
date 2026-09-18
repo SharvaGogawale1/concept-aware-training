@@ -841,8 +841,13 @@ if RUN_SCREEN:
             "alternative_uniform", 42, alpha, objective="uniform", slot_ntp_weight=1.0,
             exclude_target=True)
 
-# Set this ONLY from the alpha gate printed by the decision cell below.
-SELECTED_ALPHA = None
+# Set this ONLY from the alpha gate printed by the decision cell below -- or,
+# when REPLICATING on another model, to the value that gate already selected
+# elsewhere, passed in as SELECTED_ALPHA=0.5 rather than edited in here.  A
+# transferred value is a deliberate choice and belongs in the write-up: it means
+# alpha was not tuned on this model, which is the stronger claim and also the
+# only honest one once the test set has been read for the first model.
+SELECTED_ALPHA = float(os.environ["SELECTED_ALPHA"]) if os.environ.get("SELECTED_ALPHA") else None
 if RUN_SCREEN and SELECTED_ALPHA is not None:
     # The one ablation that isolates the exclusion: identical loss, observed
     # target back inside the concept set.  Not a headline method.
@@ -1140,7 +1145,7 @@ else:
 
 Lock $\\alpha$ and $\\beta$ from the seed-42 screen's decision cell further down; never choose them per seed. This cell sits before evaluation on purpose, so one Run All trains the new seeds and then scores them. Seeds 42, 123, 2024 for the alternative-only uniform arm and, if promoted, the contrastive arm. The seed-42 adapters already exist and resume for free."""),
         code(r"""
-SELECTED_BETA = None
+SELECTED_BETA = float(os.environ["SELECTED_BETA"]) if os.environ.get("SELECTED_BETA") else None
 if RUN_CONFIRM:
     assert SELECTED_ALPHA is not None, "set SELECTED_ALPHA from the alpha gate first"
     for seed in SEEDS:

@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Derive the server notebook from the Colab one.
+"""Derive the server notebooks from the Colab ones.
 
 Everything outside the first two cells refers to Drive only through function and
-variable NAMES, never through hardcoded paths.  So the server variant replaces
+variable NAMES, never through hardcoded paths.  So each server variant replaces
 the setup and bootstrap cells, renames those symbols, and reuses the experiment
-body verbatim -- which keeps the two notebooks from drifting apart.
+body verbatim -- which keeps the twins from drifting apart.
+
+Two notebooks are emitted, and they are meant to run against the SAME
+CONCEPT_BASE: 15b reads 15's manifest and results directory for its comparators,
+so pointing them at one directory is what lets the objective arms be scored
+against reproduction arms that are already trained.
 """
 import json
 from pathlib import Path
 
 NB_DIR = Path(__file__).resolve().parent.parent / "notebooks"
-SOURCE = NB_DIR / "research_tasks_15_zhang_reproduction.ipynb"
-TARGET = NB_DIR / "reproducibilty_15.ipynb"
 
 def md(text): return {"cell_type": "markdown", "metadata": {}, "source": text.splitlines(keepends=True)}
 def code(text): return {"cell_type": "code", "execution_count": None, "metadata": {},
@@ -53,7 +56,10 @@ GPU_PICK = r'''
 !nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv
 '''
 
-CONTROL = r'''
+# One control cell per notebook.  They are written out rather than generated
+# from a shared template: a reader of the notebook has to be able to see every
+# knob and what it costs, and the gates mean different things in the two files.
+CONTROL_15 = r'''
 # ==== THE ONLY CELL YOU EDIT.  Set these, then Run All. ======================
 import os
 
@@ -95,6 +101,63 @@ print("GPU", os.environ["CUDA_VISIBLE_DEVICES"],
       "|", os.environ.get("CONCEPT_MODEL", "(default)"),
       "| HF token", "set" if os.environ.get("HF_TOKEN") else "none",
       "| stages:", " ".join(stage for stage in ("RUN_DATA", "RUN_SMOKE", "RUN_SCREEN",
+                                                "RUN_CONFIRM", "RUN_EVAL")
+                            if os.environ.get(stage) == "1"))
+'''
+
+CONTROL_15B = r'''
+# ==== THE ONLY CELL YOU EDIT.  Set these, then Run All. ======================
+import os
+
+GPU_ID   = "1"                      # from the table above
+MODEL    = "Qwen/Qwen3-1.7B-Base"   # must be a model whose Task 15 pass already
+                                    # finished: the arms here are scored against its
+                                    # NTP, Zhang and randomized adapters.
+HF_TOKEN = ""                       # gated models only (Llama).  Qwen3 is open.
+                                    # If you do paste one, CLEAR IT BEFORE SAVING.
+
+# Alpha was selected on Llama-3.2-1B's C4 validation and beta on SWORDS dev.
+# Setting them here TRANSFERS those values instead of tuning again on this model.
+# That is the intended replication: re-tuning per model would read this model's
+# data for selection and make the second family a second tuning round rather
+# than a test.  Say so in the write-up.  Leave both None to run the alpha screen
+# and read the decision cell's gate, the way the first model did it.
+SELECTED_ALPHA = 0.5
+SELECTED_BETA  = 1.0
+
+RUN_DATA    = True    # mine WordNet hard negatives and write the negatives view (minutes)
+RUN_SCREEN  = True    # alpha sweep {0.25,0.5,1.0}; then, because SELECTED_ALPHA is set,
+                      # the inclusive-set ablation, the beta screen {0.25,0.5,1.0} and the
+                      # alpha=0.75 frontier point -- 8 arms, ~30 min each on an A40
+RUN_CONFIRM = False   # the locked arms across SEEDS.  Needs RUN_MULTISEED for a real
+                      # three-seed confirmation; on its own it loops over [42], which the
+                      # screen has already trained.
+RUN_MULTISEED = False # add seeds 123 and 2024 to SEEDS
+RUN_EVAL    = True    # score these arms AND the Task 15 comparators: SWORDS with paired
+                      # bootstrap intervals, STS, perplexity, concept sets, bm-semlex
+SPACY_GPU   = True    # only matters if this model still needs extraction
+
+# Everything below reads these from the environment, which is also how they reach
+# each child process.  Set any value to None to defer to a variable exported in
+# the shell instead -- that is what the nbconvert commands in the cell above use.
+for _name, _value in {"GPU_ID": GPU_ID, "CONCEPT_MODEL": MODEL, "HF_TOKEN": HF_TOKEN or None,
+                      "SELECTED_ALPHA": SELECTED_ALPHA, "SELECTED_BETA": SELECTED_BETA,
+                      "RUN_DATA": RUN_DATA, "RUN_SCREEN": RUN_SCREEN,
+                      "RUN_CONFIRM": RUN_CONFIRM, "RUN_EVAL": RUN_EVAL,
+                      "RUN_MULTISEED": RUN_MULTISEED, "SPACY_GPU": SPACY_GPU}.items():
+    if _value is not None:
+        os.environ[_name] = ("1" if _value else "0") if isinstance(_value, bool) else str(_value)
+
+# CUDA_VISIBLE_DEVICES has to be set before any torch import initialises the
+# driver, and the install cell below imports torch to decide about torchao.  The
+# setup cell sets it too, from GPU_ID -- but by then the choice can already be
+# locked in, and the run would quietly land on card 0.
+os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.setdefault("GPU_ID", "1")
+print("GPU", os.environ["CUDA_VISIBLE_DEVICES"],
+      "|", os.environ.get("CONCEPT_MODEL", "(default)"),
+      "| alpha", os.environ.get("SELECTED_ALPHA", "(screen)"),
+      "| beta", os.environ.get("SELECTED_BETA", "(screen)"),
+      "| stages:", " ".join(stage for stage in ("RUN_DATA", "RUN_SCREEN",
                                                 "RUN_CONFIRM", "RUN_EVAL")
                             if os.environ.get(stage) == "1"))
 '''
@@ -537,6 +600,51 @@ Shards are recorded only once they finish, so interrupting after the first costs
 nothing.
 '''
 
+HEADER_15B = r'''
+# Task 15b (server) — alternative-only supervision and contrastive calibration
+
+Server twin of `research_tasks_15b_objective_and_contrastive.ipynb` (Colab). These
+are the arms the paper contributes: **alternative-only** concept supervision
+(`--exclude-target`, uniform over the alternatives) and the same with
+**hard-negative contrastive** calibration.
+
+**Run it in the SAME directory as the Task 15 pass for this model.** Every arm
+here is compared against that pass's NTP, Zhang and randomized adapters, and it
+reads them through `run_manifests/task15.json` and `results/` under the same
+`CONCEPT_BASE`. Point it somewhere else and there is nothing to compare against.
+Nothing is re-extracted: the concept data is already on disk.
+
+```bash
+cd <the Task 15 directory for this model>     # e.g. ~/fos_retrieval/task15
+export CONCEPT_BASE=$PWD
+papermill reproducibilty_15b.ipynb executed_15b.ipynb -k concept --log-output 2>&1 | tee -a 15b.log
+```
+
+## What it trains
+
+With `SELECTED_ALPHA` set in the control cell (the replication path), `RUN_SCREEN`
+trains eight arms at seed 42:
+
+| arms | why |
+|---|---|
+| uniform α ∈ {0.25, 0.5, 1.0} | the objective, at three weights |
+| uniform α = 0.75 | frontier control: a contrastive arm must beat the uniform *curve*, not just the same-α point |
+| inclusive uniform α | identical loss with the observed target back in the set — isolates the exclusion |
+| contrastive β ∈ {0.25, 0.5, 1.0} | hard negatives at the locked α |
+
+The α = 0.75 point exists because contrastive arms land between α = 0.5 and
+α = 1.0 on both axes, so two uniform points cannot say whether they sit above the
+uniform curve or merely on it. Any contrastive claim is tested against a HIGHER-α
+uniform arm, never only against the same α.
+
+## Costs, measured on an A40 with Qwen3-1.7B-Base
+
+Roughly 30 min per training arm, so ~4 h for the eight. Evaluation then scores
+these plus the Task 15 comparators — about 17 checkpoints — at ~4.5 min for
+SWORDS and ~5 min for STS each, so ~4-5 h. Call it 9-10 h end to end, and every
+stage resumes.
+'''
+
 RENAME = [
     # Layout: outputs/<model tag>/{data_audit.json,results,logs,run_manifests}.  The
     # Colab body keys everything on _TAG_SUFFIX because its 1B run predates the
@@ -551,6 +659,19 @@ RENAME = [
     ("result_dir = DRIVE_RESULTS / RESULT_DIR", "result_dir = RESULT_DIR"),
     ('sync_small_artifacts(path, f"{LOG_DIR}/{label}")', "sync_small_artifacts(path, LOG_DIR / label)"),
     ('plt.savefig(DRIVE_RESULTS / RESULT_DIR / "training_curves.png"', 'plt.savefig(RESULT_DIR / "training_curves.png"'),
+    # Task 15b keys its artifacts the same way: inside this model's own output
+    # directory, with no tag suffix, because the server gives every model its own.
+    ('SCREEN_DIR = DRIVE_RESULTS / f"task15b_screen{_TAG_SUFFIX}"',
+     'SCREEN_DIR = MODEL_OUT / "task15b_screen"'),
+    ('DRIVE_RESULTS / f"contrastive_negative_report{_TAG_SUFFIX}.json"',
+     'MODEL_OUT / "contrastive_negative_report.json"'),
+    ('load_runs(f"task15b{_TAG_SUFFIX}")', 'load_runs("task15b")'),
+    ('save_runs(OBJECTIVE_RUNS, f"task15b{_TAG_SUFFIX}")', 'save_runs(OBJECTIVE_RUNS, "task15b")'),
+    ('sync_small_artifacts(path, f"task15b_logs{_TAG_SUFFIX}/{label}")',
+     'sync_small_artifacts(path, LOG_DIR / "task15b_logs" / label)'),
+    # 15b scores its arms against Task 15's, so it reads that notebook's result
+    # directory -- which is why both must run with the same CONCEPT_BASE.
+    ("task15_dir = DRIVE_RESULTS / RESULT_DIR", "task15_dir = RESULT_DIR"),
     # Wording that is true of Colab and false of a persistent filesystem.
     ("# Unconditional: /content is wiped between sessions and the smoke run in the next\n"
      "# section reads synonyms_train.jsonl directly.  Whenever the data was generated in\n"
@@ -587,31 +708,34 @@ RENAME = [
     ("adapters remain under /content", "adapters stay under RUNS"),
 ]
 
-source = json.loads(SOURCE.read_text())
-# The GPU table and the control cell come FIRST, before the install cell imports
-# torch: CUDA_VISIBLE_DEVICES chosen after the driver initialises is ignored, and
-# the run would land on card 0 while reporting the card you asked for.
-cells = [md(HEADER.strip("\n")),
-         md("## 1. Which GPUs are free\n\n"
-            "Run this first, then name one in the control cell below. Getting it wrong "
-            "means restarting the kernel, not just re-running a cell."),
-         code(GPU_PICK),
-         md("## 2. The one cell to edit\n\n"
-            "GPU, model, HF token and the stage gates. Everything after this reads them "
-            "from the environment, including every child process."),
-         code(CONTROL),
-         md("## 3. Dependencies\n\n"
-            "Once per environment. The `transformers` pin matters: upstream's extractor "
-            "reuses a prefix KV cache through an API removed in v5."),
-         code(INSTALL), code(SETUP), code(BOOTSTRAP)]
+def build(source_name, target_name, header, control):
+    """Assemble one server notebook from its Colab source."""
+    source = json.loads((NB_DIR / source_name).read_text())
+    # The GPU table and the control cell come FIRST, before the install cell
+    # imports torch: CUDA_VISIBLE_DEVICES chosen after the driver initialises is
+    # ignored, and the run would land on card 0 while reporting the card asked for.
+    cells = [md(header.strip("\n")),
+             md("## 1. Which GPUs are free\n\n"
+                "Run this first, then name one in the control cell below. Getting it wrong "
+                "means restarting the kernel, not just re-running a cell."),
+             code(GPU_PICK),
+             md("## 2. The one cell to edit\n\n"
+                "GPU, model, HF token and the stage gates. Everything after this reads them "
+                "from the environment, including every child process."),
+             code(control),
+             md("## 3. Dependencies\n\n"
+                "Once per environment. The `transformers` pin matters: upstream's extractor "
+                "reuses a prefix KV cache through an API removed in v5."),
+             code(INSTALL), code(SETUP), code(BOOTSTRAP)]
 
-for index, cell in enumerate(source["cells"]):
-    if index in (0, 1, 2):          # title, Colab setup, Colab bootstrap
-        continue
-    text = "".join(cell["source"])
-    for old, new in RENAME:
-        text = text.replace(old, new)
-    cells.append(code(text) if cell["cell_type"] == "code" else md(text))
+    for index, cell in enumerate(source["cells"]):
+        if index in (0, 1, 2):          # title, Colab setup, Colab bootstrap
+            continue
+        text = "".join(cell["source"])
+        for old, new in RENAME:
+            text = text.replace(old, new)
+        cells.append(code(text) if cell["cell_type"] == "code" else md(text))
+    return cells, NB_DIR / target_name
 
 def undefined_names(notebook_cells):
     """Names the notebook loads but never binds.
@@ -659,18 +783,25 @@ def undefined_names(notebook_cells):
     return sorted(loaded - bound)
 
 
-missing = undefined_names(cells)
-if missing:
-    raise SystemExit(
-        "refusing to write a notebook that would NameError at runtime.\n"
-        "These names are used but never bound -- the hand-written server setup\n"
-        "has drifted behind the Colab COMMON_SETUP it mirrors:\n  "
-        + "\n  ".join(missing))
+NOTEBOOKS = [
+    ("research_tasks_15_zhang_reproduction.ipynb", "reproducibilty_15.ipynb", HEADER, CONTROL_15),
+    ("research_tasks_15b_objective_and_contrastive.ipynb", "reproducibilty_15b.ipynb",
+     HEADER_15B, CONTROL_15B),
+]
 
-TARGET.write_text(json.dumps({
-    "cells": cells,
-    "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
-                 "language_info": {"name": "python"}},
-    "nbformat": 4, "nbformat_minor": 5,
-}, indent=1) + "\n")
-print(f"wrote {TARGET} ({len(cells)} cells)")
+for source_name, target_name, header, control in NOTEBOOKS:
+    cells, target = build(source_name, target_name, header, control)
+    missing = undefined_names(cells)
+    if missing:
+        raise SystemExit(
+            f"refusing to write {target_name}, which would NameError at runtime.\n"
+            "These names are used but never bound -- the hand-written server setup\n"
+            "has drifted behind the Colab COMMON_SETUP it mirrors:\n  "
+            + "\n  ".join(missing))
+    target.write_text(json.dumps({
+        "cells": cells,
+        "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+                     "language_info": {"name": "python"}},
+        "nbformat": 4, "nbformat_minor": 5,
+    }, indent=1) + "\n")
+    print(f"wrote {target} ({len(cells)} cells)")
