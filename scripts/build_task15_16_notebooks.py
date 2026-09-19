@@ -36,7 +36,7 @@ def write(name, cells):
 COMMON_SETUP = r'''
 from pathlib import Path
 from getpass import getpass
-import hashlib, json, os, re, shutil, subprocess, sys, torch
+import datetime, hashlib, json, os, re, shutil, subprocess, sys, torch
 
 BASE_MODEL = "meta-llama/Llama-3.2-1B"
 # Every per-model artifact -- data, adapters, manifests, results -- is keyed on
@@ -74,6 +74,13 @@ RUN_DATA = False
 RUN_SMOKE = False
 RUN_SCREEN = False
 RUN_CONFIRM = False
+# Task 15b only: Zhang's set marginal plus an alternative-only auxiliary term, and
+# the two negative-quality controls.  Seed 42 unless SELECTED_HYBRID is set.
+RUN_HYBRID = False
+# The two negative-quality controls (clean / fragments).  They are a diagnostic
+# for the demoted contrastive term, NOT a method-selection run, so they are off
+# by default and should be run AFTER the H1/H2 screen has been gated.
+RUN_NEGATIVE_CONTROLS = False
 RUN_EVAL = False
 # Skip any run whose adapter is already on Drive.  /content is wiped between
 # Colab sessions, so without this the screen -> gate -> confirm sequence has to
@@ -212,6 +219,13 @@ _TAG_SUFFIX = "" if MODEL_TAG == "llama-3.2-1b" else f"_{MODEL_TAG}"
 RESULT_DIR = f"task15_reproduction{_TAG_SUFFIX}"
 LOG_DIR = f"task15_logs{_TAG_SUFFIX}"
 
+# HyperLex is split train/dev/test; the lexical split shares no lemma between
+# them, which is the stricter generalisation setting.  Every diagnostic in these
+# notebooks reads DEV.  The test file is deliberately not referenced anywhere:
+# the hierarchy claim in Task 16 is scored on it exactly once, after the method
+# is locked, and a diagnostic that peeks at it would spend that.
+HYPERLEX_DEV = MAIN / "data/hyperlex-data/splits/lexical/hyperlex_dev_all_lexical.txt"
+HYPERLEX_TEST = MAIN / "data/hyperlex-data/splits/lexical/hyperlex_test_all_lexical.txt"  # locked
 RUN_MANIFEST = DRIVE_RESULTS / "run_manifests"
 
 def save_runs(runs, name):
@@ -275,8 +289,14 @@ def guarded(path, checkpoints, argv, cwd, what):
     run(argv, cwd=cwd)
 
 ADAPTER_CACHE = DRIVE_PROJECT / "task15_16_adapters"
+# train.py writes concept_training_config.json (the objective metadata: lambda,
+# alpha, gamma, exclude_target, seed).  It was missing here, so a session that
+# died after training cached the WEIGHTS but not the description of what they
+# were trained with -- recoverable only from the directory name.  run_config.json
+# is kept for older runs that wrote it.
 ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors",
-                 "training_history.jsonl", "run_config.json")
+                 "training_history.jsonl", "run_config.json",
+                 "concept_training_config.json")
 
 def adapter_cache_dirs(path):
     """Drive locations for one adapter, most current first.
@@ -407,8 +427,11 @@ def finished(path):
 def train_flat(method, seed, concept_weight, *, objective="set_marginal",
                slot_ntp_weight=None, contrast_beta=0.0, exclude_target=False,
                randomized=False, data_augmentation=False, epochs=5, train_file=None,
-               max_samples=None, batch=8, accum=2):
-    out = adapter_path(method, seed, f"lambda_{concept_weight}_beta_{contrast_beta}")
+               max_samples=None, batch=8, accum=2, alt_aux="none", alt_aux_weight=0.0):
+    # The aux suffix is added only when the term is on, so every adapter trained
+    # before it existed keeps its path and still resumes.
+    aux_tag = "" if alt_aux == "none" else f"_aux_{alt_aux}_{alt_aux_weight}"
+    out = adapter_path(method, seed, f"lambda_{concept_weight}_beta_{contrast_beta}{aux_tag}")
     args = [sys.executable, "train.py", "--model-name", BASE_MODEL, "--dataset", "c4",
             "--dataset-type", "embedding", "--concept-loss-weight", concept_weight,
             "--concept-objective", objective, "--contrast-beta", contrast_beta,
@@ -417,6 +440,7 @@ def train_flat(method, seed, concept_weight, *, objective="set_marginal",
             "--per-device-train-batch-size", batch,
             "--gradient-accumulation-steps", accum]
     if slot_ntp_weight is not None: args += ["--slot-ntp-weight", slot_ntp_weight]
+    if alt_aux != "none": args += ["--alt-aux", alt_aux, "--alt-aux-weight", alt_aux_weight]
     # Drops the observed target from the concept set, so the loss cannot be paid
     # with the mass NTP already put there.  Pair it with slot_ntp_weight=1.0 or
     # the observed target is pushed down.  adapter_path() does not encode this
@@ -865,6 +889,72 @@ if RUN_SCREEN and SELECTED_ALPHA is not None:
         "alternative_uniform", 42, 0.75, objective="uniform", slot_ntp_weight=1.0,
         exclude_target=True)
 """),
+        md("""## Calibrated concept marginalization, and what the negatives were really doing
+
+**Why.** Decompose the SWORDS ranking gain. GAP rises either by pushing rejected candidates down or by pulling accepted ones up, and set-marginal training does only the first. Across Llama-1B (3 seeds), Llama-3B and Qwen3-1.7B it lowers rejected-mass share every time (−.014, −.014, −.021) and never lowers NLL on human-accepted alternatives (−.012 n.s., −.046 n.s., **+.088 worse**). Alternative-only supervision moves precisely that second axis, by the same amount in both families (−.50 nats on Llama, −.485 [−.568,−.403] on Qwen). So the two objectives are not rivals; one contains the other. With $q = p / P(S)$ the model's own distribution inside the set,
+
+$$-\\tfrac{1}{n}\\sum_{c\\in S}\\log p_c \\;=\\; \\underbrace{-\\log P(S)}_{\\text{Zhang}} \\;+\\; \\underbrace{\\mathrm{KL}(u\\,\\|\\,q)}_{\\text{within-set}} \\;+\\; \\log n ,$$
+
+and $\\nabla_z[-\\log P(S)] = p - q\\,\\mathbb{1}_S$: the set marginal is self-distillation toward the model's current within-set distribution, so nothing in it says *which* members deserve mass. A semantically randomized control is a second, weaker probe of the same point: on Llama it reproduces most of the ranking gain (+.008 of Zhang's +.011), on Qwen it reproduces none (−.001). That comparison is therefore **model-dependent and reported as such**; the decomposition above is what replicates. These arms keep Zhang's term exactly as released (target-inclusive, $\\lambda=1$, 0.6 cutoff) and add one term on the alternatives only:
+
+- `uniform` — $-\\tfrac1n\\sum\\log p_a$: raises the alternatives and spreads them.
+- `within_kl` — $\\mathrm{KL}(u\\|q_A)$ alone. Its logit gradient is zero outside the alternatives and sums to zero inside them, so it moves mass *between* alternatives and leaves the observed word and the set's total mass to Zhang's term. If SWORDS moves under this arm, the gain is within-set calibration; if only `uniform` moves it, the gain is mass, and the decomposition says so.
+
+**Gate, fixed before any of these is scored (SWORDS dev only):** STS $\\ge .5469$; GAP and AUROC above Zhang with paired intervals excluding zero; above randomized $\\lambda=.25$ on GAP and AUROC; global NLL $\\le$ NTP $+.20$; observed-target NLL $\\le$ NTP $+.10$. The smallest weight that passes is the method. If none passes, the result is the STS-vs-GAP frontier these arms trace, reported as a trade-off.
+
+**The negatives.** A hand read of `negative_sample_50.csv` (2026-09-18): the contrastive loss only fires where a slot has an alternative (31/50), and in 23 of those 31 every negative is a letter or a word-prefix token; 2 of 31 have a semantically meaningful negative. The 0.35 similarity ceiling rejects every real word in a slot with rich alternatives, so only non-words survive, and WordNet lists them. Two controls settle what the published +.005 GAP was: `clean` (complete words in their dominant POS, plus antonyms of the observed word) and `fragments` (only what `clean` throws away). Effective coverage — slots with an alternative AND a negative — is printed for both; the raw 45.6% is not the supervised fraction."""),
+        code(r"""
+NEG_VARIANTS = {"clean": ["--strict-lexical", "--antonyms"], "fragments": ["--fragments-only"]}
+NEG_FILES = {name: LEAF / f"synonyms_train_negatives_{name}.jsonl" for name in NEG_VARIANTS}
+HYBRID_GRID = [("uniform", 0.25), ("uniform", 0.5), ("within_kl", 0.25), ("within_kl", 0.5), ("within_kl", 1.0)]
+# "within_kl:0.5" -- set ONLY from the gate above, then rerun with RUN_MULTISEED.
+SELECTED_HYBRID = os.environ.get("SELECTED_HYBRID")
+if RUN_HYBRID:
+    for kind, weight in HYBRID_GRID:
+        OBJECTIVE_RUNS[f"zhang_plus_{kind}_g{weight}_seed42"] = train_flat(
+            "zhang_plus_aux", 42, 1.0, alt_aux=kind, alt_aux_weight=weight)
+    # Confirmation of the arm the gate below selected.  RUN_CONFIRM is NOT used
+    # for this: that flag also relaunches the alternative-uniform and legacy
+    # contrastive arms, which are ablations here, not the method.
+    if SELECTED_HYBRID:
+        kind, weight = SELECTED_HYBRID.split(":"); weight = float(weight)
+        assert (kind, weight) in HYBRID_GRID, "SELECTED_HYBRID must be one of the screened arms"
+        for seed in SEEDS:
+            OBJECTIVE_RUNS[f"calibrated_seed{seed}"] = train_flat(
+                "zhang_plus_aux", seed, 1.0, alt_aux=kind, alt_aux_weight=weight)
+        # Same adapter as the seed-42 screen arm; one key per adapter.
+        OBJECTIVE_RUNS.pop(f"zhang_plus_{kind}_g{weight}_seed42", None)
+
+if RUN_NEGATIVE_CONTROLS:
+    topk_glob = DATA / "c4" / MODEL_TAG / "prompting" / "topk_*.jsonl"
+    if not list(topk_glob.parent.glob(topk_glob.name)):
+        print("no top-k shards restored; the negative controls are skipped, not faked")
+    else:
+        assert SELECTED_ALPHA is not None, "the negative controls reuse the locked alpha"
+        for name, flags in NEG_VARIANTS.items():
+            report = DRIVE_RESULTS / f"contrastive_negative_report_{name}{_TAG_SUFFIX}.json"
+            if not NEG_FILES[name].is_file():
+                run([sys.executable, "data/build_contrastive_negatives.py",
+                     "--source", LEAF / "synonyms_train.jsonl", "--topk", topk_glob,
+                     "--output", NEG_FILES[name], "--report", report,
+                     "--max-cosine", "0.35", "--max-negatives", "20",
+                     # Coverage counted the way the TRAINER counts: a multi-token
+                     # candidate never reaches the loss, so the raw fraction
+                     # overstates what is actually supervised.
+                     "--tokenizer", BASE_MODEL, *flags], cwd=EXT)
+            if report.is_file():
+                stats = json.loads(report.read_text())
+                print(f"{name}: raw coverage {stats['negative_coverage']:.3f}, "
+                      f"EFFECTIVE contrastive coverage {stats['effective_contrastive_coverage']:.3f}")
+            # A distinct method name per file: adapter_path() does not see train_file.
+            OBJECTIVE_RUNS[f"contrast_{name}_negatives_seed42"] = train_flat(
+                f"alternative_contrastive_{name}", 42, SELECTED_ALPHA, objective="uniform",
+                slot_ntp_weight=1.0, exclude_target=True, contrast_beta=1.0,
+                train_file=NEG_FILES[name])
+
+if RUN_HYBRID or RUN_NEGATIVE_CONTROLS:
+    save_runs(OBJECTIVE_RUNS, f"task15b{_TAG_SUFFIX}")
+"""),
         md("""## Evaluation
 
 Every checkpoint of this pass — Task 15's arms and this notebook's — is scored by the same evaluators. A validation pass of the perplexity and concept-set evaluators exists only for choosing $\\alpha$; every other number is C4 test, SWORDS dev, the nine STS tasks and bm-semlex."""),
@@ -1141,6 +1231,97 @@ elif winners["alternative_uniform"]:
 else:
     print("  no arm wins every discrimination gate: this is a negative result and is reported as one")
 """),
+        md("""## Hybrid gate (automatic)
+
+Applied to the H1/H2 arms only, on SWORDS **dev**, and evaluated before any of these numbers is read by hand. Thresholds are derived from this notebook's own Zhang and NTP rows rather than hardcoded, so the same cell gates a second model without edits.
+
+An arm passes only if it beats Zhang on the axis Zhang provably does not move (human-accepted alternative NLL) **and** on ranking, stays within the retention allowances, and also beats the randomized control. The smallest weight that passes is selected; ties go to the smaller weight. If nothing passes, that is the result and the paper reports the trade-off curve — the cell does not relax a threshold to manufacture a winner."""),
+        code(r"""
+STS_ALLOWANCE = 0.005        # vs Zhang
+GLOBAL_NLL_ALLOWANCE = 0.20  # vs NTP
+OBSERVED_NLL_ALLOWANCE = 0.10
+
+def _gate_rows():
+    table = SCREEN_DIR / "flat_extension_table.csv"
+    if not table.is_file():
+        print("no flat_extension_table.csv yet; run RUN_EVAL first"); return None
+    import csv
+    return {r["method"]: r for r in csv.DictReader(table.open())}
+
+def _ci(path, run_path, metric):
+    # Returns (delta, significant) for one candidate in one paired-CI file.
+    if not Path(path).is_file():
+        return None
+    for entry in json.loads(Path(path).read_text()):
+        if str(entry["candidate"]) != str(run_path):
+            continue
+        if metric not in entry["metrics"]:
+            return None
+        d = entry["metrics"][metric]
+        low, high = d["ci95"]
+        return d["candidate_minus_baseline"], (low * high > 0)
+    return None
+
+def hybrid_gate(verbose=True):
+    rows = _gate_rows()
+    if rows is None: return None
+    zhang = rows.get("zhang seed42") or rows.get("zhang lambda1.0 seed42")
+    ntp = rows.get("ntp seed42")
+    if not zhang or not ntp:
+        print("Task 15 baselines missing from the table; cannot gate"); return None
+    sts_floor = float(zhang["sts_mean"]) - STS_ALLOWANCE
+    nll_ceiling = float(ntp["global_nll"]) + GLOBAL_NLL_ALLOWANCE
+    obs_ceiling = float(ntp["swords_observed_target_nll"]) + OBSERVED_NLL_ALLOWANCE
+    print(f"thresholds -> STS >= {sts_floor:.4f} | global NLL <= {nll_ceiling:.4f} "
+          f"| observed-target NLL <= {obs_ceiling:.4f}")
+
+    vs_zhang = SCREEN_DIR / ("swords_paired_ci_vs_zhang_seed42.json"
+                             if (SCREEN_DIR / "swords_paired_ci_vs_zhang_seed42.json").is_file()
+                             else "swords_paired_ci_vs_zhang_lambda1.0_seed42.json")
+    vs_rand = SCREEN_DIR / "swords_paired_ci_vs_randomized_seed42.json"
+
+    passing = []
+    for kind, weight in HYBRID_GRID:
+        label = f"zhang_plus_{kind}_g{weight}_seed42"
+        run_path = OBJECTIVE_RUNS.get(label)
+        row = rows.get(label.replace("_", " "))
+        if row is None or run_path is None:
+            if verbose: print(f"  {label:34} not trained/scored yet")
+            continue
+        checks = {
+            "STS": float(row["sts_mean"]) >= sts_floor,
+            "globalNLL": float(row["global_nll"]) <= nll_ceiling,
+            "obsNLL": float(row["swords_observed_target_nll"]) <= obs_ceiling,
+        }
+        for metric, key, want_negative in (("alternatives_nll", "altNLL<Zhang", True),
+                                           ("gap", "GAP>Zhang", False),
+                                           ("auroc", "AUROC>Zhang", False)):
+            got = _ci(vs_zhang, run_path, metric)
+            checks[key] = bool(got and got[1] and ((got[0] < 0) == want_negative))
+        got = _ci(vs_rand, run_path, "gap")
+        checks["GAP>random"] = bool(got and got[1] and got[0] > 0)
+
+        ok = all(checks.values())
+        if verbose:
+            failed = [k for k, v in checks.items() if not v]
+            print(f"  {label:34} {'PASS' if ok else 'FAIL'}"
+                  f"  STS {float(row['sts_mean']):.4f}"
+                  f"  gNLL {float(row['global_nll']):.4f}"
+                  f"  altNLL {float(row['swords_alternative_nll']):.3f}"
+                  + ("" if ok else f"   failed: {', '.join(failed)}"))
+        if ok: passing.append((weight, kind))
+
+    if not passing:
+        print("\nNo hybrid arm passes every gate. That is the result: report the "
+              "STS-vs-substitution trade-off curve, do not relax a threshold.")
+        return None
+    weight, kind = sorted(passing)[0]
+    print(f"\nSELECTED_HYBRID = {kind}:{weight}   (smallest passing weight of "
+          f"{len(passing)}; set it in the environment and rerun with RUN_MULTISEED)")
+    return f"{kind}:{weight}"
+
+GATE_CHOICE = hybrid_gate()
+"""),
         md("""## Locked confirmation
 
 Lock $\\alpha$ and $\\beta$ from the seed-42 screen's decision cell further down; never choose them per seed. This cell sits before evaluation on purpose, so one Run All trains the new seeds and then scores them. Seeds 42, 123, 2024 for the alternative-only uniform arm and, if promoted, the contrastive arm. The seed-42 adapters already exist and resume for free."""),
@@ -1168,6 +1349,77 @@ save_runs(OBJECTIVE_RUNS, f"task15b{_TAG_SUFFIX}")
         md("""## Reporting
 
 Main table: NTP, augmented NTP, Zhang set-marginal, alternative-only uniform, contrastive (if promoted). Control table: pretrained, randomized $\\lambda=.25$, randomized $\\lambda=1$ (matched weight), target-inclusive uniform ablation. Paired bootstrap intervals on every SWORDS comparison; mean ± sd over three seeds everywhere else. Do not expand to 3B from this notebook until the three-seed 1B result is in; the hierarchy experiment stays deferred."""),
+        md("""## SWORDS test — one locked invocation
+
+Everything above is SWORDS **dev**: $\\alpha$, $\\beta$ and $\\gamma$ were all chosen on it, so it is development data and cannot support the headline number. This cell scores test **once**, over every locked arm in a single call, so the method and its baselines are measured on identical rows with identical code.
+
+It refuses to run until `SELECTED_HYBRID` is set, and it writes `swords_test_locked.json` recording the arms and the commit. If that file already exists the cell stops: a second test pass with a changed method is the one thing this protocol exists to prevent. Nothing here may be re-run after reading the result."""),
+        code(r"""
+RUN_SWORDS_TEST = False   # set True exactly once, after the method is locked
+if RUN_SWORDS_TEST:
+    assert SELECTED_HYBRID, "lock the method first: the gate sets SELECTED_HYBRID"
+    marker = SCREEN_DIR / "swords_test_locked.json"
+    assert not marker.is_file(), (
+        f"SWORDS test has already been run: {marker}. Re-running after seeing the "
+        "result invalidates it. Delete the marker ONLY if the previous run crashed.")
+
+    # One invocation, every locked arm, in a fixed order.  Baselines come from
+    # Task 15's manifest so the test table cannot quietly use a different NTP
+    # than the dev table did.
+    task15_runs = restore_all(load_runs(f"task15{_TAG_SUFFIX}"))
+    locked = {"pretrained": BASE_MODEL}
+    for family in ("ntp", "augmented_ntp", "zhang", "randomized"):
+        for seed in (42, 123, 2024):
+            key = f"{family}_seed{seed}"
+            if key in task15_runs:
+                locked[key] = str(task15_runs[key])
+            else:
+                print("MISSING baseline, test table will be incomplete:", key)
+    OBJECTIVE_RUNS = restore_all(OBJECTIVE_RUNS)
+    for seed in (42, 123, 2024):
+        key = f"calibrated_seed{seed}"
+        if key in OBJECTIVE_RUNS:
+            locked[key] = str(OBJECTIVE_RUNS[key])
+        else:
+            print("MISSING method seed:", key)
+    # The two ablations the paper reports beside the method.
+    for key in ("alternative_uniform_seed42", "inclusive_uniform_alpha0.5_seed42"):
+        if key in OBJECTIVE_RUNS:
+            locked[key] = str(OBJECTIVE_RUNS[key])
+
+    checkpoints = list(locked.values())
+    print(f"scoring {len(checkpoints)} locked checkpoints on SWORDS TEST")
+    run([sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/eval_swords.py",
+         "--checkpoints", *checkpoints, "--tokenizer_path", BASE_MODEL,
+         "--base_model", BASE_MODEL,
+         "--swords_json", MAIN / "data/swords/swords-v1.1_test.json.gz",
+         "--results_json", SCREEN_DIR / "swords_test.json",
+         "--modes", "left", "full"], cwd=MAIN)
+
+    # Seed-matched paired intervals: each method seed against the SAME seed of
+    # each baseline.  Averaging over mismatched seeds would fold seed variance
+    # into the effect.
+    for family in ("zhang", "ntp", "augmented_ntp"):
+        for seed in (42, 123, 2024):
+            key = f"{family}_seed{seed}"
+            if key not in locked:
+                continue
+            run([sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/paired_benchmark_ci.py",
+                 "--kind", "swords", "--results-json", SCREEN_DIR / "swords_test.json",
+                 "--baseline-index", checkpoints.index(locked[key]),
+                 "--output", SCREEN_DIR / f"swords_test_paired_ci_vs_{key}.json"], cwd=MAIN)
+
+    marker.write_text(json.dumps({
+        "selected_hybrid": SELECTED_HYBRID,
+        "arms": locked,
+        "upstream_commit": UPSTREAM_COMMIT,
+        "written": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }, indent=2))
+    print("locked:", marker)
+"""),
+        md("""### Reporting the test table
+
+For each metric report (a) mean ± sd over the three seeds of each arm, (b) the seed-matched difference method$_s$ − baseline$_s$ for $s \\in \\{42,123,2024\\}$, and (c) a paired bootstrap over per-target scores, averaged across seeds — not a bootstrap over the seed means, which has three points and no power. A claim needs all three seeds to agree in sign with intervals excluding zero."""),
     ]
     # Confirmation must TRAIN before evaluation SCORES.  Written in narrative order
     # -- screen, evaluate, decide, confirm -- a single Run All trained the new seeds
@@ -1300,7 +1552,7 @@ if RUN_EVAL:
     checkpoints = [str(x) for x in {**REFERENCE_RUNS, **HIERARCHY_RUNS}.values()]
     run([sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/eval_hyperlex.py",
          "--checkpoints", *checkpoints, "--tokenizer_path", BASE_MODEL, "--base_model", BASE_MODEL,
-         "--hyperlex", MAIN / "data/hyperlex-data/hyperlex-all.txt",
+         "--hyperlex", HYPERLEX_DEV,
          "--pos", "N", "V", "--results_json", result_dir / "hyperlex.json"], cwd=MAIN)
     run([sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/paired_benchmark_ci.py",
          "--kind", "hyperlex", "--results-json", result_dir / "hyperlex.json",
@@ -1465,7 +1717,7 @@ if RUN_SCALE_EVAL:
          "--output", result_dir / "perplexity.json"], cwd=EXT)
     run([sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/eval_hyperlex.py",
          "--checkpoints", *checkpoints, "--tokenizer_path", SCALE_MODEL, "--base_model", SCALE_MODEL,
-         "--hyperlex", MAIN / "data/hyperlex-data/hyperlex-all.txt", "--pos", "N", "V",
+         "--hyperlex", HYPERLEX_DEV, "--pos", "N", "V",
          "--results_json", result_dir / "hyperlex.json"], cwd=MAIN)
     run([sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/paired_benchmark_ci.py",
          "--kind", "hyperlex", "--results-json", result_dir / "hyperlex.json",

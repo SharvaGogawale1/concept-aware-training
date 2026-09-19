@@ -1,14 +1,16 @@
 diff --git a/conceptlib/config.py b/conceptlib/config.py
-index 95f3ea2..88fd96d 100644
+index 95f3ea2..35a60a4 100644
 --- a/conceptlib/config.py
 +++ b/conceptlib/config.py
-@@ -31,6 +31,9 @@ class TrainingConfig:
+@@ -31,6 +31,11 @@ class TrainingConfig:
      max_synonyms_per_content_word = 10
      max_content_words = None  # None means all content words; otherwise sample this many
      target_mass = 0.6
 +    concept_objective: str = "set_marginal"
 +    slot_ntp_weight: Optional[float] = None
 +    contrast_beta: float = 0.0
++    alt_aux: str = "none"
++    alt_aux_weight: float = 0.0
      use_weighted_ce: bool = False
      ce_concept_token_weight: float = 5.0
  
@@ -216,10 +218,10 @@ index 0000000..28ffac1
 +    main()
 diff --git a/data/build_contrastive_negatives.py b/data/build_contrastive_negatives.py
 new file mode 100644
-index 0000000..14352d3
+index 0000000..50665e8
 --- /dev/null
 +++ b/data/build_contrastive_negatives.py
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,319 @@
 +"""Attach conservative, automatically mined negatives to Zhang concept JSONL.
 +
 +The source `embedding_synonyms.py` records the model's top next-token pool and
@@ -255,6 +257,52 @@ index 0000000..14352d3
 +    return _normalise(word).replace(" ", "_")
 +
 +
++def _pos_counts(word: str) -> Counter:
++    """SemCor sense counts of `word` per WordNet POS (satellite adjectives folded in)."""
++    counts = Counter()
++    for synset in wn.synsets(_wordnet_form(word)):
++        pos = wn.ADJ if synset.pos() == wn.ADJ_SAT else synset.pos()
++        for lemma in synset.lemmas():
++            if lemma.name().lower() == _wordnet_form(word):
++                counts[pos] += lemma.count()
++    return counts
++
++
++def is_lexical_word(candidate: str, wn_pos: str, target: str) -> bool:
++    """True when `candidate` is a complete word that is normally used as `wn_pos`.
++
++    WordNet membership alone is not a word test: it lists single letters, Roman
++    numerals and abbreviations, and it lists "over" as an adjective, "war" as a
++    verb and "well" as a noun.  The top-k pool is full of word-prefix tokens
++    ("ex", "rev", "inter") and such strings pass a bare synset lookup.  Require an
++    alphabetic string of at least four letters, the target's capitalisation class,
++    and the requested POS to be the word's dominant attested one.  Deliberately
++    conservative: a good word with no SemCor count ("gallery") is lost, and
++    coverage is reported after this filter, not before.
++    """
++    surface = str(candidate).strip()
++    if not surface.isalpha() or len(surface) < 4:
++        return False
++    if surface[0].isupper() and not str(target).strip()[:1].isupper():
++        return False
++    counts = _pos_counts(surface)
++    return counts[wn_pos] >= 2 and counts[wn_pos] >= max(counts.values())
++
++
++def antonyms_of(words: list[str], wn_pos: str) -> list[str]:
++    """Single-word WordNet antonyms of any of `words`, in first-seen order."""
++    found = {}
++    for word in words:
++        for synset in wn.synsets(_wordnet_form(word), pos=wn_pos):
++            for lemma in synset.lemmas():
++                if lemma.name().lower() != _wordnet_form(word):
++                    continue
++                for antonym in lemma.antonyms():
++                    if "_" not in antonym.name():
++                        found.setdefault(antonym.name().lower(), None)
++    return list(found)
++
++
 +def load_topk(patterns: list[str]) -> dict[tuple[str, int], dict]:
 +    index = {}
 +    paths = sorted({path for pattern in patterns for path in glob.glob(pattern)})
@@ -271,7 +319,10 @@ index 0000000..14352d3
 +
 +
 +def mine_target(target: dict, topk: dict, max_cosine: float,
-+                max_negatives: int, reasons: Counter) -> tuple[list[str], list[float]]:
++                max_negatives: int, reasons: Counter, *,
++                strict_lexical: bool = False,
++                use_antonyms: bool = False,
++                fragments_only: bool = False) -> tuple[list[str], list[float]]:
 +    pos = target.get("pos") or topk.get("pos")
 +    wn_pos = POS_MAP.get(pos)
 +    if wn_pos is None:
@@ -294,7 +345,25 @@ index 0000000..14352d3
 +        return [], []
 +
 +    negatives, negative_scores = [], []
++    if use_antonyms:
++        # Antonyms are distributionally plausible in the slot and wrong by
++        # construction, which a similarity ceiling cannot deliver: below the
++        # ceiling sit unrelated strings, above it sit valid substitutes.  Score
++        # -1.0 marks them as not similarity-mined.  An antonym that is ALSO listed
++        # as an alternative is extraction noise; it is counted, and left alone so
++        # the positive set stays identical to the non-contrastive arms'.
++        # Of the observed word only: antonyms of every sense of every alternative
++        # drag in wrong-sense pairs (sink -> source, host -> parasite).
++        for antonym in antonyms_of([target["word"]], wn_pos):
++            if antonym in positive_norm:
++                reasons["antonym_listed_as_alternative"] += 1
++                continue
++            negatives.append(antonym)
++            negative_scores.append(-1.0)
++            reasons["antonym_negative"] += 1
 +    for candidate, score in zip(tokens, scores):
++        if len(negatives) >= max_negatives:
++            break
 +        clean = _normalise(candidate)
 +        if not clean or clean in positive_norm:
 +            reasons["positive_or_empty"] += 1
@@ -312,20 +381,53 @@ index 0000000..14352d3
 +        if candidate_synsets & positive_synsets:
 +            reasons["shared_synset"] += 1
 +            continue
++        if strict_lexical and not is_lexical_word(candidate, wn_pos, target["word"]):
++            reasons["not_a_lexical_word"] += 1
++            continue
++        # Diagnostic control, never a method: keep exactly what --strict-lexical
++        # throws away, to measure how much of a contrastive gain is owed to
++        # pushing down letters and word-prefix tokens.
++        if fragments_only and is_lexical_word(candidate, wn_pos, target["word"]):
++            reasons["lexical_word_dropped_by_control"] += 1
++            continue
++        if (strict_lexical or use_antonyms) and clean in {_normalise(word) for word in negatives}:
++            continue
 +        negatives.append(str(candidate).strip())
 +        negative_scores.append(float(score))
-+        if len(negatives) >= max_negatives:
-+            break
 +    if not negatives:
 +        reasons["no_safe_negative"] += 1
 +    return negatives, negative_scores
 +
 +
++def single_token_ids(words, tokenizer, exclude: set[int]) -> list[int]:
++    """Ids of `words` that train.py would actually keep at a concept slot.
++
++    The trainer encodes each candidate as " word" and keeps it only when that is
++    ONE token and has not been seen at this slot.  Counting raw list lengths
++    instead overstates coverage, because a multi-token alternative is silently
++    dropped at training time and the slot may end up supervising nothing.
++    """
++    kept, seen = [], set(exclude)
++    for word in words:
++        try:
++            encoded = tokenizer.encode(" " + str(word).strip(), add_special_tokens=False)
++        except Exception:
++            continue
++        if len(encoded) == 1 and encoded[0] not in seen:
++            seen.add(encoded[0])
++            kept.append(int(encoded[0]))
++    return kept
++
++
 +def build(source: str, topk_patterns: list[str], output: str,
-+          report: str, max_cosine: float, max_negatives: int) -> dict:
++          report: str, max_cosine: float, max_negatives: int,
++          strict_lexical: bool = False, use_antonyms: bool = False,
++          fragments_only: bool = False, tokenizer=None) -> dict:
++    if fragments_only and (strict_lexical or use_antonyms):
++        raise ValueError("--fragments-only is a control and excludes the cleaning flags")
 +    topk_index = load_topk(topk_patterns)
 +    reasons = Counter()
-+    rows = slots = covered = 0
++    rows = slots = covered = trainable = effective = 0
 +    Path(output).parent.mkdir(parents=True, exist_ok=True)
 +    with open(source, encoding="utf-8") as src, open(output, "w", encoding="utf-8") as dst:
 +        for line in src:
@@ -343,11 +445,39 @@ index 0000000..14352d3
 +                    continue
 +                target.setdefault("pos", pool.get("pos"))
 +                negatives, scores = mine_target(
-+                    target, pool, max_cosine, max_negatives, reasons
++                    target, pool, max_cosine, max_negatives, reasons,
++                    strict_lexical=strict_lexical, use_antonyms=use_antonyms,
++                    fragments_only=fragments_only,
 +                )
 +                target["negatives"] = negatives
 +                target["negative_scores"] = scores
 +                covered += bool(negatives)
++                # The contrastive loss skips a slot with no alternative, so only
++                # these slots can ever receive a contrastive gradient.  With a
++                # tokenizer, count what the TRAINER would keep; without one, fall
++                # back to the raw lists and say so in the report.
++                if tokenizer is None:
++                    has_alternative = bool(target.get("synonyms"))
++                    has_negative = bool(negatives)
++                else:
++                    try:
++                        target_id = tokenizer.encode(
++                            " " + str(target["word"]).strip(), add_special_tokens=False)
++                    except Exception:
++                        target_id = []
++                    if len(target_id) != 1:
++                        # train.py skips the whole slot on a target mismatch.
++                        reasons["target_not_single_token"] += 1
++                        continue
++                    exclude = {int(target_id[0])}
++                    alt_ids = single_token_ids(target.get("synonyms", []), tokenizer, exclude)
++                    neg_ids = single_token_ids(
++                        negatives, tokenizer, exclude | set(alt_ids))
++                    has_alternative, has_negative = bool(alt_ids), bool(neg_ids)
++                    if negatives and not neg_ids:
++                        reasons["negatives_all_multi_token"] += 1
++                trainable += has_alternative
++                effective += has_alternative and has_negative
 +            dst.write(json.dumps(row, ensure_ascii=False) + "\n")
 +
 +    summary = {
@@ -357,6 +487,13 @@ index 0000000..14352d3
 +        "slots": slots,
 +        "slots_with_negatives": covered,
 +        "negative_coverage": covered / max(slots, 1),
++        "slots_with_alternatives": trainable,
++        "slots_with_alternatives_and_negatives": effective,
++        "effective_contrastive_coverage": effective / max(trainable, 1),
++        "coverage_is_tokenizer_aware": tokenizer is not None,
++        "strict_lexical": strict_lexical,
++        "use_antonyms": use_antonyms,
++        "fragments_only": fragments_only,
 +        "max_contextual_cosine": max_cosine,
 +        "max_negatives_per_slot": max_negatives,
 +        "rejection_reasons": dict(sorted(reasons.items())),
@@ -365,6 +502,13 @@ index 0000000..14352d3
 +    with open(report, "w", encoding="utf-8") as handle:
 +        json.dump(summary, handle, indent=2, sort_keys=True)
 +    return summary
++
++
++def _load_tokenizer(name: str | None):
++    if not name:
++        return None
++    from transformers import AutoTokenizer
++    return AutoTokenizer.from_pretrained(name)
 +
 +
 +def main() -> None:
@@ -376,10 +520,22 @@ index 0000000..14352d3
 +    parser.add_argument("--report", required=True)
 +    parser.add_argument("--max-cosine", type=float, default=0.35)
 +    parser.add_argument("--max-negatives", type=int, default=20)
++    parser.add_argument("--strict-lexical", action="store_true",
++                        help="keep only complete words whose dominant WordNet POS matches")
++    parser.add_argument("--antonyms", action="store_true",
++                        help="add WordNet antonyms of the target and alternatives as negatives")
++    parser.add_argument("--fragments-only", action="store_true",
++                        help="control: keep ONLY the candidates --strict-lexical rejects")
++    parser.add_argument("--tokenizer", default=None,
++                        help="model id or path; makes the coverage stats count what the "
++                             "trainer keeps (single-token candidates) rather than raw lists")
 +    args = parser.parse_args()
 +    print(json.dumps(build(
 +        args.source, args.topk, args.output, args.report,
 +        args.max_cosine, args.max_negatives,
++        strict_lexical=args.strict_lexical, use_antonyms=args.antonyms,
++        fragments_only=args.fragments_only,
++        tokenizer=_load_tokenizer(args.tokenizer),
 +    ), indent=2, sort_keys=True))
 +
 +
@@ -1119,12 +1275,102 @@ index 0000000..2977b2c
 +        prompt = relation_prompt("The terrier barked.", "terrier", index)
 +        assert "The terrier barked." in prompt
 +        assert "terrier" in prompt
+diff --git a/tests/test_negatives.py b/tests/test_negatives.py
+new file mode 100644
+index 0000000..9ca1be8
+--- /dev/null
++++ b/tests/test_negatives.py
+@@ -0,0 +1,84 @@
++import sys
++from collections import Counter
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "data"))
++from build_contrastive_negatives import antonyms_of, is_lexical_word, mine_target  # noqa: E402
++from nltk.corpus import wordnet as wn  # noqa: E402
++
++
++def test_fragments_letters_and_minority_pos_are_not_words():
++    for junk, pos in [("K", wn.ADJ), ("ex", wn.ADJ), ("rev", wn.VERB), ("inter", wn.VERB),
++                      ("over", wn.ADJ), ("war", wn.VERB), ("well", wn.NOUN), ("high", wn.NOUN)]:
++        assert not is_lexical_word(junk, pos, "target"), junk
++    for word, pos in [("poem", wn.NOUN), ("come", wn.VERB), ("statement", wn.NOUN)]:
++        assert is_lexical_word(word, pos, "target"), word
++
++
++def test_capitalised_candidate_needs_a_capitalised_target():
++    assert not is_lexical_word("Point", wn.NOUN, "post")
++    assert is_lexical_word("Point", wn.NOUN, "Post")
++
++
++def test_antonyms_come_from_the_observed_word():
++    assert "voluntary" in antonyms_of(["involuntary"], wn.ADJ)
++    assert antonyms_of(["kitchen"], wn.NOUN) == []
++
++
++_TARGET = {"word": "involuntary", "pos": "ADJ", "synonyms": ["unexpected"]}
++_POOL = {"pos": "ADJ", "topk_tokens": ["ex", "over", "poem"], "topk_scores": [0.29, 0.33, 0.10]}
++
++
++def test_default_mining_is_unchanged_and_strict_mining_drops_fragments():
++    legacy, _ = mine_target(dict(_TARGET), _POOL, 0.35, 20, Counter())
++    assert legacy == ["ex", "over"]
++    reasons = Counter()
++    strict, scores = mine_target(dict(_TARGET), _POOL, 0.35, 20, reasons,
++                                 strict_lexical=True, use_antonyms=True)
++    assert strict == ["voluntary"] and scores == [-1.0]
++    assert reasons["not_a_lexical_word"] == 2
++
++
++def test_fragment_control_keeps_exactly_what_strict_rejects():
++    control, _ = mine_target(dict(_TARGET), _POOL, 0.35, 20, Counter(), fragments_only=True)
++    assert control == ["ex", "over"]
++
++
++class _ToyTokenizer:
++    """Encodes ' word' as one token only for words in `single`."""
++    def __init__(self, single): self.single = {w: i + 10 for i, w in enumerate(single)}
++    def encode(self, text, add_special_tokens=False):
++        word = text.strip()
++        return [self.single[word]] if word in self.single else [1, 2]
++
++
++def test_single_token_ids_matches_the_trainer_rule():
++    from build_contrastive_negatives import single_token_ids
++    tok = _ToyTokenizer(["cat", "feline", "dog"])
++    # "kitten" is multi-token -> dropped; "dog" repeated -> deduped
++    assert single_token_ids(["feline", "kitten", "dog", "dog"], tok, exclude=set()) == [11, 12]
++    # a candidate colliding with the excluded target id is dropped
++    assert single_token_ids(["cat", "feline"], tok, exclude={10}) == [11]
++
++
++def test_tokenizer_aware_coverage_counts_fewer_slots_than_raw_lists(tmp_path):
++    import json
++    from build_contrastive_negatives import build
++    src = tmp_path / "src.jsonl"
++    # one slot whose only alternative is multi-token: raw counts it, trainer cannot
++    row = {"input_sequence": "a b", "content_word_responses": [
++        {"word": "cat", "position": 1, "pos": "NOUN", "synonyms": ["kitten"]}]}
++    src.write_text(json.dumps(row) + "\n")
++    topk = tmp_path / "topk.jsonl"
++    topk.write_text(json.dumps({"input_sequence": "a b", "content_word_topk": [
++        {"position": 1, "pos": "NOUN", "topk_tokens": ["dog"], "topk_scores": [0.1]}]}) + "\n")
++    tok = _ToyTokenizer(["cat", "dog"])
++
++    def run(tokenizer):
++        return build(str(src), [str(topk)], str(tmp_path / f"out{bool(tokenizer)}.jsonl"),
++                     str(tmp_path / f"rep{bool(tokenizer)}.json"), 0.35, 20, tokenizer=tokenizer)
++
++    raw, aware = run(None), run(tok)
++    assert raw["slots_with_alternatives"] == 1 and raw["coverage_is_tokenizer_aware"] is False
++    assert aware["slots_with_alternatives"] == 0 and aware["coverage_is_tokenizer_aware"] is True
++    assert aware["effective_contrastive_coverage"] == 0.0
 diff --git a/tests/test_objectives.py b/tests/test_objectives.py
 new file mode 100644
-index 0000000..e57cc32
+index 0000000..54a19f8
 --- /dev/null
 +++ b/tests/test_objectives.py
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,298 @@
 +import torch
 +import torch.nn.functional as F
 +from types import SimpleNamespace
@@ -1209,6 +1455,7 @@ index 0000000..e57cc32
 +    trainer = ConceptLossTrainer.__new__(ConceptLossTrainer)
 +    trainer.concept_loss_weight = 0
 +    trainer.contrast_beta = 0
++    trainer.alt_aux_weight = 0
 +    trainer.use_weighted_ce = False
 +    trainer._is_evaluating = False
 +    trainer.state = SimpleNamespace(global_step=0)
@@ -1331,8 +1578,99 @@ index 0000000..e57cc32
 +    assert logits.grad[0, 0, 5] > 0          # gold logit pushed down
 +    assert logits.grad[0, 0, 7] < 0          # alternatives pushed up
 +    assert logits.grad[0, 0, 9] < 0
++
++
++# --- alternative-only auxiliary term -----------------------------------------
++
++def _aux(kind):
++    trainer = ConceptLossTrainer.__new__(ConceptLossTrainer)
++    trainer.alt_aux = kind
++    return trainer
++
++
++def test_uniform_equals_set_marginal_plus_within_kl_plus_log_n():
++    # The identity the hybrid rests on, checked on the code rather than on paper.
++    torch.manual_seed(0)
++    logits = torch.randn(1, 3, 11)
++    ids = [[2, 5, 7], [1, 4, 6, 8, 9]]
++    flat = ([0, 0], [0, 1])
++    uniform = _trainer("uniform")._compute_concept_losses_vectorized(
++        logits, *flat, ids, [[], []])[0]
++    marginal = _trainer("set_marginal")._compute_concept_losses_vectorized(
++        logits, *flat, ids, [[], []])[0]
++    within = _aux("within_kl")._compute_alt_aux_loss(logits, *flat, ids)
++    log_n = torch.tensor([3.0, 5.0]).log().mean()
++    assert torch.allclose(uniform, marginal + within + log_n, atol=1e-5)
++
++
++def test_within_kl_is_zero_at_uniform_and_positive_otherwise():
++    logits = torch.zeros(1, 1, 6)
++    assert _aux("within_kl")._compute_alt_aux_loss(logits, [0], [0], [[1, 2, 3]]).abs() < 1e-6
++    logits[0, 0, 1] = 3.0
++    assert _aux("within_kl")._compute_alt_aux_loss(logits, [0], [0], [[1, 2, 3]]) > 0
++
++
++def test_within_kl_only_moves_mass_between_alternatives():
++    torch.manual_seed(1)
++    logits = torch.randn(1, 1, 8, requires_grad=True)
++    _aux("within_kl")._compute_alt_aux_loss(logits, [0], [0], [[2, 4, 6]]).backward()
++    grad = logits.grad[0, 0]
++    outside = [i for i in range(8) if i not in (2, 4, 6)]
++    assert grad[outside].abs().max() < 1e-7      # observed token and the rest untouched
++    assert grad[[2, 4, 6]].sum().abs() < 1e-6    # zero-sum inside the set
++    assert grad[[2, 4, 6]].abs().max() > 1e-3
++
++
++def test_aux_keeps_empty_and_singleton_slots_in_the_denominator():
++    torch.manual_seed(2)
++    logits = torch.randn(1, 3, 9)
++    full = _aux("within_kl")._compute_alt_aux_loss(logits, [0, 0, 0], [0, 1, 2], [[1, 2, 3], [4], []])
++    alone = _aux("within_kl")._compute_alt_aux_loss(logits, [0], [0], [[1, 2, 3]])
++    assert torch.isfinite(full) and torch.allclose(full, alone / 3, atol=1e-6)
++    uni = _aux("uniform")._compute_alt_aux_loss(logits, [0, 0], [0, 2], [[1, 2, 3], []])
++    assert torch.isfinite(uni)
++
++
++def test_aux_alternatives_match_the_exclude_target_set():
++    inclusive = _flattener(False)._build_concept_targets(_TWO_SLOTS, 1, 4, return_alternatives=True)
++    exclusive = _flattener(True)._build_concept_targets(_TWO_SLOTS, 1, 4)
++    assert inclusive[4] == exclusive[2] == [[7, 9], []]
++    assert inclusive[2] == [[5, 7, 9], [3]]      # main set still carries the observed token
++
++
++def test_hybrid_total_is_main_objective_plus_weighted_aux():
++    from transformers.modeling_outputs import CausalLMOutputWithPast
++    torch.manual_seed(3)
++    logits = torch.randn(1, 4, 12)
++
++    def run(alt_aux, weight):
++        trainer = ConceptLossTrainer.__new__(ConceptLossTrainer)
++        trainer.concept_loss_weight = 1.0
++        trainer.concept_objective = "set_marginal"
++        trainer.target_mass = 0.6
++        trainer.slot_ntp_weight = None
++        trainer.contrast_beta = 0.0
++        trainer.alt_aux, trainer.alt_aux_weight = alt_aux, weight
++        trainer.exclude_target = False
++        trainer.randomized_synonyms = False
++        trainer.use_weighted_ce = False
++        trainer.max_synonyms_per_content_word = None
++        trainer.max_content_words = None
++        trainer._is_evaluating = False
++        trainer.state = SimpleNamespace(global_step=0)
++        trainer.args = SimpleNamespace(logging_steps=50, seed=42)
++        words = [[{"shift_position": 1, "target_token_id": 2, "synonym_token_ids": [5, 7, 9]}]]
++        return trainer.compute_loss(
++            lambda **kw: CausalLMOutputWithPast(logits=logits),
++            {"input_ids": torch.tensor([[0, 1, 2, 3]]), "attention_mask": None,
++             "content_words": words})
++
++    base = run("none", 0.0)
++    aux = _aux("within_kl")._compute_alt_aux_loss(logits, [0], [1], [[5, 7, 9]])
++    assert aux > 0
++    assert torch.allclose(run("within_kl", 0.5), base + 0.5 * aux, atol=1e-6)
 diff --git a/train.py b/train.py
-index 0778a31..083fa35 100644
+index 0778a31..6eb214f 100644
 --- a/train.py
 +++ b/train.py
 @@ -132,20 +132,47 @@ class ConceptDataset(Dataset):
@@ -1392,7 +1730,7 @@ index 0778a31..083fa35 100644
                  })
  
          if max_samples and max_samples > 0:
-@@ -175,14 +203,32 @@ class ConceptDataset(Dataset):
+@@ -175,14 +203,38 @@ class ConceptDataset(Dataset):
              'input_ids': item['input_ids'],
              'attention_mask': item['attention_mask'],
              'content_words': item['content_words'],
@@ -1418,15 +1756,21 @@ index 0778a31..083fa35 100644
 +        slot_ntp_weight=None,
 +        contrast_beta=0.0,
 +        exclude_target=False,
++        alt_aux="none",
++        alt_aux_weight=0.0,
 +        **kwargs,
 +    ):
          super().__init__(**kwargs)
 +        if concept_objective not in {"set_marginal", "uniform"}:
 +            raise ValueError("concept_objective must be set_marginal or uniform")
++        if alt_aux not in {"none", "uniform", "within_kl"}:
++            raise ValueError("alt_aux must be none, uniform or within_kl")
++        if alt_aux != "none" and randomized_synonyms:
++            raise ValueError("alt_aux is undefined for randomized synonyms")
          self.concept_loss_weight = concept_loss_weight
          self.max_synonyms_per_content_word = max_synonyms_per_content_word
          self.max_content_words = max_content_words
-@@ -197,6 +243,17 @@ class ConceptLossTrainer(Trainer):
+@@ -197,6 +249,29 @@ class ConceptLossTrainer(Trainer):
          self._is_evaluating = False
          self._last_eval_metrics = {}
          self.randomized_synonyms = randomized_synonyms
@@ -1441,10 +1785,22 @@ index 0778a31..083fa35 100644
 +        # the mass NTP already puts there; excluding it forces the alternatives to
 +        # be learned on their own.  This is the P1_fixed arm from task 14.
 +        self.exclude_target = bool(exclude_target)
++        # Auxiliary term on the alternatives only, added to whatever the main
++        # concept objective is.  It exists because of an exact identity:
++        #   -(1/n) sum_c log p_c = -log P(S) + KL(u || q) + log n,  q = p / P(S)
++        # so the uniform loss is the set marginal plus a within-set term, and the
++        # released objective is the member of that family with the term at zero.
++        #   uniform   : -(1/n) sum log p_c over alternatives (raises them AND
++        #               spreads them; the alternative-only loss as an add-on)
++        #   within_kl : KL(u || q_alt) only.  Its logit gradient sums to zero over
++        #               the alternatives, so it moves mass between them and leaves
++        #               the observed token and the set's total mass to the main term.
++        self.alt_aux = alt_aux
++        self.alt_aux_weight = float(alt_aux_weight) if alt_aux != "none" else 0.0
  
      def get_eval_dataloader(self, eval_dataset=None):
          """Create eval dataloader that adds labels for loss computation."""
-@@ -258,7 +315,11 @@ class ConceptLossTrainer(Trainer):
+@@ -258,7 +333,12 @@ class ConceptLossTrainer(Trainer):
  
          # Skip concept-loss work entirely when its weight is 0 and we're not in
          # weighted-CE mode (which needs concept timesteps for its own weighting).
@@ -1452,18 +1808,21 @@ index 0778a31..083fa35 100644
 +        skip_concept_work = (
 +            self.concept_loss_weight == 0
 +            and self.contrast_beta == 0
++            and self.alt_aux_weight == 0
 +            and not self.use_weighted_ce
 +        )
  
          if skip_concept_work:
              concept_loss = torch.tensor(0.0, device=logits.device)
-@@ -266,12 +327,16 @@ class ConceptLossTrainer(Trainer):
+@@ -266,12 +346,22 @@ class ConceptLossTrainer(Trainer):
              ce_loss = (per_token_ce * valid.float()).sum() / N_total
              training_loss = ce_loss
          else:
 -            flat_b_idx, flat_shift_idx, flat_concept_ids = self._build_concept_targets(
-+            flat_b_idx, flat_shift_idx, flat_concept_ids, flat_negative_ids = self._build_concept_targets(
-                 content_words_list, batch_size, shift_len
+-                content_words_list, batch_size, shift_len
++            (flat_b_idx, flat_shift_idx, flat_concept_ids, flat_negative_ids,
++             flat_alt_ids) = self._build_concept_targets(
++                content_words_list, batch_size, shift_len, return_alternatives=True
              )
  
 -            concept_loss = self._compute_concept_loss_vectorized(
@@ -1474,19 +1833,28 @@ index 0778a31..083fa35 100644
 +                flat_shift_idx,
 +                flat_concept_ids,
 +                flat_negative_ids,
++            )
++            alt_aux_loss = (
++                self._compute_alt_aux_loss(logits, flat_b_idx, flat_shift_idx, flat_alt_ids)
++                if self.alt_aux_weight
++                else torch.tensor(0.0, device=logits.device)
              )
  
              if self.use_weighted_ce:
-@@ -282,7 +347,7 @@ class ConceptLossTrainer(Trainer):
+@@ -282,7 +372,11 @@ class ConceptLossTrainer(Trainer):
                      ce_weights[b_t, s_t] = self.ce_concept_token_weight
                  denom = (ce_weights * valid.float()).sum().clamp(min=1e-8)
                  ce_loss = (per_token_ce * ce_weights * valid.float()).sum() / denom
 -                training_loss = ce_loss
-+                training_loss = ce_loss + self.contrast_beta * contrast_loss
++                training_loss = (
++                    ce_loss
++                    + self.contrast_beta * contrast_loss
++                    + self.alt_aux_weight * alt_aux_loss
++                )
              else:
                  target_mask = torch.zeros(batch_size, shift_len, dtype=torch.bool, device=logits.device)
                  if flat_b_idx:
-@@ -301,10 +366,23 @@ class ConceptLossTrainer(Trainer):
+@@ -301,10 +395,25 @@ class ConceptLossTrainer(Trainer):
                  ce_loss_non_targets = (per_token_ce * non_target_valid.float()).sum() / N_non_target.clamp(min=1e-8)
                  ce_loss_targets = (per_token_ce * target_valid.float()).sum() / N_target.clamp(min=1e-8)
  
@@ -1505,26 +1873,40 @@ index 0778a31..083fa35 100644
 +                    training_loss
 +                    + self.concept_loss_weight * concept_loss
 +                    + self.contrast_beta * contrast_loss
++                    + self.alt_aux_weight * alt_aux_loss
 +                )
 +
 +        if skip_concept_work:
 +            contrast_loss = torch.tensor(0.0, device=logits.device)
++            alt_aux_loss = torch.tensor(0.0, device=logits.device)
  
          ce_loss_val = ce_loss.detach().item()
          concept_loss_val = concept_loss.detach().item()
-@@ -319,6 +397,7 @@ class ConceptLossTrainer(Trainer):
+@@ -319,6 +428,8 @@ class ConceptLossTrainer(Trainer):
                  self.log({
                      "ce_loss": ce_loss_val,
                      "concept_loss": concept_loss_val,
 +                    "contrast_loss": contrast_loss.detach().item(),
++                    "alt_aux_loss": alt_aux_loss.detach().item(),
                      "perplexity": perplexity,
                  })
  
-@@ -343,18 +422,33 @@ class ConceptLossTrainer(Trainer):
+@@ -326,7 +437,8 @@ class ConceptLossTrainer(Trainer):
+             return training_loss, {"logits": logits}
+         return training_loss
+ 
+-    def _build_concept_targets(self, content_words_list, batch_size, shift_len):
++    def _build_concept_targets(self, content_words_list, batch_size, shift_len,
++                               return_alternatives=False):
+         """
+         Walk pre-tokenized content words once and return flat lists describing each
+         valid (sequence, content-word) pair:
+@@ -343,18 +455,34 @@ class ConceptLossTrainer(Trainer):
          flat_b_idx = []
          flat_shift_idx = []
          flat_concept_ids = []
 +        flat_negative_ids = []
++        flat_alt_ids = []
  
          for b in range(batch_size):
              content_words = content_words_list[b]
@@ -1556,7 +1938,7 @@ index 0778a31..083fa35 100644
                  content_words = rng.sample(content_words, k)
  
              for tw in content_words:
-@@ -368,6 +462,14 @@ class ConceptLossTrainer(Trainer):
+@@ -368,6 +496,14 @@ class ConceptLossTrainer(Trainer):
                      # max_synonyms + 1 synonyms.
                      limit = (max_synonyms + 1) if max_synonyms is not None else None
                      ids = list(synonyms[:limit]) if limit is not None else list(synonyms)
@@ -1571,7 +1953,7 @@ index 0778a31..083fa35 100644
                  else:
                      ids = [tw['target_token_id']]
                      limit = max_synonyms
-@@ -376,16 +478,37 @@ class ConceptLossTrainer(Trainer):
+@@ -376,16 +512,83 @@ class ConceptLossTrainer(Trainer):
                      else:
                          ids.extend(synonyms)
  
@@ -1592,6 +1974,13 @@ index 0778a31..083fa35 100644
 -        return flat_b_idx, flat_shift_idx, flat_concept_ids
 -
 -    def _compute_concept_loss_vectorized(self, logits, flat_b_idx, flat_shift_idx, flat_concept_ids):
++                # Alternatives only, whatever the main set contains: the same
++                # rule --exclude-target applies, so an aux arm and an
++                # alternative-only arm supervise identical tokens.
++                alt_target = int(tw['target_token_id'])
++                alt_pool = synonyms[:max_synonyms] if max_synonyms is not None else synonyms
++                flat_alt_ids.append(list(dict.fromkeys(
++                    int(t) for t in alt_pool if int(t) != alt_target)))
 +                negatives = []
 +                seen_ids = set(ids)
 +                for token_id in tw.get('negative_token_ids', []):
@@ -1601,7 +1990,46 @@ index 0778a31..083fa35 100644
 +                        negatives.append(token_id)
 +                flat_negative_ids.append(negatives)
 +
++        if return_alternatives:
++            return flat_b_idx, flat_shift_idx, flat_concept_ids, flat_negative_ids, flat_alt_ids
 +        return flat_b_idx, flat_shift_idx, flat_concept_ids, flat_negative_ids
++
++    def _compute_alt_aux_loss(self, logits, flat_b_idx, flat_shift_idx, flat_alt_ids):
++        """Auxiliary loss over the alternatives at each content slot.
++
++        Averaged over ALL content slots, like the concept loss: a slot with no
++        alternative (or, for within_kl, a single one, where KL is identically
++        zero) contributes zero and stays in the denominator, so the weight means
++        the same thing in every arm.
++        """
++        if not flat_b_idx:
++            return logits.sum() * 0.0
++        device = logits.device
++        b_t = torch.tensor(flat_b_idx, device=device, dtype=torch.long)
++        s_t = torch.tensor(flat_shift_idx, device=device, dtype=torch.long)
++        log_probs = F.log_softmax(logits[b_t, s_t].float(), dim=-1)
++
++        num_targets = len(flat_alt_ids)
++        width = max(1, max(len(ids) for ids in flat_alt_ids))
++        padded = torch.zeros(num_targets, width, dtype=torch.long, device=device)
++        mask = torch.zeros(num_targets, width, dtype=torch.bool, device=device)
++        for i, ids in enumerate(flat_alt_ids):
++            padded[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
++            mask[i, :len(ids)] = True
++
++        gathered = log_probs.gather(1, padded)
++        count = mask.sum(dim=1)
++        mean_log = gathered.masked_fill(~mask, 0.0).sum(dim=1) / count.clamp(min=1)
++        if self.alt_aux == "uniform":
++            per_slot = -mean_log
++            keep = count >= 1
++        else:
++            # KL(u || q) = -log n - (1/n) sum_c log q_c,  log q_c = log p_c - log P(S_alt)
++            log_mass = torch.logsumexp(gathered.masked_fill(~mask, float("-inf")), dim=1)
++            log_mass = torch.where(count >= 1, log_mass, torch.zeros_like(log_mass))
++            per_slot = -torch.log(count.clamp(min=1).float()) - (mean_log - log_mass)
++            keep = count >= 2
++        return torch.where(keep, per_slot, torch.zeros_like(per_slot)).mean()
 +
 +    def _compute_concept_losses_vectorized(
 +        self,
@@ -1614,7 +2042,7 @@ index 0778a31..083fa35 100644
          """
          Vectorized concept loss:
            - Gather logits only at target shift positions: [num_targets, V].
-@@ -394,7 +517,8 @@ class ConceptLossTrainer(Trainer):
+@@ -394,7 +597,8 @@ class ConceptLossTrainer(Trainer):
            - Apply margin (hinge) loss at target_mass.
          """
          if not flat_b_idx:
@@ -1624,7 +2052,7 @@ index 0778a31..083fa35 100644
  
          device = logits.device
          b_t = torch.tensor(flat_b_idx, device=device, dtype=torch.long)
-@@ -402,10 +526,11 @@ class ConceptLossTrainer(Trainer):
+@@ -402,10 +606,11 @@ class ConceptLossTrainer(Trainer):
  
          # logits[b, shift_pos] = logits at index shift_pos predicts token at shift_pos+1.
          target_logits = logits[b_t, s_t]                    # [num_targets, V]
@@ -1638,7 +2066,7 @@ index 0778a31..083fa35 100644
          padded_ids = torch.zeros(num_targets, max_concept, dtype=torch.long, device=device)
          valid_mask = torch.zeros(num_targets, max_concept, dtype=torch.bool, device=device)
          for i, ids in enumerate(flat_concept_ids):
-@@ -413,18 +538,53 @@ class ConceptLossTrainer(Trainer):
+@@ -413,18 +618,53 @@ class ConceptLossTrainer(Trainer):
              padded_ids[i, :n] = torch.tensor(ids, dtype=torch.long, device=device)
              valid_mask[i, :n] = True
  
@@ -1699,7 +2127,7 @@ index 0778a31..083fa35 100644
  
      def compute_metrics(self, eval_pred):
          """Compute and return evaluation metrics from accumulated values."""
-@@ -512,6 +672,19 @@ class EvalMetricsCallback(TrainerCallback):
+@@ -512,6 +752,19 @@ class EvalMetricsCallback(TrainerCallback):
                  logger.warning("wandb.run is None, cannot log metrics")
  
  
@@ -1719,7 +2147,7 @@ index 0778a31..083fa35 100644
  def collate_fn(examples, tokenizer):
      """Custom collate function for concept dataset."""
      input_ids = pad_sequence(
-@@ -527,11 +700,13 @@ def collate_fn(examples, tokenizer):
+@@ -527,11 +780,13 @@ def collate_fn(examples, tokenizer):
  
      # List of lists: content_words_list[b] = [{word, position, synonyms}, ...] for sequence b
      content_words_list = [ex['content_words'] for ex in examples]
@@ -1733,7 +2161,7 @@ index 0778a31..083fa35 100644
      }
  
  
-@@ -627,6 +802,47 @@ def parse_args():
+@@ -627,6 +882,56 @@ def parse_args():
          default=None,
          help='Weight for concept loss (default: use value from config)'
      )
@@ -1760,6 +2188,15 @@ index 0778a31..083fa35 100644
 +        default=None,
 +        help='Weight on set-level InfoNCE over per-slot negatives.',
 +    )
++    parser.add_argument(
++        '--alt-aux',
++        choices=['none', 'uniform', 'within_kl'],
++        default=None,
++        help='Auxiliary term on the alternatives only, added to the main concept '
++             'objective: uniform = -(1/n) sum log p; within_kl = KL(u || q_alt).',
++    )
++    parser.add_argument('--alt-aux-weight', type=float, default=None,
++                        help='Weight on --alt-aux (gamma).')
 +    parser.add_argument('--seed', type=int, default=None)
 +    parser.add_argument('--output-dir', type=str, default=None)
 +    parser.add_argument('--train-file', type=str, default=None,
@@ -1781,7 +2218,7 @@ index 0778a31..083fa35 100644
      parser.add_argument(
          '--model-name',
          type=str,
-@@ -684,7 +900,7 @@ def parse_args():
+@@ -684,7 +989,7 @@ def parse_args():
      )
      parser.add_argument(
          '--num-train-epochs',
@@ -1790,7 +2227,7 @@ index 0778a31..083fa35 100644
          default=None,
          help='Number of train epochs (default: use value from config)'
      )
-@@ -707,6 +923,24 @@ def main():
+@@ -707,6 +1012,30 @@ def main():
      if args.concept_loss_weight is not None:
          logger.info(f"Overriding concept_loss_weight from command line: {args.concept_loss_weight}")
          config.concept_loss_weight = args.concept_loss_weight
@@ -1802,6 +2239,12 @@ index 0778a31..083fa35 100644
 +        config.exclude_target = True
 +    if args.contrast_beta is not None:
 +        config.contrast_beta = args.contrast_beta
++    if args.alt_aux is not None:
++        config.alt_aux = args.alt_aux
++    if args.alt_aux_weight is not None:
++        config.alt_aux_weight = args.alt_aux_weight
++    if (config.alt_aux == "none") != (config.alt_aux_weight == 0):
++        raise ValueError("--alt-aux and a non-zero --alt-aux-weight must be given together")
 +    if args.seed is not None:
 +        config.seed = args.seed
 +    if args.save_strategy is not None:
@@ -1815,7 +2258,7 @@ index 0778a31..083fa35 100644
  
      if args.model_name is not None:
          logger.info(f"Overriding model_name from command line: {args.model_name}")
-@@ -753,7 +987,7 @@ def main():
+@@ -753,7 +1082,7 @@ def main():
      content_word_tag = "all_content_words" if config.max_content_words is None else f"{config.max_content_words}_content_words"
  
      data_base_dir = dataset_dir(dataset_name, config.model_name, dataset_type)
@@ -1824,7 +2267,7 @@ index 0778a31..083fa35 100644
  
      # Pick the training file and a short run-name tag for the active ablation.
      if config.randomized_synonyms:
-@@ -772,17 +1006,29 @@ def main():
+@@ -772,17 +1101,29 @@ def main():
          train_path = os.path.join(data_base_dir, "synonyms_train.jsonl")
          run_tag = None
  
@@ -1865,18 +2308,19 @@ index 0778a31..083fa35 100644
  
      run_name_parts = [dataset_name, suffix, dataset_type, content_word_tag]
      if run_tag:
-@@ -793,6 +1039,10 @@ def main():
+@@ -793,6 +1134,11 @@ def main():
      os.makedirs(config.output_dir, exist_ok=True)
  
      logger.info(f"Using concept_loss_weight: {config.concept_loss_weight}")
 +    logger.info(f"Using concept_objective: {config.concept_objective}")
 +    logger.info(f"Using slot_ntp_weight: {config.slot_ntp_weight}")
 +    logger.info(f"Using contrast_beta: {config.contrast_beta}")
++    logger.info(f"Using alt_aux: {config.alt_aux} (weight {config.alt_aux_weight})")
 +    logger.info(f"Using seed: {config.seed}")
      logger.info(f"Using model_name: {config.model_name}")
      logger.info(f"Using dataset: {config.dataset}")
      logger.info(f"Using randomized_synonyms: {config.randomized_synonyms}")
-@@ -807,6 +1057,10 @@ def main():
+@@ -807,6 +1153,10 @@ def main():
      logger.info(f"Using max_train_samples: {config.max_train_samples}")
      logger.info(f"Using num_train_epochs: {config.num_train_epochs}")
      logger.info(f"Using use_data_augmentation: {args.use_data_augmentation}")
@@ -1887,7 +2331,7 @@ index 0778a31..083fa35 100644
  
      if args.use_data_augmentation:
          assert config.concept_loss_weight == 0, (
-@@ -877,7 +1131,7 @@ def main():
+@@ -877,7 +1227,7 @@ def main():
          optim="adamw_torch_fused",
      )
  
@@ -1896,7 +2340,7 @@ index 0778a31..083fa35 100644
      if eval_dataset and config.early_stopping:
          callbacks.append(
              EarlyStoppingCallback(
-@@ -904,6 +1158,10 @@ def main():
+@@ -904,6 +1254,12 @@ def main():
          randomized_synonyms=config.randomized_synonyms,
          use_weighted_ce=config.use_weighted_ce,
          ce_concept_token_weight=config.ce_concept_token_weight,
@@ -1904,10 +2348,12 @@ index 0778a31..083fa35 100644
 +        exclude_target=getattr(config, "exclude_target", False),
 +        slot_ntp_weight=config.slot_ntp_weight,
 +        contrast_beta=config.contrast_beta,
++        alt_aux=config.alt_aux,
++        alt_aux_weight=config.alt_aux_weight,
          callbacks=callbacks,
      )
  
-@@ -916,6 +1174,27 @@ def main():
+@@ -916,6 +1272,29 @@ def main():
      logger.info(f"\nSaving final model to {config.output_dir}...")
      trainer.save_model(config.output_dir)
      tokenizer.save_pretrained(config.output_dir)
@@ -1922,6 +2368,8 @@ index 0778a31..083fa35 100644
 +            "concept_objective": config.concept_objective,
 +            "slot_ntp_weight": config.slot_ntp_weight,
 +            "contrast_beta": config.contrast_beta,
++            "alt_aux": config.alt_aux,
++            "alt_aux_weight": config.alt_aux_weight,
 +            "target_mass": config.target_mass,
 +            "num_train_epochs": config.num_train_epochs,
 +            "learning_rate": config.learning_rate,

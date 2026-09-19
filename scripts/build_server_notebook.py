@@ -133,6 +133,11 @@ RUN_CONFIRM = False   # the locked arms across SEEDS.  Needs RUN_MULTISEED for a
                       # three-seed confirmation; on its own it loops over [42], which the
                       # screen has already trained.
 RUN_MULTISEED = False # add seeds 123 and 2024 to SEEDS
+RUN_HYBRID  = False   # Zhang + alternative-only auxiliary term (5 arms) and the two
+                      # negative-quality controls, seed 42.  Off until the 1B gate on
+                      # Colab has picked one; then set SELECTED_HYBRID and run only that.
+SELECTED_HYBRID = None  # e.g. "within_kl:0.5" -- transferred from the 1B gate, never tuned here
+RUN_NEGATIVE_CONTROLS = False  # clean/fragments negative diagnostic; not method selection
 RUN_EVAL    = True    # score these arms AND the Task 15 comparators: SWORDS with paired
                       # bootstrap intervals, STS, perplexity, concept sets, bm-semlex
 SPACY_GPU   = True    # only matters if this model still needs extraction
@@ -143,6 +148,8 @@ SPACY_GPU   = True    # only matters if this model still needs extraction
 for _name, _value in {"GPU_ID": GPU_ID, "CONCEPT_MODEL": MODEL, "HF_TOKEN": HF_TOKEN or None,
                       "SELECTED_ALPHA": SELECTED_ALPHA, "SELECTED_BETA": SELECTED_BETA,
                       "RUN_DATA": RUN_DATA, "RUN_SCREEN": RUN_SCREEN,
+                      "RUN_HYBRID": RUN_HYBRID, "SELECTED_HYBRID": SELECTED_HYBRID,
+                      "RUN_NEGATIVE_CONTROLS": RUN_NEGATIVE_CONTROLS,
                       "RUN_CONFIRM": RUN_CONFIRM, "RUN_EVAL": RUN_EVAL,
                       "RUN_MULTISEED": RUN_MULTISEED, "SPACY_GPU": SPACY_GPU}.items():
     if _value is not None:
@@ -157,7 +164,7 @@ print("GPU", os.environ["CUDA_VISIBLE_DEVICES"],
       "|", os.environ.get("CONCEPT_MODEL", "(default)"),
       "| alpha", os.environ.get("SELECTED_ALPHA", "(screen)"),
       "| beta", os.environ.get("SELECTED_BETA", "(screen)"),
-      "| stages:", " ".join(stage for stage in ("RUN_DATA", "RUN_SCREEN",
+      "| stages:", " ".join(stage for stage in ("RUN_DATA", "RUN_SCREEN", "RUN_HYBRID",
                                                 "RUN_CONFIRM", "RUN_EVAL")
                             if os.environ.get(stage) == "1"))
 '''
@@ -171,7 +178,7 @@ GPU_ID = os.environ.get("GPU_ID", "1")
 os.environ["CUDA_VISIBLE_DEVICES"] = GPU_ID
 
 from pathlib import Path
-import hashlib, json, re, shutil, subprocess, sys, torch
+import datetime, hashlib, json, re, shutil, subprocess, sys, torch
 
 # Every clone, dataset, checkpoint and result lives under BASE, so the whole
 # experiment is one directory to archive or copy off the server.
@@ -272,6 +279,9 @@ RUN_SCREEN = _flag("RUN_SCREEN", True)
 # Three seeds are a Colab job for the headline arms only; Qwen is a second-family
 # replication at seed 42, so this stays off.
 RUN_CONFIRM = _flag("RUN_CONFIRM", False)
+# Task 15b only, and only after the 1B gate has chosen an arm.
+RUN_HYBRID = _flag("RUN_HYBRID", False)
+RUN_NEGATIVE_CONTROLS = _flag("RUN_NEGATIVE_CONTROLS", False)
 RUN_EVAL = _flag("RUN_EVAL", True)
 # Skip any run whose artefacts already exist.  A killed job resumes from here.
 RESUME_FINISHED_RUNS = True
@@ -665,6 +675,8 @@ RENAME = [
      'SCREEN_DIR = MODEL_OUT / "task15b_screen"'),
     ('DRIVE_RESULTS / f"contrastive_negative_report{_TAG_SUFFIX}.json"',
      'MODEL_OUT / "contrastive_negative_report.json"'),
+    ('DRIVE_RESULTS / f"contrastive_negative_report_{name}{_TAG_SUFFIX}.json"',
+     'MODEL_OUT / f"contrastive_negative_report_{name}.json"'),
     ('load_runs(f"task15b{_TAG_SUFFIX}")', 'load_runs("task15b")'),
     ('save_runs(OBJECTIVE_RUNS, f"task15b{_TAG_SUFFIX}")', 'save_runs(OBJECTIVE_RUNS, "task15b")'),
     ('sync_small_artifacts(path, f"task15b_logs{_TAG_SUFFIX}/{label}")',
