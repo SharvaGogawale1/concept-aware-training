@@ -906,7 +906,18 @@ and $\\nabla_z[-\\log P(S)] = p - q\\,\\mathbb{1}_S$: the set marginal is self-d
         code(r"""
 NEG_VARIANTS = {"clean": ["--strict-lexical", "--antonyms"], "fragments": ["--fragments-only"]}
 NEG_FILES = {name: LEAF / f"synonyms_train_negatives_{name}.jsonl" for name in NEG_VARIANTS}
-HYBRID_GRID = [("uniform", 0.25), ("uniform", 0.5), ("within_kl", 0.25), ("within_kl", 0.5), ("within_kl", 1.0)]
+# The grid the gate was pre-registered over on 2026-09-18, before any of it was run.
+PREREGISTERED_GRID = [("uniform", 0.25), ("uniform", 0.5),
+                      ("within_kl", 0.25), ("within_kl", 0.5), ("within_kl", 1.0)]
+# Added 2026-09-21, AFTER that grid was screened and every arm failed on STS alone --
+# Llama uniform g0.25 missed the floor by .0004 (the three-seed STS sd is .0005), Qwen
+# by .0063.  These two resolve the knee of the frontier between Zhang and g=0.25.  They
+# are frontier points, NOT gate candidates: hybrid_gate() scores and prints them but
+# refuses to select them, because extending a grid downward after reading a near-miss is
+# exactly how a pre-registration gets spent.  The curve was the pre-registered outcome
+# when nothing passed; adding points to a curve is resolution, not a second attempt.
+POSTHOC_GRID = [("uniform", 0.125), ("uniform", 0.0625)]
+HYBRID_GRID = PREREGISTERED_GRID + POSTHOC_GRID
 # "within_kl:0.5" -- set ONLY from the gate above, then rerun with RUN_MULTISEED.
 SELECTED_HYBRID = os.environ.get("SELECTED_HYBRID")
 if RUN_HYBRID:
@@ -1302,14 +1313,18 @@ def hybrid_gate(verbose=True):
         checks["GAP>random"] = bool(got and got[1] and got[0] > 0)
 
         ok = all(checks.values())
+        posthoc = (kind, weight) in POSTHOC_GRID
         if verbose:
             failed = [k for k, v in checks.items() if not v]
-            print(f"  {label:34} {'PASS' if ok else 'FAIL'}"
+            print(f"  {label:36} {'PASS' if ok else 'FAIL'}"
+                  f"{'  [post-hoc, not selectable]' if posthoc else ''}"
                   f"  STS {float(row['sts_mean']):.4f}"
                   f"  gNLL {float(row['global_nll']):.4f}"
                   f"  altNLL {float(row['swords_alternative_nll']):.3f}"
                   + ("" if ok else f"   failed: {', '.join(failed)}"))
-        if ok: passing.append((weight, kind))
+        # A post-hoc point never enters `passing`: it is reported on the frontier curve
+        # and cannot become the method by passing a gate it was added after reading.
+        if ok and not posthoc: passing.append((weight, kind))
 
     if not passing:
         print("\nNo hybrid arm passes every gate. That is the result: report the "
