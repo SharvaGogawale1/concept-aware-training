@@ -1,5 +1,8 @@
 # Paper PDFs (large binary files — reference locally, don't push)
 *.pdf
+# ...except figures generated into latex/ by scripts/, which the paper needs to
+# build on someone else's machine.  main.pdf stays ignored: it is a build artifact.
+!latex/fig_*.pdf
 
 # Experiment outputs
 wandb/
