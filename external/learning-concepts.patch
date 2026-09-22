@@ -1,8 +1,8 @@
 diff --git a/conceptlib/config.py b/conceptlib/config.py
-index 95f3ea2..35a60a4 100644
+index 95f3ea2..23efd28 100644
 --- a/conceptlib/config.py
 +++ b/conceptlib/config.py
-@@ -31,6 +31,11 @@ class TrainingConfig:
+@@ -31,6 +31,14 @@ class TrainingConfig:
      max_synonyms_per_content_word = 10
      max_content_words = None  # None means all content words; otherwise sample this many
      target_mass = 0.6
@@ -11,6 +11,9 @@ index 95f3ea2..35a60a4 100644
 +    contrast_beta: float = 0.0
 +    alt_aux: str = "none"
 +    alt_aux_weight: float = 0.0
++    exclude_target: bool = False
++    # Pruning threshold of the verified data; list_verifier weights are max(s - theta, 0).
++    verifier_theta: float = 0.4
      use_weighted_ce: bool = False
      ce_concept_token_weight: float = 5.0
  
@@ -1367,10 +1370,10 @@ index 0000000..9ca1be8
 +    assert aware["effective_contrastive_coverage"] == 0.0
 diff --git a/tests/test_objectives.py b/tests/test_objectives.py
 new file mode 100644
-index 0000000..54a19f8
+index 0000000..b88d077
 --- /dev/null
 +++ b/tests/test_objectives.py
-@@ -0,0 +1,298 @@
+@@ -0,0 +1,414 @@
 +import torch
 +import torch.nn.functional as F
 +from types import SimpleNamespace
@@ -1669,16 +1672,140 @@ index 0000000..54a19f8
 +    aux = _aux("within_kl")._compute_alt_aux_loss(logits, [0], [1], [[5, 7, 9]])
 +    assert aux > 0
 +    assert torch.allclose(run("within_kl", 0.5), base + 0.5 * aux, atol=1e-6)
++
++
++# ---- discriminative objectives: pool / rank / list_uniform / list_verifier -----------
++import math
++import pytest
++from train import DISCRIMINATIVE_OBJECTIVES, validate_objective_config
++
++
++def _disc(objective, theta=0.4):
++    trainer = _scorer(objective, True)
++    trainer.verifier_theta = theta
++    return trainer
++
++
++def _logits_from_probs(probs):
++    return torch.log(torch.tensor([[probs]], dtype=torch.float32)).requires_grad_(True)
++
++
++def test_single_positive_makes_pool_rank_and_list_uniform_identical():
++    """With one alternative there is nothing to share or to balance."""
++    logits = torch.randn(1, 1, 6, generator=torch.Generator().manual_seed(1)).requires_grad_(True)
++    args = (logits, [0], [0], [[1]], [[3, 4]], [None])
++    values = [_disc(o)._compute_concept_losses_vectorized(*args)[0]
++              for o in ("pool", "rank", "list_uniform")]
++    assert torch.allclose(values[0], values[1]) and torch.allclose(values[1], values[2])
++
++
++def test_discriminative_objectives_are_zero_without_negatives_and_keep_the_slot():
++    """Common eligibility rule: no negatives -> exactly zero, still in the denominator."""
++    logits = torch.randn(1, 2, 6, generator=torch.Generator().manual_seed(2)).requires_grad_(True)
++    for objective in DISCRIMINATIVE_OBJECTIVES:
++        trainer = _disc(objective)
++        alone = trainer._compute_concept_losses_vectorized(
++            logits, [0], [0], [[1, 2]], [[3]], [[0.9, 0.7]])[0]
++        both = trainer._compute_concept_losses_vectorized(
++            logits, [0, 0], [0, 1], [[1, 2], [1, 2]], [[3], []], [[0.9, 0.7], [0.9, 0.7]])[0]
++        assert torch.isclose(both, alone / 2), objective
++        assert trainer._last_eligible == 0.5
++
++
++def test_per_positive_ranking_sees_the_neglected_positive():
++    """The audit's numbers: positives .20 and .001 against negative mass .02."""
++    logits = _logits_from_probs([0.20, 0.001, 0.02, 0.779])
++    args = (logits, [0], [0], [[0, 1]], [[2]], [None])
++    pool = _disc("pool")._compute_concept_losses_vectorized(*args)[0]
++    rank = _disc("rank")._compute_concept_losses_vectorized(*args)[0]
++    assert torch.isclose(pool, torch.tensor(-math.log(0.201 / 0.221)), atol=1e-4)      # .095
++    assert torch.isclose(rank, torch.tensor(0.5 * (-math.log(0.20 / 0.22)
++                                                   - math.log(0.001 / 0.021))), atol=1e-4)  # 1.570
++    assert rank > 10 * pool
++
++
++def test_list_uniform_equals_pool_plus_within_positive_kl_plus_log_n():
++    logits = torch.randn(1, 1, 7, generator=torch.Generator().manual_seed(3)).requires_grad_(True)
++    positives, negatives = [1, 2, 4], [5]
++    args = (logits, [0], [0], [positives], [negatives], [None])
++    pool = _disc("pool")._compute_concept_losses_vectorized(*args)[0]
++    listwise = _disc("list_uniform")._compute_concept_losses_vectorized(*args)[0]
++    probs = F.softmax(logits[0, 0].float(), dim=-1)
++    q = probs[positives] / probs[positives].sum()
++    n = len(positives)
++    kl = sum((1.0 / n) * math.log((1.0 / n) / q[i].item()) for i in range(n))
++    assert torch.isclose(listwise, pool + kl + math.log(n), atol=1e-5)
++
++
++def test_list_verifier_equal_scores_is_uniform_and_unscored_falls_back():
++    logits = torch.randn(1, 1, 7, generator=torch.Generator().manual_seed(4)).requires_grad_(True)
++    base = (logits, [0], [0], [[1, 2]], [[5]])
++    uniform = _disc("list_uniform")._compute_concept_losses_vectorized(*base, [None])[0]
++    equal = _disc("list_verifier")._compute_concept_losses_vectorized(*base, [[0.9, 0.9]])[0]
++    unscored = _disc("list_verifier")._compute_concept_losses_vectorized(*base, [[0.9, None]])[0]
++    assert torch.isclose(equal, uniform) and torch.isclose(unscored, uniform)
++    # Graded: theta .4 -> weights (.5, .1) / .6.
++    graded = _disc("list_verifier")._compute_concept_losses_vectorized(*base, [[0.9, 0.5]])[0]
++    log_p = F.log_softmax(logits[0, 0].float(), dim=-1)
++    log_all = torch.logsumexp(log_p[[1, 2, 5]], dim=0)
++    expected = log_all - ((0.5 / 0.6) * log_p[1] + (0.1 / 0.6) * log_p[2])
++    assert torch.isclose(graded, expected, atol=1e-5)
++    assert not torch.isclose(graded, uniform)
++
++
++def test_verifier_scores_stay_aligned_through_exclusion():
++    """Weights are taken over the SURVIVING alternatives: the excluded observed
++    token's score must go with it, not shift onto a neighbour."""
++    words = [[{"shift_position": 0, "target_token_id": 5,
++               "synonym_token_ids": [7, 5, 9], "synonym_scores": [0.9, 0.6, 0.5]}]]
++    flat = _flattener(True)._build_concept_targets(words, 1, 4, return_scores=True)
++    assert flat[2] == [[7, 9]]
++    assert flat[4] == [[0.9, 0.5]]
++
++
++def test_discriminative_objectives_have_zero_direct_gradient_off_the_candidate_list():
++    """The vocabulary softmax cancels: the observed token (and every other token
++    outside P u N) gets no direct gradient.  This is what the audit checked by
++    hand, and it is why slot NTP has to be declared separately."""
++    for objective in DISCRIMINATIVE_OBJECTIVES:
++        logits = torch.randn(1, 1, 6, generator=torch.Generator().manual_seed(5)).requires_grad_(True)
++        loss = _disc(objective)._compute_concept_losses_vectorized(
++            logits, [0], [0], [[1, 2]], [[4]], [[0.9, 0.6]])[0]
++        loss.backward()
++        grad = logits.grad[0, 0]
++        assert torch.allclose(grad[[0, 3, 5]], torch.zeros(3), atol=1e-6), objective
++        assert grad[[1, 2, 4]].abs().sum() > 0, objective
++
++
++def test_validation_refuses_stacked_terms_and_inclusive_sets():
++    validate_objective_config("rank", True, 0.0, "none", 1.0)
++    validate_objective_config("set_marginal", False, 1.0, "uniform", None)   # old arms untouched
++    with pytest.raises(ValueError):
++        validate_objective_config("rank", False, 0.0, "none", 1.0)            # observed token in P
++    with pytest.raises(ValueError):
++        validate_objective_config("pool", True, 1.0, "none", 1.0)             # + old contrastive term
++    with pytest.raises(ValueError):
++        validate_objective_config("list_uniform", True, 0.0, "uniform", 1.0)  # + auxiliary
++    with pytest.raises(ValueError):
++        validate_objective_config("list_verifier", True, 0.0, "none", None)   # NTP policy not stated
 diff --git a/train.py b/train.py
-index 0778a31..6eb214f 100644
+index 0778a31..b6d8276 100644
 --- a/train.py
 +++ b/train.py
-@@ -132,20 +132,47 @@ class ConceptDataset(Dataset):
+@@ -132,20 +132,57 @@ class ConceptDataset(Dataset):
  
                      seen = {target_token_id}
                      synonym_first_ids = []
+-                    for synonym in tw.get('synonyms', []):
 +                    synonym_surfaces = []
-                     for synonym in tw.get('synonyms', []):
++                    synonym_scores_kept = []
++                    # Verifier scores travel with the synonyms they belong to, or
++                    # not at all: a missing score is None, never a confidence.
++                    raw_scores = tw.get('synonym_scores')
++                    synonyms_listed = tw.get('synonyms', [])
++                    if not isinstance(raw_scores, list) or len(raw_scores) != len(synonyms_listed):
++                        raw_scores = [None] * len(synonyms_listed)
++                    for synonym, score in zip(synonyms_listed, raw_scores):
                          try:
                              encoded = tokenizer.encode(' ' + synonym, add_special_tokens=False)
                          except Exception:
@@ -1691,6 +1818,8 @@ index 0778a31..6eb214f 100644
                              seen.add(encoded[0])
                              synonym_first_ids.append(int(encoded[0]))
 +                            synonym_surfaces.append(str(synonym).strip())
++                            synonym_scores_kept.append(
++                                float(score) if isinstance(score, (int, float)) else None)
 +
 +                    negative_token_ids = []
 +                    negative_seen = set(seen)
@@ -1713,6 +1842,7 @@ index 0778a31..6eb214f 100644
 +                        'word': word,
 +                        'pos': tw.get('pos'),
 +                        'synonym_surfaces': synonym_surfaces,
++                        'synonym_scores': synonym_scores_kept,
 +                        'negative_token_ids': negative_token_ids,
 +                        'hypernyms': list(tw.get('hypernyms', [])),
 +                        'shuffled_hypernyms': list(tw.get('shuffled_hypernyms', [])),
@@ -1722,7 +1852,7 @@ index 0778a31..6eb214f 100644
                      })
  
                  if not content_words_processed:
-@@ -155,6 +182,7 @@ class ConceptDataset(Dataset):
+@@ -155,6 +192,7 @@ class ConceptDataset(Dataset):
                      'input_ids': input_ids_seq,
                      'attention_mask': attention_mask_seq,
                      'content_words': content_words_processed,
@@ -1730,7 +1860,7 @@ index 0778a31..6eb214f 100644
                  })
  
          if max_samples and max_samples > 0:
-@@ -175,14 +203,38 @@ class ConceptDataset(Dataset):
+@@ -175,14 +213,84 @@ class ConceptDataset(Dataset):
              'input_ids': item['input_ids'],
              'attention_mask': item['attention_mask'],
              'content_words': item['content_words'],
@@ -1738,6 +1868,49 @@ index 0778a31..6eb214f 100644
          }
  
  
++# The objective at a concept slot is ONE of these.  The first two are the released
++# set marginal and the per-word uniform loss; the rest discriminate the alternatives
++# from verified negatives and REPLACE the slot term rather than being added to it.
++#   pool          : -log [ P(A) / (P(A) + P(N)) ]
++#   rank          : -(1/|A|) sum_a log [ p_a / (p_a + P(N)) ]     every alternative beats N
++#   list_uniform  : -(1/|A|) sum_a log [ p_a / (P(A) + P(N)) ]   = pool + KL(u || q_A) + log|A|
++#   list_verifier : -sum_a w_a log [ p_a / (P(A) + P(N)) ],  w_a ∝ max(s_a - theta, 0)
++# A is the alternative set with the observed token excluded; N the verified negatives.
++CONCEPT_OBJECTIVES = ("set_marginal", "uniform", "pool", "rank", "list_uniform", "list_verifier")
++DISCRIMINATIVE_OBJECTIVES = ("pool", "rank", "list_uniform", "list_verifier")
++
++
++def validate_objective_config(concept_objective, exclude_target, contrast_beta, alt_aux,
++                              slot_ntp_weight):
++    """Refuse the combinations that would train something other than what was declared.
++
++    A discriminative objective is the whole slot objective.  Stacking the old
++    contrastive term or an auxiliary on top would train the A + B + C construction
++    the comparison exists to avoid; including the observed token would let the
++    ranking be satisfied by mass NTP already put there; and the NTP policy at the
++    slot is a separate decision, so it must be stated rather than inherited from
++    1 - lambda.
++    """
++    if concept_objective not in CONCEPT_OBJECTIVES:
++        raise ValueError(f"concept_objective must be one of {CONCEPT_OBJECTIVES}")
++    if alt_aux not in {"none", "uniform", "within_kl"}:
++        raise ValueError("alt_aux must be none, uniform or within_kl")
++    if concept_objective not in DISCRIMINATIVE_OBJECTIVES:
++        return
++    problems = []
++    if not exclude_target:
++        problems.append("--exclude-target (the alternatives must not contain the observed token)")
++    if float(contrast_beta or 0.0) != 0.0:
++        problems.append("--contrast-beta 0 (the pooled term is not an add-on here)")
++    if alt_aux != "none":
++        problems.append("--alt-aux none (no auxiliary on top of a discriminative objective)")
++    if slot_ntp_weight is None:
++        problems.append("an explicit --slot-ntp-weight (the NTP policy at the slot is declared, not inherited)")
++    if problems:
++        raise ValueError(
++            f"--concept-objective {concept_objective} requires " + "; ".join(problems))
++
++
  class ConceptLossTrainer(Trainer):
      """Custom Trainer that uses concept loss based on synonyms."""
  
@@ -1758,19 +1931,22 @@ index 0778a31..6eb214f 100644
 +        exclude_target=False,
 +        alt_aux="none",
 +        alt_aux_weight=0.0,
++        verifier_theta=0.4,
 +        **kwargs,
 +    ):
          super().__init__(**kwargs)
-+        if concept_objective not in {"set_marginal", "uniform"}:
-+            raise ValueError("concept_objective must be set_marginal or uniform")
-+        if alt_aux not in {"none", "uniform", "within_kl"}:
-+            raise ValueError("alt_aux must be none, uniform or within_kl")
++        validate_objective_config(concept_objective, exclude_target, contrast_beta,
++                                  alt_aux, slot_ntp_weight)
++        # Pruning threshold of the verified data; list_verifier weights are
++        # max(score - theta, 0), so weight is continuous with pruning.
++        self.verifier_theta = float(verifier_theta)
++        self._last_eligible = None
 +        if alt_aux != "none" and randomized_synonyms:
 +            raise ValueError("alt_aux is undefined for randomized synonyms")
          self.concept_loss_weight = concept_loss_weight
          self.max_synonyms_per_content_word = max_synonyms_per_content_word
          self.max_content_words = max_content_words
-@@ -197,6 +249,29 @@ class ConceptLossTrainer(Trainer):
+@@ -197,6 +305,29 @@ class ConceptLossTrainer(Trainer):
          self._is_evaluating = False
          self._last_eval_metrics = {}
          self.randomized_synonyms = randomized_synonyms
@@ -1800,7 +1976,7 @@ index 0778a31..6eb214f 100644
  
      def get_eval_dataloader(self, eval_dataset=None):
          """Create eval dataloader that adds labels for loss computation."""
-@@ -258,7 +333,12 @@ class ConceptLossTrainer(Trainer):
+@@ -258,7 +389,12 @@ class ConceptLossTrainer(Trainer):
  
          # Skip concept-loss work entirely when its weight is 0 and we're not in
          # weighted-CE mode (which needs concept timesteps for its own weighting).
@@ -1814,15 +1990,16 @@ index 0778a31..6eb214f 100644
  
          if skip_concept_work:
              concept_loss = torch.tensor(0.0, device=logits.device)
-@@ -266,12 +346,22 @@ class ConceptLossTrainer(Trainer):
+@@ -266,12 +402,24 @@ class ConceptLossTrainer(Trainer):
              ce_loss = (per_token_ce * valid.float()).sum() / N_total
              training_loss = ce_loss
          else:
 -            flat_b_idx, flat_shift_idx, flat_concept_ids = self._build_concept_targets(
 -                content_words_list, batch_size, shift_len
 +            (flat_b_idx, flat_shift_idx, flat_concept_ids, flat_negative_ids,
-+             flat_alt_ids) = self._build_concept_targets(
-+                content_words_list, batch_size, shift_len, return_alternatives=True
++             flat_alt_ids, flat_concept_scores) = self._build_concept_targets(
++                content_words_list, batch_size, shift_len,
++                return_alternatives=True, return_scores=True,
              )
  
 -            concept_loss = self._compute_concept_loss_vectorized(
@@ -1833,6 +2010,7 @@ index 0778a31..6eb214f 100644
 +                flat_shift_idx,
 +                flat_concept_ids,
 +                flat_negative_ids,
++                flat_concept_scores,
 +            )
 +            alt_aux_loss = (
 +                self._compute_alt_aux_loss(logits, flat_b_idx, flat_shift_idx, flat_alt_ids)
@@ -1841,7 +2019,7 @@ index 0778a31..6eb214f 100644
              )
  
              if self.use_weighted_ce:
-@@ -282,7 +372,11 @@ class ConceptLossTrainer(Trainer):
+@@ -282,7 +430,11 @@ class ConceptLossTrainer(Trainer):
                      ce_weights[b_t, s_t] = self.ce_concept_token_weight
                  denom = (ce_weights * valid.float()).sum().clamp(min=1e-8)
                  ce_loss = (per_token_ce * ce_weights * valid.float()).sum() / denom
@@ -1854,7 +2032,7 @@ index 0778a31..6eb214f 100644
              else:
                  target_mask = torch.zeros(batch_size, shift_len, dtype=torch.bool, device=logits.device)
                  if flat_b_idx:
-@@ -301,10 +395,25 @@ class ConceptLossTrainer(Trainer):
+@@ -301,10 +453,25 @@ class ConceptLossTrainer(Trainer):
                  ce_loss_non_targets = (per_token_ce * non_target_valid.float()).sum() / N_non_target.clamp(min=1e-8)
                  ce_loss_targets = (per_token_ce * target_valid.float()).sum() / N_target.clamp(min=1e-8)
  
@@ -1882,31 +2060,45 @@ index 0778a31..6eb214f 100644
  
          ce_loss_val = ce_loss.detach().item()
          concept_loss_val = concept_loss.detach().item()
-@@ -319,6 +428,8 @@ class ConceptLossTrainer(Trainer):
-                 self.log({
+@@ -316,17 +483,26 @@ class ConceptLossTrainer(Trainer):
+             self._eval_perplexities.append(perplexity)
+         else:
+             if self.state.global_step % self.args.logging_steps == 0 and self.state.global_step > 0:
+-                self.log({
++                record = {
                      "ce_loss": ce_loss_val,
                      "concept_loss": concept_loss_val,
 +                    "contrast_loss": contrast_loss.detach().item(),
 +                    "alt_aux_loss": alt_aux_loss.detach().item(),
                      "perplexity": perplexity,
-                 })
+-                })
++                }
++                if self._last_eligible is not None:
++                    # Share of content slots that actually carried the
++                    # discriminative term this step (>= 1 alternative AND >= 1
++                    # negative after tokenization); the rest contributed zero.
++                    record["concept_eligible_share"] = self._last_eligible
++                self.log(record)
  
-@@ -326,7 +437,8 @@ class ConceptLossTrainer(Trainer):
+         if return_outputs:
              return training_loss, {"logits": logits}
          return training_loss
  
 -    def _build_concept_targets(self, content_words_list, batch_size, shift_len):
 +    def _build_concept_targets(self, content_words_list, batch_size, shift_len,
-+                               return_alternatives=False):
++                               return_alternatives=False, return_scores=False):
          """
          Walk pre-tokenized content words once and return flat lists describing each
          valid (sequence, content-word) pair:
-@@ -343,18 +455,34 @@ class ConceptLossTrainer(Trainer):
+@@ -343,18 +519,37 @@ class ConceptLossTrainer(Trainer):
          flat_b_idx = []
          flat_shift_idx = []
          flat_concept_ids = []
 +        flat_negative_ids = []
 +        flat_alt_ids = []
++        # Raw verifier scores aligned with flat_concept_ids (None where unscored).
++        # Normalisation happens in the loss, AFTER every filter above has run.
++        flat_concept_scores = []
  
          for b in range(batch_size):
              content_words = content_words_list[b]
@@ -1938,22 +2130,35 @@ index 0778a31..6eb214f 100644
                  content_words = rng.sample(content_words, k)
  
              for tw in content_words:
-@@ -368,6 +496,14 @@ class ConceptLossTrainer(Trainer):
+@@ -363,11 +558,27 @@ class ConceptLossTrainer(Trainer):
+                     continue
+ 
+                 synonyms = tw['synonym_token_ids']
++                scores = tw.get('synonym_scores')
++                if not isinstance(scores, list) or len(scores) != len(synonyms):
++                    scores = [None] * len(synonyms)
++                raw_scores = None
+                 if self.randomized_synonyms:
+                     # Randomized mode: exclude the target token and admit up to
                      # max_synonyms + 1 synonyms.
                      limit = (max_synonyms + 1) if max_synonyms is not None else None
                      ids = list(synonyms[:limit]) if limit is not None else list(synonyms)
 +                elif self.exclude_target:
 +                    # Gold-exclusive: alternatives only.  A synonym list that
 +                    # happens to repeat the observed token is de-duplicated, so
-+                    # the gold can never re-enter through the back door.
++                    # the gold can never re-enter through the back door.  Scores
++                    # are filtered in lockstep so they stay aligned with the ids.
 +                    target_id = int(tw['target_token_id'])
 +                    limit = max_synonyms
 +                    pool = synonyms[:limit] if limit is not None else synonyms
-+                    ids = [int(t) for t in pool if int(t) != target_id]
++                    pool_scores = scores[:limit] if limit is not None else scores
++                    kept = [(int(t), s) for t, s in zip(pool, pool_scores) if int(t) != target_id]
++                    ids = [t for t, _ in kept]
++                    raw_scores = [s for _, s in kept]
                  else:
                      ids = [tw['target_token_id']]
                      limit = max_synonyms
-@@ -376,16 +512,83 @@ class ConceptLossTrainer(Trainer):
+@@ -376,16 +587,165 @@ class ConceptLossTrainer(Trainer):
                      else:
                          ids.extend(synonyms)
  
@@ -1974,6 +2179,7 @@ index 0778a31..6eb214f 100644
 -        return flat_b_idx, flat_shift_idx, flat_concept_ids
 -
 -    def _compute_concept_loss_vectorized(self, logits, flat_b_idx, flat_shift_idx, flat_concept_ids):
++                flat_concept_scores.append(raw_scores)
 +                # Alternatives only, whatever the main set contains: the same
 +                # rule --exclude-target applies, so an aux arm and an
 +                # alternative-only arm supervise identical tokens.
@@ -1990,9 +2196,12 @@ index 0778a31..6eb214f 100644
 +                        negatives.append(token_id)
 +                flat_negative_ids.append(negatives)
 +
++        out = [flat_b_idx, flat_shift_idx, flat_concept_ids, flat_negative_ids]
 +        if return_alternatives:
-+            return flat_b_idx, flat_shift_idx, flat_concept_ids, flat_negative_ids, flat_alt_ids
-+        return flat_b_idx, flat_shift_idx, flat_concept_ids, flat_negative_ids
++            out.append(flat_alt_ids)
++        if return_scores:
++            out.append(flat_concept_scores)
++        return tuple(out)
 +
 +    def _compute_alt_aux_loss(self, logits, flat_b_idx, flat_shift_idx, flat_alt_ids):
 +        """Auxiliary loss over the alternatives at each content slot.
@@ -2031,6 +2240,83 @@ index 0778a31..6eb214f 100644
 +            keep = count >= 2
 +        return torch.where(keep, per_slot, torch.zeros_like(per_slot)).mean()
 +
++    def _verifier_weights(self, flat_concept_scores, valid_mask):
++        """Per-slot target weights for list_verifier: w_a ∝ max(s_a - theta, 0).
++
++        Computed over the alternatives that SURVIVED tokenization and exclusion,
++        then normalised.  A slot with any unscored alternative, or with no weight
++        above zero, falls back to uniform -- an unverified alternative is never
++        given a confidence it did not earn.
++        """
++        theta = float(getattr(self, "verifier_theta", 0.4))
++        num_targets, width = valid_mask.shape
++        weights = torch.zeros(num_targets, width, dtype=torch.float32, device=valid_mask.device)
++        for i in range(num_targets):
++            n = int(valid_mask[i].sum().item())
++            if n == 0:
++                continue
++            scores = flat_concept_scores[i] if flat_concept_scores is not None else None
++            usable = (isinstance(scores, list) and len(scores) == n
++                      and all(isinstance(s, (int, float)) for s in scores))
++            raw = [max(float(s) - theta, 0.0) for s in scores] if usable else []
++            if not usable or sum(raw) <= 0.0:
++                weights[i, :n] = 1.0 / n
++            else:
++                total = sum(raw)
++                weights[i, :n] = torch.tensor([r / total for r in raw], device=valid_mask.device)
++        return weights
++
++    def _discriminative_per_slot(self, target_log_probs, gathered_log, valid_mask,
++                                 has_candidate, flat_negative_ids, flat_concept_scores):
++        """Per-slot value of pool / rank / list_uniform / list_verifier.
++
++        Common eligibility rule for all four: a slot counts only when at least one
++        alternative AND at least one negative survived tokenization.  Every other
++        slot contributes exactly zero and stays in the denominator, so lambda
++        means the same thing in each arm -- the same convention the set marginal
++        uses for slots emptied by exclusion.
++        """
++        device = gathered_log.device
++        num_targets = gathered_log.shape[0]
++        max_neg = max(1, max((len(n) for n in flat_negative_ids), default=1))
++        neg_ids = torch.zeros(num_targets, max_neg, dtype=torch.long, device=device)
++        neg_mask = torch.zeros(num_targets, max_neg, dtype=torch.bool, device=device)
++        for i, ids in enumerate(flat_negative_ids):
++            if ids:
++                neg_ids[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
++                neg_mask[i, :len(ids)] = True
++        has_negative = neg_mask.any(dim=1)
++        eligible = has_candidate & has_negative
++
++        # Everything below is computed on FINITE values only: masked entries are
++        # zeroed, and ineligible rows are zeroed at the end.  -inf arithmetic
++        # would put NaN into the backward pass through torch.where.
++        safe_pos = gathered_log.masked_fill(~valid_mask, 0.0)
++        neg_log = target_log_probs.gather(1, neg_ids).masked_fill(~neg_mask, float("-inf"))
++        log_mass_neg = torch.logsumexp(neg_log, dim=1)
++        log_mass_neg = torch.where(has_negative, log_mass_neg, torch.zeros_like(log_mass_neg))
++        log_mass_pos = torch.logsumexp(gathered_log.masked_fill(~valid_mask, float("-inf")), dim=1)
++        log_mass_pos = torch.where(has_candidate, log_mass_pos, torch.zeros_like(log_mass_pos))
++        log_mass_all = torch.logaddexp(log_mass_pos, log_mass_neg)
++        count = valid_mask.sum(dim=1).clamp(min=1).float()
++        mean_log = safe_pos.sum(dim=1) / count
++
++        if self.concept_objective == "pool":
++            per_slot = log_mass_all - log_mass_pos
++        elif self.concept_objective == "rank":
++            # Each alternative against the negatives alone: other alternatives
++            # never appear in its denominator, so a weak one keeps its gradient.
++            per_alt = torch.logaddexp(safe_pos, log_mass_neg[:, None]) - safe_pos
++            per_slot = per_alt.masked_fill(~valid_mask, 0.0).sum(dim=1) / count
++        elif self.concept_objective == "list_uniform":
++            per_slot = log_mass_all - mean_log
++        else:  # list_verifier
++            weights = self._verifier_weights(flat_concept_scores, valid_mask)
++            per_slot = log_mass_all - (weights * safe_pos).sum(dim=1)
++
++        self._last_eligible = float(eligible.float().mean().item()) if num_targets else 0.0
++        return torch.where(eligible, per_slot, torch.zeros_like(per_slot))
++
 +    def _compute_concept_losses_vectorized(
 +        self,
 +        logits,
@@ -2038,11 +2324,12 @@ index 0778a31..6eb214f 100644
 +        flat_shift_idx,
 +        flat_concept_ids,
 +        flat_negative_ids,
++        flat_concept_scores=None,
 +    ):
          """
          Vectorized concept loss:
            - Gather logits only at target shift positions: [num_targets, V].
-@@ -394,7 +597,8 @@ class ConceptLossTrainer(Trainer):
+@@ -394,7 +754,8 @@ class ConceptLossTrainer(Trainer):
            - Apply margin (hinge) loss at target_mass.
          """
          if not flat_b_idx:
@@ -2052,7 +2339,7 @@ index 0778a31..6eb214f 100644
  
          device = logits.device
          b_t = torch.tensor(flat_b_idx, device=device, dtype=torch.long)
-@@ -402,10 +606,11 @@ class ConceptLossTrainer(Trainer):
+@@ -402,10 +763,11 @@ class ConceptLossTrainer(Trainer):
  
          # logits[b, shift_pos] = logits at index shift_pos predicts token at shift_pos+1.
          target_logits = logits[b_t, s_t]                    # [num_targets, V]
@@ -2066,7 +2353,7 @@ index 0778a31..6eb214f 100644
          padded_ids = torch.zeros(num_targets, max_concept, dtype=torch.long, device=device)
          valid_mask = torch.zeros(num_targets, max_concept, dtype=torch.bool, device=device)
          for i, ids in enumerate(flat_concept_ids):
-@@ -413,18 +618,53 @@ class ConceptLossTrainer(Trainer):
+@@ -413,18 +775,61 @@ class ConceptLossTrainer(Trainer):
              padded_ids[i, :n] = torch.tensor(ids, dtype=torch.long, device=device)
              valid_mask[i, :n] = True
  
@@ -2079,6 +2366,14 @@ index 0778a31..6eb214f 100644
 +        # Rows emptied by --exclude-target: -inf mass would make set_marginal
 +        # infinite, so they are forced to zero below in either objective.
 +        has_candidate = valid_mask.any(dim=1)
++
++        if self.concept_objective in DISCRIMINATIVE_OBJECTIVES:
++            per_slot = self._discriminative_per_slot(
++                target_log_probs, gathered_log, valid_mask, has_candidate,
++                flat_negative_ids, flat_concept_scores)
++            # The pooled add-on term is not defined for these arms (validated at
++            # construction); return a zero that still carries the graph.
++            return per_slot.mean(), target_logits.sum() * 0.0
  
          # Margin loss: zero contribution above target_mass, -log(mass) below.
          # torch.where evaluates both branches; clamp keeps log finite either way.
@@ -2127,7 +2422,7 @@ index 0778a31..6eb214f 100644
  
      def compute_metrics(self, eval_pred):
          """Compute and return evaluation metrics from accumulated values."""
-@@ -512,6 +752,19 @@ class EvalMetricsCallback(TrainerCallback):
+@@ -512,6 +917,19 @@ class EvalMetricsCallback(TrainerCallback):
                  logger.warning("wandb.run is None, cannot log metrics")
  
  
@@ -2147,7 +2442,7 @@ index 0778a31..6eb214f 100644
  def collate_fn(examples, tokenizer):
      """Custom collate function for concept dataset."""
      input_ids = pad_sequence(
-@@ -527,11 +780,13 @@ def collate_fn(examples, tokenizer):
+@@ -527,11 +945,13 @@ def collate_fn(examples, tokenizer):
  
      # List of lists: content_words_list[b] = [{word, position, synonyms}, ...] for sequence b
      content_words_list = [ex['content_words'] for ex in examples]
@@ -2161,15 +2456,24 @@ index 0778a31..6eb214f 100644
      }
  
  
-@@ -627,6 +882,56 @@ def parse_args():
+@@ -627,6 +1047,65 @@ def parse_args():
          default=None,
          help='Weight for concept loss (default: use value from config)'
      )
 +    parser.add_argument(
 +        '--concept-objective',
-+        choices=['set_marginal', 'uniform'],
++        choices=list(CONCEPT_OBJECTIVES),
 +        default=None,
-+        help='Concept loss form. Default preserves the released set marginal.',
++        help='Concept loss form. Default preserves the released set marginal. '
++             'pool / rank / list_uniform / list_verifier discriminate the alternatives '
++             'from per-slot negatives and REPLACE the slot term; they require '
++             '--exclude-target, an explicit --slot-ntp-weight, and no --contrast-beta or --alt-aux.',
++    )
++    parser.add_argument(
++        '--verifier-theta',
++        type=float,
++        default=None,
++        help='Pruning threshold of the verified data; list_verifier weights are max(score - theta, 0).',
 +    )
 +    parser.add_argument(
 +        '--slot-ntp-weight',
@@ -2218,7 +2522,7 @@ index 0778a31..6eb214f 100644
      parser.add_argument(
          '--model-name',
          type=str,
-@@ -684,7 +989,7 @@ def parse_args():
+@@ -684,7 +1163,7 @@ def parse_args():
      )
      parser.add_argument(
          '--num-train-epochs',
@@ -2227,7 +2531,26 @@ index 0778a31..6eb214f 100644
          default=None,
          help='Number of train epochs (default: use value from config)'
      )
-@@ -707,6 +1012,30 @@ def main():
+@@ -697,6 +1176,18 @@ def parse_args():
+     return parser.parse_args()
+ 
+ 
++def _sha256_of(path):
++    import hashlib
++    digest = hashlib.sha256()
++    try:
++        with open(path, "rb") as handle:
++            for chunk in iter(lambda: handle.read(1 << 20), b""):
++                digest.update(chunk)
++    except OSError:
++        return None
++    return digest.hexdigest()
++
++
+ def main():
+     """Main training function"""
+ 
+@@ -707,6 +1198,35 @@ def main():
      if args.concept_loss_weight is not None:
          logger.info(f"Overriding concept_loss_weight from command line: {args.concept_loss_weight}")
          config.concept_loss_weight = args.concept_loss_weight
@@ -2245,6 +2568,11 @@ index 0778a31..6eb214f 100644
 +        config.alt_aux_weight = args.alt_aux_weight
 +    if (config.alt_aux == "none") != (config.alt_aux_weight == 0):
 +        raise ValueError("--alt-aux and a non-zero --alt-aux-weight must be given together")
++    if args.verifier_theta is not None:
++        config.verifier_theta = args.verifier_theta
++    # Fail here, before a model is loaded, with the same rule the trainer enforces.
++    validate_objective_config(config.concept_objective, getattr(config, "exclude_target", False),
++                              config.contrast_beta, config.alt_aux, config.slot_ntp_weight)
 +    if args.seed is not None:
 +        config.seed = args.seed
 +    if args.save_strategy is not None:
@@ -2258,7 +2586,7 @@ index 0778a31..6eb214f 100644
  
      if args.model_name is not None:
          logger.info(f"Overriding model_name from command line: {args.model_name}")
-@@ -753,7 +1082,7 @@ def main():
+@@ -753,7 +1273,7 @@ def main():
      content_word_tag = "all_content_words" if config.max_content_words is None else f"{config.max_content_words}_content_words"
  
      data_base_dir = dataset_dir(dataset_name, config.model_name, dataset_type)
@@ -2267,7 +2595,7 @@ index 0778a31..6eb214f 100644
  
      # Pick the training file and a short run-name tag for the active ablation.
      if config.randomized_synonyms:
-@@ -772,17 +1101,29 @@ def main():
+@@ -772,17 +1292,29 @@ def main():
          train_path = os.path.join(data_base_dir, "synonyms_train.jsonl")
          run_tag = None
  
@@ -2308,7 +2636,7 @@ index 0778a31..6eb214f 100644
  
      run_name_parts = [dataset_name, suffix, dataset_type, content_word_tag]
      if run_tag:
-@@ -793,6 +1134,11 @@ def main():
+@@ -793,6 +1325,11 @@ def main():
      os.makedirs(config.output_dir, exist_ok=True)
  
      logger.info(f"Using concept_loss_weight: {config.concept_loss_weight}")
@@ -2320,7 +2648,7 @@ index 0778a31..6eb214f 100644
      logger.info(f"Using model_name: {config.model_name}")
      logger.info(f"Using dataset: {config.dataset}")
      logger.info(f"Using randomized_synonyms: {config.randomized_synonyms}")
-@@ -807,6 +1153,10 @@ def main():
+@@ -807,6 +1344,10 @@ def main():
      logger.info(f"Using max_train_samples: {config.max_train_samples}")
      logger.info(f"Using num_train_epochs: {config.num_train_epochs}")
      logger.info(f"Using use_data_augmentation: {args.use_data_augmentation}")
@@ -2331,7 +2659,7 @@ index 0778a31..6eb214f 100644
  
      if args.use_data_augmentation:
          assert config.concept_loss_weight == 0, (
-@@ -877,7 +1227,7 @@ def main():
+@@ -877,7 +1418,7 @@ def main():
          optim="adamw_torch_fused",
      )
  
@@ -2340,7 +2668,7 @@ index 0778a31..6eb214f 100644
      if eval_dataset and config.early_stopping:
          callbacks.append(
              EarlyStoppingCallback(
-@@ -904,6 +1254,12 @@ def main():
+@@ -904,6 +1445,13 @@ def main():
          randomized_synonyms=config.randomized_synonyms,
          use_weighted_ce=config.use_weighted_ce,
          ce_concept_token_weight=config.ce_concept_token_weight,
@@ -2350,10 +2678,11 @@ index 0778a31..6eb214f 100644
 +        contrast_beta=config.contrast_beta,
 +        alt_aux=config.alt_aux,
 +        alt_aux_weight=config.alt_aux_weight,
++        verifier_theta=getattr(config, "verifier_theta", 0.4),
          callbacks=callbacks,
      )
  
-@@ -916,6 +1272,29 @@ def main():
+@@ -916,6 +1464,35 @@ def main():
      logger.info(f"\nSaving final model to {config.output_dir}...")
      trainer.save_model(config.output_dir)
      tokenizer.save_pretrained(config.output_dir)
@@ -2367,9 +2696,15 @@ index 0778a31..6eb214f 100644
 +            "concept_loss_weight": config.concept_loss_weight,
 +            "concept_objective": config.concept_objective,
 +            "slot_ntp_weight": config.slot_ntp_weight,
++            "exclude_target": bool(getattr(config, "exclude_target", False)),
 +            "contrast_beta": config.contrast_beta,
 +            "alt_aux": config.alt_aux,
 +            "alt_aux_weight": config.alt_aux_weight,
++            "verifier_theta": getattr(config, "verifier_theta", 0.4),
++            # Identity of the supervision, so a resumed adapter can be checked
++            # against the file it claims to have been trained on.
++            "train_file": os.path.abspath(train_path),
++            "train_file_sha256": _sha256_of(train_path),
 +            "target_mass": config.target_mass,
 +            "num_train_epochs": config.num_train_epochs,
 +            "learning_rate": config.learning_rate,
