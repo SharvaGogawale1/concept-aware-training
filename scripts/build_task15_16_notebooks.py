@@ -1424,16 +1424,25 @@ if RUN_VERIFIED:
                   VERIFIED_TRAIN.parent / "verified_report.json"):
         if _cand.is_file():
             _report = json.loads(_cand.read_text()); break
-    if _report is None:
-        print("no miner report found beside the data; the data-sanity gate is skipped")
-    else:
+    # Missing or old reports are errors, not reasons to skip the gate: the data is
+    # only trusted when its report was written by the current miner FOR THIS FILE.
+    assert _report is not None, "no miner report beside the verified data; refusing to train on it"
+    _want = re.search(r'MINER_VERSION = "([^"]+)"',
+                      (MAIN / "scripts/build_verified_negatives.py").read_text()).group(1)
+    assert _report.get("miner_version") == _want, (
+        f"verified data was written by miner {_report.get('miner_version')!r}, current is {_want!r}; re-mine")
+    assert _report.get("output_sha256") == sha256(VERIFIED_TRAIN), (
+        "the miner report describes a different file than the one on disk; re-mine")
+    assert _report.get("complete"), "the report is from a partial (pilot or shard) run; re-mine the full file"
+    assert "positives_unscored" in _report, "report lacks the unscored-positive count; re-mine"
+    if True:
         _checks = {
             "negative_coverage in [.15,.70]": .15 <= _report["negative_coverage"] <= .70,
             "effective_contrastive_coverage >= .15": _report["effective_contrastive_coverage"] >= .15,
             "positives pruned share in [.02,.30]":
                 .02 <= _report["positives_pruned"] / max(_report["positives_seen"], 1) <= .30,
             "positives unscored share < .05":
-                _report.get("positives_unscored", 0) / max(_report["positives_seen"], 1) < .05,
+                _report["positives_unscored"] / max(_report["positives_seen"], 1) < .05,
             "rows >= 3000": _report["rows"] >= 3000,
         }
         for _k, _v in _checks.items():

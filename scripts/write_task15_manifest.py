@@ -14,6 +14,7 @@ from pathlib import Path
 p = argparse.ArgumentParser()
 p.add_argument("--model-tag", required=True)
 p.add_argument("--base", default=".")
+p.add_argument("--force", action="store_true", help="replace a manifest that has other entries (backed up first)")
 a = p.parse_args()
 runs = Path(a.base).resolve() / "concept_aware" / "runs" / a.model_tag
 wanted = {"ntp_seed42": ("ntp", "lambda_0.0_beta_0.0"),
@@ -30,5 +31,15 @@ if missing:
     raise SystemExit("missing adapters (need adapter_config.json + adapter_model.safetensors):\n  " + "\n  ".join(missing))
 out = Path(a.base).resolve() / "outputs" / a.model_tag / "run_manifests" / "task15.json"
 out.parent.mkdir(parents=True, exist_ok=True)
+if out.is_file():
+    existing = json.loads(out.read_text())
+    extra = sorted(set(existing) - set(manifest))
+    if extra and not a.force:
+        raise SystemExit(f"{out} already lists {extra}; this would drop them.  Pass --force (a backup is kept).")
+    if existing != manifest:
+        import time
+        backup = out.with_name(f"task15.json.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+        backup.write_text(json.dumps(existing, indent=2))
+        print("backed up the previous manifest to", backup)
 out.write_text(json.dumps(manifest, indent=2))
 print(f"wrote {out}\n" + "\n".join(f"  {k}: {v}" for k, v in manifest.items()))

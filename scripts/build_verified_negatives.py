@@ -27,7 +27,12 @@ Schema is preserved: every `content_word_responses` item gains `negatives` and
         --prune-positives [--limit 50 for a pilot] [--start/--end for sharding]
 """
 from __future__ import annotations
-import argparse, csv, glob, json, random, re, sys, time
+import argparse, csv, glob, hashlib, json, random, re, sys, time
+
+# Bump whenever the OUTPUT changes meaning.  The launcher and the notebook refuse data
+# whose report carries a different version, so output from an older miner -- including
+# the one that wrote synonym_scores with fabricated 1.0 values -- cannot be trained on.
+MINER_VERSION = "2026-09-22.3"
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -320,7 +325,14 @@ with open(a.source, encoding="utf-8") as src, open(a.output, "w", encoding="utf-
         flush(pending, dst)
 
 # ---- report and hand-reading sample -----------------------------------------------------------------
+_digest = hashlib.sha256()
+with open(a.output, "rb") as _h:
+    for _chunk in iter(lambda: _h.read(1 << 20), b""):
+        _digest.update(_chunk)
 report = {
+    "miner_version": MINER_VERSION,
+    "output_sha256": _digest.hexdigest(),
+    "complete": a.limit is None and a.start == 0 and a.end is None,
     "source": a.source, "output": a.output, "model": a.model, "verifier": a.verifier,
     "theta": a.theta, "max_candidates": a.max_candidates, "max_negatives": a.max_negatives,
     "prune_positives": a.prune_positives, "fake_nli": a.fake_nli,
