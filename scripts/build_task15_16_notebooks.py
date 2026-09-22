@@ -81,6 +81,17 @@ RUN_HYBRID = False
 # for the demoted contrastive term, NOT a method-selection run, so they are off
 # by default and should be run AFTER the H1/H2 screen has been gated.
 RUN_NEGATIVE_CONTROLS = False
+# Task 15b only: the verified-supervision comparison.  Six arms trained from
+# synonyms_train_verified.jsonl (pruned positives + verifier-mined negatives), one
+# slot objective each, scored in their own result directory against Task 15's
+# NTP and Zhang.  VERIFIED_SMOKE_STEPS > 0 trains ~that many steps per arm,
+# prints first-step loss magnitudes for the pre-declared lambda rule, and
+# trains nothing else.  Weights are read from the environment so a Colab session
+# and the server twin declare them the same way:
+#   os.environ["VERIFIED_LAMBDA"] = "1.0"    weight on the slot objective (pool/rank/list)
+#   os.environ["VERIFIED_GAMMA"]  = "0.125"  the continuity arm's gamma: Llama .125, Qwen .0625
+RUN_VERIFIED = False
+VERIFIED_SMOKE_STEPS = 0
 RUN_EVAL = False
 # Skip any run whose adapter is already on Drive.  /content is wiped between
 # Colab sessions, so without this the screen -> gate -> confirm sequence has to
@@ -1360,6 +1371,237 @@ if RUN_CONFIRM:
     for label, path in OBJECTIVE_RUNS.items(): sync_small_artifacts(path, f"task15b_logs{_TAG_SUFFIX}/{label}")
     audit_no_drive_weights()
 save_runs(OBJECTIVE_RUNS, f"task15b{_TAG_SUFFIX}")
+"""),
+        md(r"""## Verified supervision: one slot objective per arm
+
+The question this stage answers, with everything else held equal:
+
+> Does teaching every valid alternative to outrank verifier-filtered negatives improve contextual substitution over maximising the total probability of a concept set?
+
+Same training file for every arm (`synonyms_train_verified.jsonl`: positives pruned by the verifier's low tail, negatives mined from the model's own top-$k$ pool through the same tail), same schedule and initialisation, NTP everywhere else. What differs is **only** what sits at the concept slot:
+
+| arm | at the slot | positives | negatives |
+|---|---|---|---|
+| `zhang_seed42` (Task 15) | released set marginal | original | — |
+| `verified_zhang` | released set marginal | pruned | — |
+| `verified_hybrid` | set marginal $+\gamma\,$uniform | pruned | — |
+| `verified_pool` | $-\log\frac{P(A)}{P(A)+P(N)}$ | pruned | yes |
+| `verified_rank` | $-\frac1{|A|}\sum_a\log\frac{p_a}{p_a+P(N)}$ | pruned | yes |
+| `verified_list_uniform` | $-\frac1{|A|}\sum_a\log\frac{p_a}{P(A)+P(N)}$ | pruned | yes |
+| `verified_list_verifier` | $-\sum_a w_a\log\frac{p_a}{P(A)+P(N)},\ w_a\propto\max(s_a-\theta,0)$ | pruned | yes |
+
+The four discriminative arms exclude the observed token from $A$ and keep slot NTP at 1.0 (the trainer refuses any other combination, and refuses `--contrast-beta` or `--alt-aux` on top of them). A slot carries the term only when at least one alternative **and** one negative survive tokenization; otherwise it contributes exactly zero and stays in the denominator.
+
+Two claims, gated separately below and never merged: **contrast helps** (a discriminative arm beats `verified_zhang` on GAP and AUROC with paired intervals excluding zero, inside the STS and observed-target allowances) and **per-positive helps** (`verified_rank` beats `verified_pool` the same way). Beating the old noisy baseline establishes neither.
+
+Adapters live under a method name that carries the training file's SHA-256, and a resume is refused if the recorded hash differs, so a pruned-positive run can never reuse an older adapter."""),
+        code(r"""
+VERIFIED_DIR = DRIVE_RESULTS / f"task15b_verified{_TAG_SUFFIX}"
+VERIFIED_DIR.mkdir(parents=True, exist_ok=True)
+VERIFIED_TRAIN = Path(os.environ.get("VERIFIED_TRAIN_FILE") or (LEAF / "synonyms_train_verified.jsonl"))
+VERIFIED_LAMBDA = float(os.environ.get("VERIFIED_LAMBDA", "1.0"))
+VERIFIED_GAMMA = float(os.environ.get("VERIFIED_GAMMA") or (0.125 if MODEL_TAG == "llama-3.2-1b" else 0.0625))
+VERIFIED_RUNS = load_runs(f"task15b_verified{_TAG_SUFFIX}")
+DISCRIMINATIVE = ("pool", "rank", "list_uniform", "list_verifier")
+
+if RUN_VERIFIED:
+    assert VERIFIED_TRAIN.is_file(), f"{VERIFIED_TRAIN} missing: run scripts/build_verified_negatives.py first"
+    DATA_HASH = sha256(VERIFIED_TRAIN)
+    DATA_TAG = f"data_{DATA_HASH[:8]}"
+    print("verified train file:", VERIFIED_TRAIN, "| sha256", DATA_HASH[:16] + "...",
+          "| lambda", VERIFIED_LAMBDA, "| gamma", VERIFIED_GAMMA)
+
+    ARMS = {
+        "verified_zhang":         dict(objective="set_marginal", weight=1.0),
+        "verified_hybrid":        dict(objective="set_marginal", weight=1.0,
+                                       alt_aux="uniform", alt_aux_weight=VERIFIED_GAMMA),
+        "verified_pool":          dict(objective="pool"),
+        "verified_rank":          dict(objective="rank"),
+        "verified_list_uniform":  dict(objective="list_uniform"),
+        "verified_list_verifier": dict(objective="list_verifier"),
+    }
+
+    def launch(label, spec, *, prefix="", epochs=5, max_samples=None):
+        objective = spec["objective"]
+        weight = spec.get("weight", VERIFIED_LAMBDA)
+        alt_aux, alt_w = spec.get("alt_aux", "none"), spec.get("alt_aux_weight", 0.0)
+        kw = dict(objective=objective, train_file=VERIFIED_TRAIN, epochs=epochs,
+                  max_samples=max_samples, alt_aux=alt_aux, alt_aux_weight=alt_w)
+        if objective in DISCRIMINATIVE:
+            kw.update(exclude_target=True, slot_ntp_weight=1.0)
+        # The data hash is part of the METHOD name, so this path can only ever hold
+        # an adapter trained on this exact file -- and the recorded hash is checked
+        # anyway before a resume is accepted.
+        method = f"{prefix}{label}_{DATA_TAG}"
+        aux_tag = "" if alt_aux == "none" else f"_aux_{alt_aux}_{alt_w}"
+        expected = adapter_path(method, 42, f"lambda_{weight}_beta_0.0{aux_tag}")
+        if RESUME_FINISHED_RUNS and finished(expected):
+            recorded = json.loads((expected / "concept_training_config.json").read_text()) \
+                if (expected / "concept_training_config.json").is_file() else {}
+            if recorded.get("train_file_sha256") != DATA_HASH:
+                raise RuntimeError(f"{expected} was trained on a different file "
+                                   f"({recorded.get('train_file_sha256')}); refusing to resume it")
+        return train_flat(method, 42, weight, **kw)
+
+    if VERIFIED_SMOKE_STEPS:
+        print(f"== smoke: ~{VERIFIED_SMOKE_STEPS} steps per arm, first logged magnitudes ==")
+        for label in ("verified_zhang", "verified_pool", "verified_rank",
+                      "verified_list_uniform", "verified_list_verifier"):
+            out = launch(label, ARMS[label], prefix="smoke_", epochs=1,
+                         max_samples=VERIFIED_SMOKE_STEPS * 16)
+            history = out / "training_history.jsonl"
+            rows = [json.loads(l) for l in history.read_text().splitlines() if l.strip()] \
+                if history.is_file() else []
+            first = next((r for r in rows if "concept_loss" in r), None)
+            print(f"  {label:24s}", {k: round(first[k], 4) for k in
+                  ("ce_loss", "concept_loss", "concept_eligible_share") if k in first}
+                  if first else "no logged step (raise VERIFIED_SMOKE_STEPS above logging_steps)")
+        print("Rule, declared before any result: VERIFIED_LAMBDA = 1.0 unless an arm's first "
+              "concept_loss is more than 3x or less than 1/3 of verified_zhang's, in which case "
+              "the nearest power of two.  Set it in the environment, set VERIFIED_SMOKE_STEPS = 0, rerun.")
+    else:
+        for label, spec in ARMS.items():
+            VERIFIED_RUNS[label] = launch(label, spec)
+        for label, path in VERIFIED_RUNS.items():
+            sync_small_artifacts(path, f"task15b_verified_logs{_TAG_SUFFIX}/{label}")
+        save_runs(VERIFIED_RUNS, f"task15b_verified{_TAG_SUFFIX}")
+
+if RUN_VERIFIED and RUN_EVAL and not VERIFIED_SMOKE_STEPS:
+    # Its OWN result directory: the baselines plus these six, about ten checkpoints,
+    # instead of re-scoring the whole screen every time an arm is added.
+    VERIFIED_RUNS = restore_all(VERIFIED_RUNS)
+    task15_runs = restore_all(load_runs(f"task15{_TAG_SUFFIX}"))
+    baseline_runs = {label: task15_runs[label] for label in
+                     ("ntp_seed42", "randomized_seed42", "zhang_seed42", "zhang_lambda1.0_seed42")
+                     if label in task15_runs}
+    if "zhang_seed42" in baseline_runs:
+        baseline_runs.pop("zhang_lambda1.0_seed42", None)
+    all_runs = {**baseline_runs, **VERIFIED_RUNS}
+    checkpoints = [BASE_MODEL, *map(str, all_runs.values())]
+    result_dir = VERIFIED_DIR
+    guarded(result_dir / "val_perplexity.json", checkpoints,
+            [sys.executable, "eval/eval_perplexity_explicit.py", "--checkpoints", *checkpoints,
+             "--base-model", BASE_MODEL, "--test-jsonl", LEAF / "synonyms_val.jsonl",
+             "--output", result_dir / "val_perplexity.json"], EXT, "validation perplexity")
+    guarded(result_dir / "val_concept_sets.json", checkpoints,
+            [sys.executable, "eval/eval_concept_sets.py", "--checkpoints", *checkpoints,
+             "--base-model", BASE_MODEL, "--test-jsonl", LEAF / "synonyms_val.jsonl",
+             "--output", result_dir / "val_concept_sets.json"], EXT, "validation concept sets")
+    guarded(result_dir / "perplexity.json", checkpoints,
+            [sys.executable, "eval/eval_perplexity_explicit.py", "--checkpoints", *checkpoints,
+             "--base-model", BASE_MODEL, "--test-jsonl", LEAF / "synonyms_test.jsonl",
+             "--output", result_dir / "perplexity.json"], EXT, "perplexity")
+    guarded(result_dir / "concept_sets.json", checkpoints,
+            [sys.executable, "eval/eval_concept_sets.py", "--checkpoints", *checkpoints,
+             "--base-model", BASE_MODEL, "--test-jsonl", LEAF / "synonyms_test.jsonl",
+             "--output", result_dir / "concept_sets.json"], EXT, "concept sets")
+    task15_dir = DRIVE_RESULTS / RESULT_DIR
+    for label, checkpoint in {"pretrained": BASE_MODEL, **all_runs}.items():
+        display_label = label.replace("_", " ")
+        csv_output = result_dir / f"sts_{display_label}.csv"
+        # STS is deterministic per checkpoint: reuse the baselines' files from Task 15
+        # or the screen rather than re-deriving them.
+        for previous in (task15_dir / csv_output.name, SCREEN_DIR / csv_output.name):
+            if not csv_output.is_file() and previous.is_file():
+                shutil.copy2(previous, csv_output)
+        if sts_covered(csv_output):
+            print("resume: STS already scored, skipping", display_label)
+            continue
+        mteb_args = [sys.executable, "eval/eval_mteb.py", "--base-model", BASE_MODEL,
+                     "--dataset", "c4", "--dataset-type", "embedding", "--tasks", "sts",
+                     "--run-label", display_label, "--csv-output", csv_output,
+                     "--mteb-output-root", result_dir / "mteb_raw"]
+        mteb_args += ["--no-adapter"] if checkpoint == BASE_MODEL else ["--adapter-path", checkpoint]
+        run(mteb_args, cwd=EXT)
+    guarded(result_dir / "swords.json", checkpoints,
+            [sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/eval_swords.py",
+             "--checkpoints", *checkpoints, "--tokenizer_path", BASE_MODEL, "--base_model", BASE_MODEL,
+             "--swords_json", MAIN / "data/swords/swords-v1.1_dev.json.gz",
+             "--results_json", result_dir / "swords.json", "--modes", "left", "full"], MAIN, "SWORDS")
+    # Paired intervals against every reference a claim below needs: the released
+    # baseline, its pruned-data twin, the continuity arm, and pooled contrast.
+    references = {"pretrained": BASE_MODEL, **{label: str(path) for label, path in baseline_runs.items()}}
+    for key in ("verified_zhang", "verified_hybrid", "verified_pool"):
+        if key in VERIFIED_RUNS:
+            references[key] = str(VERIFIED_RUNS[key])
+    for label, reference in references.items():
+        run([sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/paired_benchmark_ci.py",
+             "--kind", "swords", "--results-json", result_dir / "swords.json",
+             "--baseline-index", checkpoints.index(reference),
+             "--output", result_dir / f"swords_paired_ci_vs_{label}.json"], cwd=MAIN)
+    guarded(result_dir / "bm_semlex.json", checkpoints,
+            [sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/eval_bm_semlex.py",
+             "--checkpoints", *checkpoints, "--tokenizer_path", BASE_MODEL, "--base_model", BASE_MODEL,
+             "--data", MAIN / "data/bm_semlex/curated_200.tsv",
+             "--results_json", result_dir / "bm_semlex.json"], MAIN, "bm-semlex")
+    manifest = {"pretrained": BASE_MODEL, **{label.replace("_", " "): str(path) for label, path in all_runs.items()}}
+    (result_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    run([sys.executable, MAIN / "scripts/summarize_concept_experiments.py",
+         "--manifest", result_dir / "manifest.json", "--result-dir", result_dir,
+         "--output", result_dir / "flat_extension_table.csv"], cwd=MAIN)
+"""),
+        md("""## Verified gate (automatic, two claims, no selection)
+
+Reads only what the cell above wrote. Thresholds come from this table's own rows: STS within .005 of the arm being compared against, observed-target NLL within .10 of NTP, global NLL within .20 of NTP. It prints every check and its number; it selects nothing."""),
+        code(r"""
+def verified_gate():
+    table = VERIFIED_DIR / "flat_extension_table.csv"
+    if not table.is_file():
+        print("no verified table yet; run RUN_VERIFIED with RUN_EVAL first"); return
+    import csv
+    rows = {r["method"]: r for r in csv.DictReader(table.open())}
+    ntp = rows.get("ntp seed42")
+    if ntp is None:
+        print("NTP row missing from the verified table; cannot gate"); return
+    nll_ceiling = float(ntp["global_nll"]) + 0.20
+    obs_ceiling = float(ntp["swords_observed_target_nll"]) + 0.10
+    print(f"retention ceilings -> global NLL <= {nll_ceiling:.4f} | observed-target NLL <= {obs_ceiling:.4f}")
+
+    def beats(candidate, reference_label, sts_reference):
+        # (all_pass, checks) for candidate vs one reference, paired on SWORDS dev.
+        path = VERIFIED_DIR / f"swords_paired_ci_vs_{reference_label}.json"
+        run_path = VERIFIED_RUNS.get(candidate)
+        row = rows.get(candidate.replace("_", " "))
+        if row is None or run_path is None or not path.is_file():
+            return None, {}
+        checks = {}
+        for metric, key, want_negative in (("gap", "GAP", False), ("auroc", "AUROC", False),
+                                           ("alternatives_nll", "acceptedNLL", True)):
+            got = _ci(path, run_path, metric)
+            checks[key] = bool(got and got[1] and ((got[0] < 0) == want_negative))
+        checks["STS"] = float(row["sts_mean"]) >= float(sts_reference["sts_mean"]) - 0.005
+        checks["globalNLL"] = float(row["global_nll"]) <= nll_ceiling
+        checks["obsNLL"] = float(row["swords_observed_target_nll"]) <= obs_ceiling
+        return all(checks.values()), checks
+
+    def show(title, candidate, reference_label):
+        ref_row = rows.get(reference_label.replace("_", " "))
+        if ref_row is None:
+            print(f"  {title:44s} reference row missing"); return
+        ok, checks = beats(candidate, reference_label, ref_row)
+        if ok is None:
+            print(f"  {title:44s} not scored yet"); return
+        failed = [k for k, v in checks.items() if not v]
+        print(f"  {title:44s} {'PASS' if ok else 'FAIL'}" + ("" if ok else f"   failed: {', '.join(failed)}"))
+
+    print("\n== data effect: pruned positives alone ==")
+    zhang_label = "zhang_seed42" if "zhang_seed42" in rows or "zhang seed42" in rows else "zhang_lambda1.0_seed42"
+    show("verified_zhang vs zhang (original data)", "verified_zhang", zhang_label)
+    print("\n== claim 1: contrast helps (vs verified_zhang, same data) ==")
+    for arm in ("verified_pool", "verified_rank", "verified_list_uniform", "verified_list_verifier"):
+        show(f"{arm} vs verified_zhang", arm, "verified_zhang")
+    print("\n== claim 1, against the released baseline on original data ==")
+    for arm in ("verified_pool", "verified_rank", "verified_list_uniform", "verified_list_verifier"):
+        show(f"{arm} vs zhang", arm, zhang_label)
+    print("\n== claim 2: per-positive ranking helps (vs verified_pool) ==")
+    show("verified_rank vs verified_pool", "verified_rank", "verified_pool")
+    print("\n== decompositions ==")
+    show("verified_list_uniform vs verified_pool  (within-positive calibration)", "verified_list_uniform", "verified_pool")
+    show("verified_hybrid vs verified_zhang        (continuity arm on clean data)", "verified_hybrid", "verified_zhang")
+    print("\nNothing is selected here.  Confirm across seeds only what passes its own claim; "
+          "SWORDS test stays locked until then.")
+
+verified_gate()
 """),
         md("""## Reporting
 

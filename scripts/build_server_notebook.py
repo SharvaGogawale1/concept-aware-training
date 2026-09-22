@@ -138,6 +138,11 @@ RUN_HYBRID  = False   # Zhang + alternative-only auxiliary term (5 arms) and the
                       # Colab has picked one; then set SELECTED_HYBRID and run only that.
 SELECTED_HYBRID = None  # e.g. "within_kl:0.5" -- transferred from the 1B gate, never tuned here
 RUN_NEGATIVE_CONTROLS = False  # clean/fragments negative diagnostic; not method selection
+RUN_VERIFIED = False  # six arms from synonyms_train_verified.jsonl, one slot objective each,
+                      # scored in their own directory against Task 15's NTP and Zhang
+VERIFIED_SMOKE_STEPS = 0     # >0: ~that many steps per arm, print first-step magnitudes, train nothing else
+VERIFIED_LAMBDA = 1.0        # weight on the slot objective for pool/rank/list arms -- declared, not tuned
+VERIFIED_GAMMA  = 0.0625     # the continuity arm's gamma from the dev frontier: Qwen .0625, Llama .125
 RUN_EVAL    = True    # score these arms AND the Task 15 comparators: SWORDS with paired
                       # bootstrap intervals, STS, perplexity, concept sets, bm-semlex
 SPACY_GPU   = True    # only matters if this model still needs extraction
@@ -150,6 +155,8 @@ for _name, _value in {"GPU_ID": GPU_ID, "CONCEPT_MODEL": MODEL, "HF_TOKEN": HF_T
                       "RUN_DATA": RUN_DATA, "RUN_SCREEN": RUN_SCREEN,
                       "RUN_HYBRID": RUN_HYBRID, "SELECTED_HYBRID": SELECTED_HYBRID,
                       "RUN_NEGATIVE_CONTROLS": RUN_NEGATIVE_CONTROLS,
+                      "RUN_VERIFIED": RUN_VERIFIED, "VERIFIED_SMOKE_STEPS": VERIFIED_SMOKE_STEPS,
+                      "VERIFIED_LAMBDA": VERIFIED_LAMBDA, "VERIFIED_GAMMA": VERIFIED_GAMMA,
                       "RUN_CONFIRM": RUN_CONFIRM, "RUN_EVAL": RUN_EVAL,
                       "RUN_MULTISEED": RUN_MULTISEED, "SPACY_GPU": SPACY_GPU}.items():
     if _value is not None:
@@ -164,7 +171,7 @@ print("GPU", os.environ["CUDA_VISIBLE_DEVICES"],
       "|", os.environ.get("CONCEPT_MODEL", "(default)"),
       "| alpha", os.environ.get("SELECTED_ALPHA", "(screen)"),
       "| beta", os.environ.get("SELECTED_BETA", "(screen)"),
-      "| stages:", " ".join(stage for stage in ("RUN_DATA", "RUN_SCREEN", "RUN_HYBRID",
+      "| stages:", " ".join(stage for stage in ("RUN_DATA", "RUN_SCREEN", "RUN_HYBRID", "RUN_VERIFIED",
                                                 "RUN_CONFIRM", "RUN_EVAL")
                             if os.environ.get(stage) == "1"))
 '''
@@ -282,6 +289,8 @@ RUN_CONFIRM = _flag("RUN_CONFIRM", False)
 # Task 15b only, and only after the 1B gate has chosen an arm.
 RUN_HYBRID = _flag("RUN_HYBRID", False)
 RUN_NEGATIVE_CONTROLS = _flag("RUN_NEGATIVE_CONTROLS", False)
+RUN_VERIFIED = _flag("RUN_VERIFIED", False)
+VERIFIED_SMOKE_STEPS = int(float(os.environ.get("VERIFIED_SMOKE_STEPS", "0")))
 RUN_EVAL = _flag("RUN_EVAL", True)
 # Skip any run whose artefacts already exist.  A killed job resumes from here.
 RESUME_FINISHED_RUNS = True
@@ -681,6 +690,13 @@ RENAME = [
     ('save_runs(OBJECTIVE_RUNS, f"task15b{_TAG_SUFFIX}")', 'save_runs(OBJECTIVE_RUNS, "task15b")'),
     ('sync_small_artifacts(path, f"task15b_logs{_TAG_SUFFIX}/{label}")',
      'sync_small_artifacts(path, LOG_DIR / "task15b_logs" / label)'),
+    # The verified-supervision stage: same per-model layout, no tag suffix.
+    ('VERIFIED_DIR = DRIVE_RESULTS / f"task15b_verified{_TAG_SUFFIX}"',
+     'VERIFIED_DIR = MODEL_OUT / "task15b_verified"'),
+    ('load_runs(f"task15b_verified{_TAG_SUFFIX}")', 'load_runs("task15b_verified")'),
+    ('save_runs(VERIFIED_RUNS, f"task15b_verified{_TAG_SUFFIX}")', 'save_runs(VERIFIED_RUNS, "task15b_verified")'),
+    ('sync_small_artifacts(path, f"task15b_verified_logs{_TAG_SUFFIX}/{label}")',
+     'sync_small_artifacts(path, LOG_DIR / "task15b_verified_logs" / label)'),
     # 15b scores its arms against Task 15's, so it reads that notebook's result
     # directory -- which is why both must run with the same CONCEPT_BASE.
     ("task15_dir = DRIVE_RESULTS / RESULT_DIR", "task15_dir = RESULT_DIR"),
