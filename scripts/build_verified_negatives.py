@@ -123,6 +123,19 @@ def single_token(word: str) -> bool:
     except Exception:
         return False
 
+def trainer_ids(words, exclude):
+    """Mirror of the trainer's slot rule: " word" must be ONE token, deduplicated, and
+    not the observed target's id.  A mirror, not the loader itself -- say so in the paper."""
+    kept, seen = [], set(exclude)
+    for w in words:
+        try:
+            ids = tok.encode(" " + str(w).strip(), add_special_tokens=False)
+        except Exception:
+            continue
+        if len(ids) == 1 and ids[0] not in seen:
+            seen.add(ids[0]); kept.append(ids[0])
+    return kept
+
 # ---- the verifier ---------------------------------------------------------------------
 class Verifier:
     def __init__(self):
@@ -229,13 +242,22 @@ def flush(rows, dst):
                     (drop if pj.get(_normalise(syn), 1.0) <= a.theta else keep).append(syn)
                 target["synonyms_pruned"] = [[s, round(pj[_normalise(s)], 4)] for s in drop]
                 target["synonyms"] = keep
+                # Score of every KEPT positive too: the listwise arm weights positives by
+                # it, and a weight that exists only for the ones thrown away is no use.
+                target["synonym_scores"] = [round(pj.get(_normalise(s), 1.0), 4) for s in keep]
                 stats["positives_seen"] += len(keep) + len(drop)
                 stats["positives_pruned"] += len(drop)
             # What the TRAINER would keep: single-token alternative AND single-token negative.
-            alt_ok = any(single_token(s) for s in target.get("synonyms", []))
-            neg_ok = any(single_token(n) for n in target["negatives"])
+            tid = tok.encode(" " + str(target["word"]).strip(), add_special_tokens=False)
+            tid = set(tid) if len(tid) == 1 else set()
+            alt_ids = trainer_ids(target.get("synonyms", []), tid)
+            neg_ids = trainer_ids(target["negatives"], tid | set(alt_ids))
+            alt_ok, neg_ok = bool(alt_ids), bool(neg_ids)
             stats["slots_with_single_token_alternative"] += alt_ok
             stats["effective_slots"] += alt_ok and neg_ok
+            # Where per-positive ranking can differ from pooled contrast at all.
+            stats["slots_multi_positive_with_negative"] += (len(alt_ids) >= 2) and neg_ok
+            stats["slots_multi_positive"] += len(alt_ids) >= 2
             if negs and a.sample:
                 key = (target.get("pos", "?"), "small" if len(target.get("synonyms", [])) <= 2 else "large")
                 sample_pool[key].append({
@@ -302,6 +324,10 @@ report = {
     "slots_with_single_token_alternative": stats["slots_with_single_token_alternative"],
     "effective_slots": stats["effective_slots"],
     "effective_contrastive_coverage": stats["effective_slots"] / max(stats["slots_with_single_token_alternative"], 1),
+    "slots_multi_positive": stats["slots_multi_positive"],
+    "slots_multi_positive_with_negative": stats["slots_multi_positive_with_negative"],
+    "share_of_effective_slots_where_rank_differs_from_pool":
+        stats["slots_multi_positive_with_negative"] / max(stats["effective_slots"], 1),
     "unique_pairs_scored": len(verifier.cache), "seconds": round(time.time() - t0, 1),
     "rejection_reasons": dict(reasons),
 }
