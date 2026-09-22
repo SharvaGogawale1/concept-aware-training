@@ -22,7 +22,21 @@ parser.add_argument("notebook")
 parser.add_argument("--gpu")
 parser.add_argument("--base", default=".", help="CONCEPT_BASE: holds outputs/")
 parser.add_argument("--model-tag", default="qwen3-1.7b-base")
+parser.add_argument("--stage", choices=["hybrid", "verified"], default="hybrid",
+                    help="hybrid: the frontier screen (default); verified: the six verified-supervision arms")
+parser.add_argument("--smoke-steps", type=int, default=0,
+                    help="verified stage only: >0 trains ~that many steps per arm and prints magnitudes")
+parser.add_argument("--gamma", type=float, default=None,
+                    help="verified stage only: continuity arm's gamma (default per model: llama .125, qwen .0625)")
 args = parser.parse_args()
+if args.stage == "verified":
+    # The verified pass must not relaunch the hybrid screen: those arms resume by
+    # manifest, and RUN_HYBRID=True would otherwise retrain nothing but still add
+    # the five hybrid checkpoints to a table this stage keeps separate on purpose.
+    FLAGS.update({"RUN_HYBRID": "False", "RUN_VERIFIED": "True",
+                  "VERIFIED_SMOKE_STEPS": str(args.smoke_steps),
+                  "VERIFIED_GAMMA": str(args.gamma if args.gamma is not None
+                                        else (0.125 if "llama" in args.model_tag else 0.0625))})
 
 # ---- what is already trained -------------------------------------------------
 manifests = Path(args.base) / "outputs" / args.model_tag / "run_manifests"
