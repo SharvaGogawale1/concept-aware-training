@@ -124,16 +124,28 @@ for tid, rows in by_target.items():
 lm = {}
 if a.swords_results:
     entries = json.loads(Path(a.swords_results).read_text())
-    entry = next((e for e in entries if a.lm_checkpoint is None or e["checkpoint"] == a.lm_checkpoint), entries[0])
+    if a.lm_checkpoint is None:
+        entry = entries[0]
+    else:
+        matches = [e for e in entries if e["checkpoint"] == a.lm_checkpoint]
+        if not matches:
+            raise SystemExit(f"--lm-checkpoint {a.lm_checkpoint!r} not in {a.swords_results}; "
+                             f"available: {[e['checkpoint'] for e in entries][:6]} ...")
+        entry = matches[0]
     for mode in ("left", "full"):
         per = {r["target_id"]: r["auroc"] for r in entry[mode]["per_target"] if r.get("auroc") is not None}
         common = sorted(set(per) & set(aurocs))
         diffs = [aurocs[t] - per[t] for t in common]
+        # The two AUROCs are over each side's own scoreable candidates; report how
+        # often the candidate COUNTS differ so the pairing is not overstated.
+        lm_n = {r["target_id"]: r.get("n") for r in entry[mode]["per_target"]}
+        n_mismatch = sum(1 for t in common if lm_n.get(t) is not None and lm_n[t] != len(by_target[t]))
         lm[mode] = {"checkpoint": entry["checkpoint"], "targets": len(common),
                     "lm_auroc": sum(per[t] for t in common) / len(common),
                     "verifier_auroc_same_targets": sum(aurocs[t] for t in common) / len(common),
                     "paired_mean_diff": sum(diffs) / len(diffs),
-                    "share_targets_verifier_wins": sum(d > 0 for d in diffs) / len(diffs)}
+                    "share_targets_verifier_wins": sum(d > 0 for d in diffs) / len(diffs),
+                    "targets_with_different_candidate_counts": n_mismatch}
 
 # ---- operating points: what the pipeline's thresholds would actually deliver --------
 accepted = [s for it, s in zip(items, preserved) if it[2] >= CONSERVATIVE]

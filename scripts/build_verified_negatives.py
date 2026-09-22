@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Verified concept supervision: NLI-mined negatives, and optionally pruned positives.
+"""Verifier-filtered concept supervision: NLI-mined negatives, optionally pruned positives.
+
+Nothing here is human-validated: the verifier's errors are part of the experiment.
 
 Replaces the contextual-cosine ceiling in `build_contrastive_negatives.py`, which let
 only tokenizer fragments through (in 23/31 trainable slots every negative was a letter
@@ -49,7 +51,10 @@ p.add_argument("--chunk-rows", type=int, default=100, help="rows scored per veri
 p.add_argument("--start", type=int, default=0); p.add_argument("--end", type=int, default=None)
 p.add_argument("--limit", type=int, default=None, help="pilot: only this many rows")
 p.add_argument("--fake-nli", action="store_true", help="random verifier scores (tests only)")
+p.add_argument("--overwrite", action="store_true", help="replace an existing --output")
 a = p.parse_args()
+if Path(a.output).exists() and not a.overwrite:
+    raise SystemExit(f"{a.output} exists; pass --overwrite to replace it (a restart would discard a finished shard)")
 
 # ---- shared filters from the existing miner -----------------------------------------
 ext = a.ext or next((str(c) for c in (Path("external/learning-concepts/data"),
@@ -191,12 +196,13 @@ def candidates_for(target, pool, reasons):
     for cand in pool.get("topk_tokens", []):
         if len(kept) >= a.max_candidates:
             break
-        clean = _normalise(cand)
+        surface = str(cand).strip()            # original casing, for the word test
+        clean = _normalise(cand)               # lowercased, for matching only
         if not clean or clean in pos_norm:
             reasons["positive_or_empty"] += 1; continue
         if stem(clean) in pos_stems:
             reasons["morphological_variant"] += 1; continue
-        if not is_word_like(clean, wn_pos, target["word"]):
+        if not is_word_like(surface, wn_pos, target["word"]):
             reasons["not_word_like"] += 1; continue
         cs = _synsets_cached(_wordnet_form(clean), wn_pos)
         if not cs:
@@ -239,12 +245,15 @@ def flush(rows, dst):
                 pj = {j["cand"]: j["score"] for j in jobs if j["kind"] == "pos"}
                 keep, drop = [], []
                 for syn in target.get("synonyms", []):
-                    (drop if pj.get(_normalise(syn), 1.0) <= a.theta else keep).append(syn)
-                target["synonyms_pruned"] = [[s, round(pj[_normalise(s)], 4)] for s in drop]
+                    score = pj.get(_normalise(syn))          # None = never scored
+                    (drop if score is not None and score <= a.theta else keep).append(syn)
+                target["synonyms_pruned"] = [[s, pj[_normalise(s)]] for s in drop]
                 target["synonyms"] = keep
-                # Score of every KEPT positive too: the listwise arm weights positives by
-                # it, and a weight that exists only for the ones thrown away is no use.
-                target["synonym_scores"] = [round(pj.get(_normalise(s), 1.0), 4) for s in keep]
+                # Score of every KEPT positive too, full precision, None where the
+                # verifier never saw it: the listwise arm weights positives by this,
+                # and "not checked" must never read as "fully confident".
+                target["synonym_scores"] = [pj.get(_normalise(s)) for s in keep]
+                stats["positives_unscored"] += sum(pj.get(_normalise(s)) is None for s in keep)
                 stats["positives_seen"] += len(keep) + len(drop)
                 stats["positives_pruned"] += len(drop)
             # What the TRAINER would keep: single-token alternative AND single-token negative.
@@ -321,6 +330,7 @@ report = {
     "candidates_verified": stats["candidates_verified"], "negatives_kept": stats["negatives_kept"],
     "negatives_per_covered_slot": stats["negatives_kept"] / max(stats["slots_with_negatives"], 1),
     "positives_seen": stats["positives_seen"], "positives_pruned": stats["positives_pruned"],
+    "positives_unscored": stats["positives_unscored"],
     "slots_with_single_token_alternative": stats["slots_with_single_token_alternative"],
     "effective_slots": stats["effective_slots"],
     "effective_contrastive_coverage": stats["effective_slots"] / max(stats["slots_with_single_token_alternative"], 1),
