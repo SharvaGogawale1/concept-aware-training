@@ -71,13 +71,24 @@ def _counts_cached(word: str):
 def _synsets_cached(form: str, pos: str):
     return frozenset(wn.synsets(form, pos=pos))
 
+# Quantifiers and determiners that WordNet lists as adjectives or nouns and the LM pool
+# offers freely ("in both ways", "a group of three").  Seen in the pilot sample; a slot
+# never needs them as negatives, and they are not what a substitution benchmark rejects.
+STOPLIST = {"both", "other", "such", "same", "several", "various", "many", "much", "few",
+            "less", "more", "most", "each", "every", "another", "either", "neither",
+            "some", "none", "half", "whole", "total", "entire", "single", "double",
+            "first", "second", "third", "last", "next", "previous", "former", "latter",
+            "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+            "ten", "hundred", "thousand", "million", "billion", "dozen", "hundreds",
+            "thousands", "millions", "billions", "dozens", "lots", "plenty"}
+
 def is_word_like(candidate: str, wn_pos: str, target: str) -> bool:
     """Alphabetic, >= 4 letters, target's capitalisation class, and the requested POS is
     the word's dominant WordNet POS -- zero SemCor counts allowed.  Looser than the
     strict filter (which required a count >= 2 and left 3/31 slots), because the
     verifier now carries the meaning test; this only has to keep fragments out."""
     s = str(candidate).strip()
-    if not s.isalpha() or len(s) < 4:
+    if not s.isalpha() or len(s) < 4 or s.lower() in STOPLIST:
         return False
     if s[0].isupper() and not str(target).strip()[:1].isupper():
         return False
