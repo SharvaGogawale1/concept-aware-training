@@ -26,6 +26,8 @@ parser.add_argument("--stage", choices=["hybrid", "verified"], default="hybrid",
                     help="hybrid: the frontier screen (default); verified: the six verified-supervision arms")
 parser.add_argument("--smoke-steps", type=int, default=0,
                     help="verified stage only: >0 trains ~that many steps per arm and prints magnitudes")
+parser.add_argument("--smoke-only", action="store_true",
+                    help="verified stage only: stop after the smoke run instead of training")
 parser.add_argument("--gamma", type=float, default=None,
                     help="verified stage only: continuity arm's gamma (default per model: llama .125, qwen .0625)")
 args = parser.parse_args()
@@ -38,6 +40,7 @@ if args.stage == "verified":
     # RUN_SCREEN on and spend hours training eight arms this stage never reads.
     FLAGS.update({"RUN_HYBRID": "False", "RUN_SCREEN": "False", "RUN_VERIFIED": "True",
                   "VERIFIED_SMOKE_STEPS": str(args.smoke_steps),
+                  "VERIFIED_SMOKE_ONLY": "True" if args.smoke_only else "False",
                   "VERIFIED_GAMMA": str(args.gamma if args.gamma is not None
                                         else (0.125 if "llama" in args.model_tag else 0.0625))})
 

@@ -92,6 +92,10 @@ RUN_NEGATIVE_CONTROLS = False
 #   os.environ["VERIFIED_GAMMA"]  = "0.125"  the continuity arm's gamma: Llama .125, Qwen .0625
 RUN_VERIFIED = False
 VERIFIED_SMOKE_STEPS = 0
+# With VERIFIED_SMOKE_STEPS > 0: True = smoke, print, stop (read it by hand);
+# False = smoke, apply the declared lambda rule automatically, record the
+# decision, then train and evaluate in the same pass -- the unattended path.
+VERIFIED_SMOKE_ONLY = False
 RUN_EVAL = False
 # Skip any run whose adapter is already on Drive.  /content is wiped between
 # Colab sessions, so without this the screen -> gate -> confirm sequence has to
@@ -1409,6 +1413,32 @@ DISCRIMINATIVE = ("pool", "rank", "list_uniform", "list_verifier")
 
 if RUN_VERIFIED:
     assert VERIFIED_TRAIN.is_file(), f"{VERIFIED_TRAIN} missing: run scripts/build_verified_negatives.py first"
+    # ---- data-sanity gate: the mechanical version of "read the 50-row sample" ----
+    # Ranges come from the Qwen pilot (coverage .35, 9.8% pruned, 0 unscored).  Out of
+    # range stops the pass here, before a GPU-hour is spent; the sample is still read
+    # by a person afterwards, this only catches a run that went visibly wrong.
+    n_rows = sum(1 for _ in VERIFIED_TRAIN.open(encoding="utf-8"))
+    assert n_rows >= 3000, f"{VERIFIED_TRAIN} has {n_rows} rows; the merged file should have ~3200"
+    _report = None
+    for _cand in (DRIVE_RESULTS / f"verified_report{_TAG_SUFFIX}.json",
+                  VERIFIED_TRAIN.parent / "verified_report.json"):
+        if _cand.is_file():
+            _report = json.loads(_cand.read_text()); break
+    if _report is None:
+        print("no miner report found beside the data; the data-sanity gate is skipped")
+    else:
+        _checks = {
+            "negative_coverage in [.15,.70]": .15 <= _report["negative_coverage"] <= .70,
+            "effective_contrastive_coverage >= .15": _report["effective_contrastive_coverage"] >= .15,
+            "positives pruned share in [.02,.30]":
+                .02 <= _report["positives_pruned"] / max(_report["positives_seen"], 1) <= .30,
+            "positives unscored share < .05":
+                _report.get("positives_unscored", 0) / max(_report["positives_seen"], 1) < .05,
+            "rows >= 3000": _report["rows"] >= 3000,
+        }
+        for _k, _v in _checks.items():
+            print(f"  data gate  {'PASS' if _v else 'FAIL'}  {_k}")
+        assert all(_checks.values()), "verified data is outside the piloted ranges; stopping before training"
     DATA_HASH = sha256(VERIFIED_TRAIN)
     DATA_TAG = f"data_{DATA_HASH[:8]}"
     print("verified train file:", VERIFIED_TRAIN, "| sha256", DATA_HASH[:16] + "...",
@@ -1448,6 +1478,7 @@ if RUN_VERIFIED:
 
     if VERIFIED_SMOKE_STEPS:
         print(f"== smoke: ~{VERIFIED_SMOKE_STEPS} steps per arm, first logged magnitudes ==")
+        magnitudes = {}
         for label in ("verified_zhang", "verified_pool", "verified_rank",
                       "verified_list_uniform", "verified_list_verifier"):
             out = launch(label, ARMS[label], prefix="smoke_", epochs=1,
@@ -1456,20 +1487,39 @@ if RUN_VERIFIED:
             rows = [json.loads(l) for l in history.read_text().splitlines() if l.strip()] \
                 if history.is_file() else []
             first = next((r for r in rows if "concept_loss" in r), None)
-            print(f"  {label:24s}", {k: round(first[k], 4) for k in
-                  ("ce_loss", "concept_loss", "concept_eligible_share") if k in first}
-                  if first else "no logged step (raise VERIFIED_SMOKE_STEPS above logging_steps)")
-        print("Rule, declared before any result: VERIFIED_LAMBDA = 1.0 unless an arm's first "
-              "concept_loss is more than 3x or less than 1/3 of verified_zhang's, in which case "
-              "the nearest power of two.  Set it in the environment, set VERIFIED_SMOKE_STEPS = 0, rerun.")
-    else:
+            magnitudes[label] = {k: first[k] for k in
+                                 ("ce_loss", "concept_loss", "concept_eligible_share") if first and k in first}
+            print(f"  {label:24s}", {k: round(v, 4) for k, v in magnitudes[label].items()}
+                  or "no logged step (raise VERIFIED_SMOKE_STEPS above logging_steps)")
+        # The rule, declared before any result was read: lambda = 1.0 unless the median
+        # first-step concept_loss of the four discriminative arms is more than 3x or less
+        # than 1/3 of verified_zhang's, in which case the nearest power of two of the
+        # ratio, clamped to [1/16, 16].  One lambda for all four arms.
+        import math, statistics
+        ref = magnitudes.get("verified_zhang", {}).get("concept_loss")
+        disc = [magnitudes[k]["concept_loss"] for k in ("verified_pool", "verified_rank",
+                "verified_list_uniform", "verified_list_verifier") if magnitudes[k].get("concept_loss")]
+        decision = {"rule": "1.0 unless median(discriminative)/verified_zhang outside [1/3, 3]; then 2^round(log2(zhang/median)) clamped to [1/16,16]",
+                    "magnitudes": magnitudes, "reference": ref, "median_discriminative": None,
+                    "lambda_before": VERIFIED_LAMBDA, "lambda_after": VERIFIED_LAMBDA}
+        if ref and disc:
+            med = statistics.median(disc)
+            decision["median_discriminative"] = med
+            if med > 3 * ref or med < ref / 3:
+                decision["lambda_after"] = float(min(16, max(1 / 16, 2 ** round(math.log2(ref / med)))))
+        VERIFIED_LAMBDA = decision["lambda_after"]
+        (VERIFIED_DIR / "verified_lambda_decision.json").write_text(json.dumps(decision, indent=2))
+        print(f"lambda rule -> {VERIFIED_LAMBDA}  (recorded in {VERIFIED_DIR / 'verified_lambda_decision.json'})")
+        if VERIFIED_SMOKE_ONLY:
+            print("VERIFIED_SMOKE_ONLY: stopping here; set it False (or VERIFIED_SMOKE_STEPS = 0) to train.")
+    if not (VERIFIED_SMOKE_STEPS and VERIFIED_SMOKE_ONLY):
         for label, spec in ARMS.items():
             VERIFIED_RUNS[label] = launch(label, spec)
         for label, path in VERIFIED_RUNS.items():
             sync_small_artifacts(path, f"task15b_verified_logs{_TAG_SUFFIX}/{label}")
         save_runs(VERIFIED_RUNS, f"task15b_verified{_TAG_SUFFIX}")
 
-if RUN_VERIFIED and RUN_EVAL and not VERIFIED_SMOKE_STEPS:
+if RUN_VERIFIED and RUN_EVAL and not (VERIFIED_SMOKE_STEPS and VERIFIED_SMOKE_ONLY):
     # Its OWN result directory: the baselines plus these six, about ten checkpoints,
     # instead of re-scoring the whole screen every time an arm is added.
     VERIFIED_RUNS = restore_all(VERIFIED_RUNS)

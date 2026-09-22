@@ -140,7 +140,8 @@ SELECTED_HYBRID = None  # e.g. "within_kl:0.5" -- transferred from the 1B gate, 
 RUN_NEGATIVE_CONTROLS = False  # clean/fragments negative diagnostic; not method selection
 RUN_VERIFIED = False  # six arms from synonyms_train_verified.jsonl, one slot objective each,
                       # scored in their own directory against Task 15's NTP and Zhang
-VERIFIED_SMOKE_STEPS = 0     # >0: ~that many steps per arm, print first-step magnitudes, train nothing else
+VERIFIED_SMOKE_STEPS = 0     # >0: smoke ~that many steps per arm first and apply the lambda rule
+VERIFIED_SMOKE_ONLY = False  # True: stop after the smoke and print; False: continue to train + eval
 VERIFIED_LAMBDA = 1.0        # weight on the slot objective for pool/rank/list arms -- declared, not tuned
 VERIFIED_GAMMA  = 0.0625     # the continuity arm's gamma from the dev frontier: Qwen .0625, Llama .125
 RUN_EVAL    = True    # score these arms AND the Task 15 comparators: SWORDS with paired
@@ -156,6 +157,7 @@ for _name, _value in {"GPU_ID": GPU_ID, "CONCEPT_MODEL": MODEL, "HF_TOKEN": HF_T
                       "RUN_HYBRID": RUN_HYBRID, "SELECTED_HYBRID": SELECTED_HYBRID,
                       "RUN_NEGATIVE_CONTROLS": RUN_NEGATIVE_CONTROLS,
                       "RUN_VERIFIED": RUN_VERIFIED, "VERIFIED_SMOKE_STEPS": VERIFIED_SMOKE_STEPS,
+                      "VERIFIED_SMOKE_ONLY": VERIFIED_SMOKE_ONLY,
                       "VERIFIED_LAMBDA": VERIFIED_LAMBDA, "VERIFIED_GAMMA": VERIFIED_GAMMA,
                       "RUN_CONFIRM": RUN_CONFIRM, "RUN_EVAL": RUN_EVAL,
                       "RUN_MULTISEED": RUN_MULTISEED, "SPACY_GPU": SPACY_GPU}.items():
@@ -291,6 +293,7 @@ RUN_HYBRID = _flag("RUN_HYBRID", False)
 RUN_NEGATIVE_CONTROLS = _flag("RUN_NEGATIVE_CONTROLS", False)
 RUN_VERIFIED = _flag("RUN_VERIFIED", False)
 VERIFIED_SMOKE_STEPS = int(float(os.environ.get("VERIFIED_SMOKE_STEPS", "0")))
+VERIFIED_SMOKE_ONLY = _flag("VERIFIED_SMOKE_ONLY", False)
 RUN_EVAL = _flag("RUN_EVAL", True)
 # Skip any run whose artefacts already exist.  A killed job resumes from here.
 RESUME_FINISHED_RUNS = True
@@ -697,6 +700,7 @@ RENAME = [
     ('save_runs(VERIFIED_RUNS, f"task15b_verified{_TAG_SUFFIX}")', 'save_runs(VERIFIED_RUNS, "task15b_verified")'),
     ('sync_small_artifacts(path, f"task15b_verified_logs{_TAG_SUFFIX}/{label}")',
      'sync_small_artifacts(path, LOG_DIR / "task15b_verified_logs" / label)'),
+    ('DRIVE_RESULTS / f"verified_report{_TAG_SUFFIX}.json"', 'MODEL_OUT / "verified_report.json"'),
     # 15b scores its arms against Task 15's, so it reads that notebook's result
     # directory -- which is why both must run with the same CONCEPT_BASE.
     ("task15_dir = DRIVE_RESULTS / RESULT_DIR", "task15_dir = RESULT_DIR"),
