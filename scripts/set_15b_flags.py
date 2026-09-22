@@ -33,7 +33,10 @@ if args.stage == "verified":
     # The verified pass must not relaunch the hybrid screen: those arms resume by
     # manifest, and RUN_HYBRID=True would otherwise retrain nothing but still add
     # the five hybrid checkpoints to a table this stage keeps separate on purpose.
-    FLAGS.update({"RUN_HYBRID": "False", "RUN_VERIFIED": "True",
+    # And never the screen either: on a machine that has no screen arms for this
+    # model (Llama on the server) the manifest check would otherwise turn
+    # RUN_SCREEN on and spend hours training eight arms this stage never reads.
+    FLAGS.update({"RUN_HYBRID": "False", "RUN_SCREEN": "False", "RUN_VERIFIED": "True",
                   "VERIFIED_SMOKE_STEPS": str(args.smoke_steps),
                   "VERIFIED_GAMMA": str(args.gamma if args.gamma is not None
                                         else (0.125 if "llama" in args.model_tag else 0.0625))})
@@ -54,7 +57,7 @@ for name in ("task15", "task15b"):
           + ("" if not gone else "  -> " + ", ".join(gone)))
     missing_any = missing_any or (bool(gone) and name == "task15b")
 
-if missing_any:
+if missing_any and args.stage != "verified":
     FLAGS["RUN_SCREEN"] = "True"
     print("\n=> RUN_SCREEN=True: a screen arm must be retrained to re-enter the table.")
 else:

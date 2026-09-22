@@ -981,7 +981,10 @@ if RUN_HYBRID or RUN_NEGATIVE_CONTROLS:
 
 Every checkpoint of this pass — Task 15's arms and this notebook's — is scored by the same evaluators. A validation pass of the perplexity and concept-set evaluators exists only for choosing $\\alpha$; every other number is C4 test, SWORDS dev, the nine STS tasks and bm-semlex."""),
         code(r"""
-if RUN_EVAL:
+if RUN_EVAL and not OBJECTIVE_RUNS:
+    print("no screen arms for this model here; the screen evaluation is skipped, "
+          "not run on the baselines alone")
+if RUN_EVAL and OBJECTIVE_RUNS:
     OBJECTIVE_RUNS = restore_all(OBJECTIVE_RUNS)
     # The question is "does this beat Zhang", so Zhang's arms sit IN this table:
     # pretrained as the reference row, NTP and augmented NTP as matched controls,
