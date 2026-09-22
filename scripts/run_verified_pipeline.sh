@@ -21,12 +21,29 @@ log() { echo "[$(date '+%F %T')] $*"; }
 git -C $REPO pull -q --ff-only || log "git pull failed; continuing with the checkout as is"
 
 # ---- 1. verified data ------------------------------------------------------------
-if [ -f "$OUT/verified_report.json" ] && [ -f "$D/embedding/synonyms_train_verified.jsonl" ]; then
+# Output from a miner older than the synonym_scores fix has no scores for the kept
+# positives; list_verifier would silently fall back to uniform.  Treat it as stale.
+stale=0
+if [ -f "$D/embedding/synonyms_train_verified.jsonl" ] && ! head -c 200000 "$D/embedding/synonyms_train_verified.jsonl" | grep -q synonym_scores; then
+  log "existing verified file predates the synonym_scores fix; it will be re-mined"
+  stale=1; rm -f "$D/embedding/synonyms_train_verified.jsonl" "$OUT/verified_report.json"
+fi
+if [ "$stale" = 0 ] && [ -f "$OUT/verified_report.json" ] && [ -f "$D/embedding/synonyms_train_verified.jsonl" ]; then
   log "verified data present; skipping the miner"
 else
   if pgrep -f "build_verified_negatives.py.*$D/embedding/synonyms_train.jsonl" >/dev/null; then
     log "a miner for $TAG is already running; waiting for its report"
     while [ ! -f "$OUT/verified_report.json" ]; do sleep 120; done
+    if ! head -c 200000 "$D/embedding/synonyms_train_verified.jsonl" | grep -q synonym_scores; then
+      log "that miner was the old code (no synonym_scores); re-mining"
+      rm -f "$D/embedding/synonyms_train_verified.jsonl" "$OUT/verified_report.json"
+      CUDA_VISIBLE_DEVICES=$GPU python $REPO/scripts/build_verified_negatives.py \
+        --source $D/embedding/synonyms_train.jsonl --topk "$D/prompting/topk_*.jsonl" \
+        --model "$MODEL" --ext concept_aware/learning-concepts/data \
+        --output $D/embedding/synonyms_train_verified.jsonl \
+        --report $OUT/verified_report.json --sample $OUT/verified_sample_50.csv \
+        --prune-positives --overwrite 2>&1 | tee -a verify_$TAG.log
+    fi
   else
     # A partial output with no report is a killed run: replace it.
     [ -f "$D/embedding/synonyms_train_verified.jsonl" ] && rm -f "$D/embedding/synonyms_train_verified.jsonl"
