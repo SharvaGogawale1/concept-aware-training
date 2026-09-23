@@ -80,6 +80,8 @@ RUN_CONFIRM = False
 #       (empty = all); a second process on another GPU can take the rest.
 #   os.environ["SELECTED_HYBRID"] = "uniform:0.125"  with RUN_MULTISEED: that arm's seeds
 #       123 and 2024, on the same original file as Task 15's three-seed baselines.
+#   os.environ["RESULT_TAG"] = "_confirm"; os.environ["EVAL_ARMS"] = "zhang_plus_uniform_g0.125_seed42,..."
+#       score this pass into task15b_screen_confirm with only those 15b arms (+ baselines).
 RUN_HYBRID = False
 # The two negative-quality controls (clean / fragments).  They are a diagnostic
 # for the demoted contrastive term, NOT a method-selection run, so they are off
@@ -852,7 +854,11 @@ Candidates must occur in the model’s top-100 next-token pool, match POS, lie o
 MODEL_TAG = BASE_MODEL.split("/")[-1].lower()
 LEAF = DATA / "c4" / MODEL_TAG / "embedding"
 NEG_TRAIN = LEAF / "synonyms_train_conservative_negatives.jsonl"
-SCREEN_DIR = DRIVE_RESULTS / f"task15b_screen{_TAG_SUFFIX}"
+# RESULT_TAG ("_confirm") scores this pass into its own directory instead of
+# re-scoring every screen arm; EVAL_ARMS restricts which 15b arms enter it.
+RESULT_TAG = os.environ.get("RESULT_TAG", "")
+SCREEN_DIR = DRIVE_RESULTS / f"task15b_screen{_TAG_SUFFIX}{RESULT_TAG}"
+SCREEN_DIR_MAIN = DRIVE_RESULTS / f"task15b_screen{_TAG_SUFFIX}"
 SCREEN_DIR.mkdir(parents=True, exist_ok=True)
 if RUN_DATA:
     run([sys.executable, "data/build_contrastive_negatives.py",
@@ -1066,8 +1072,17 @@ Every checkpoint of this pass — Task 15's arms and this notebook's — is scor
 if RUN_EVAL and not OBJECTIVE_RUNS:
     print("no screen arms for this model here; the screen evaluation is skipped, "
           "not run on the baselines alone")
+# Score only these 15b arms in this pass (labels, comma list; empty = all).  With
+# RESULT_TAG this keeps a confirmation pass to ~10 checkpoints instead of the
+# whole screen; the manifest on disk keeps every arm regardless.
+EVAL_ONLY = [x.strip() for x in os.environ.get("EVAL_ARMS", "").split(",") if x.strip()]
+if RUN_EVAL and EVAL_ONLY:
+    missing_eval = sorted(set(EVAL_ONLY) - set(OBJECTIVE_RUNS))
+    assert not missing_eval, f"EVAL_ARMS names arms this manifest lacks: {missing_eval}"
+    OBJECTIVE_RUNS = {k: v for k, v in OBJECTIVE_RUNS.items() if k in EVAL_ONLY}
 if RUN_EVAL and OBJECTIVE_RUNS:
     OBJECTIVE_RUNS = restore_all(OBJECTIVE_RUNS)
+    SCREEN_DIR.mkdir(parents=True, exist_ok=True)
     # The question is "does this beat Zhang", so Zhang's arms sit IN this table:
     # pretrained as the reference row, NTP and augmented NTP as matched controls,
     # randomized at both weights as the semantic control, and set-marginal at
@@ -1117,9 +1132,9 @@ if RUN_EVAL and OBJECTIVE_RUNS:
         csv_output = result_dir / f"sts_{display_label}.csv"
         # STS is deterministic per checkpoint and Task 15 already scored the
         # baselines, so reuse its file rather than spending 3.5 min re-deriving it.
-        previous = task15_dir / csv_output.name
-        if not csv_output.is_file() and previous.is_file():
-            shutil.copy2(previous, csv_output)
+        for previous in (task15_dir / csv_output.name, SCREEN_DIR_MAIN / csv_output.name):
+            if not csv_output.is_file() and previous.is_file():
+                shutil.copy2(previous, csv_output)
         if sts_covered(csv_output):
             print("resume: STS already scored, skipping", display_label)
             continue

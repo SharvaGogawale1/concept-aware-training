@@ -30,6 +30,10 @@ parser.add_argument("--hybrid-arms", default="",
 parser.add_argument("--selected-hybrid", default=None,
                     help='hybrid stage only: the selected arm, e.g. "uniform:0.125"; with --multiseed trains its seeds')
 parser.add_argument("--multiseed", action="store_true", help="add seeds 123 and 2024 (hybrid / confirm15)")
+parser.add_argument("--result-tag", default="",
+                    help='hybrid stage only: score into task15b_screen<tag>, e.g. "_confirm"')
+parser.add_argument("--eval-arms", default="",
+                    help="hybrid stage only: with --result-tag, only these 15b arm labels enter the table")
 parser.add_argument("--no-screen", action="store_true",
                     help="hybrid stage only: never turn RUN_SCREEN on (a machine without the screen arms)")
 parser.add_argument("--confirm-arms", default="",
@@ -49,6 +53,7 @@ parser.add_argument("--no-eval", action="store_true",
 args = parser.parse_args()
 if args.stage == "hybrid":
     FLAGS.update({"HYBRID_ARMS": f'"{args.hybrid_arms}"',
+                  "RESULT_TAG": f'"{args.result_tag}"', "EVAL_ARMS": f'"{args.eval_arms}"',
                   "SELECTED_HYBRID": f'"{args.selected_hybrid}"' if args.selected_hybrid else "None",
                   "RUN_MULTISEED": "True" if args.multiseed else "False",
                   "RUN_EVAL": "False" if args.no_eval else "True"})
@@ -122,5 +127,5 @@ print("\nchanged:" if changed else "\nnothing to change (already set)")
 print("\n".join(changed))
 print("\nflags now:")
 for line in cell["source"]:
-    if re.match(r"^\s*(GPU_ID|MODEL|HF_TOKEN|RUN_|SELECTED_|SPACY_|VERIFIED_|HYBRID_|CONFIRM_)", line):
+    if re.match(r"^\s*(GPU_ID|MODEL|HF_TOKEN|RUN_|SELECTED_|SPACY_|VERIFIED_|HYBRID_|CONFIRM_|RESULT_|EVAL_)", line):
         print("   " + line.rstrip())

@@ -17,16 +17,31 @@ p.add_argument("--base", default=".")
 p.add_argument("--force", action="store_true", help="replace a manifest that has other entries (backed up first)")
 a = p.parse_args()
 runs = Path(a.base).resolve() / "concept_aware" / "runs" / a.model_tag
-wanted = {"ntp_seed42": ("ntp", "lambda_0.0_beta_0.0"),
-          "zhang_seed42": ("zhang_marginal", "lambda_1.0_beta_0.0"),
-          "randomized_seed42": ("randomized", "lambda_0.25_beta_0.0")}
+wanted = {"ntp_seed42": ("ntp", 42, "lambda_0.0_beta_0.0"),
+          "zhang_seed42": ("zhang_marginal", 42, "lambda_1.0_beta_0.0"),
+          "randomized_seed42": ("randomized", 42, "lambda_0.25_beta_0.0")}
+# Present when copied, absent otherwise: the seed-matched Zhang references the 15b
+# confirmation pairs against, and the other three-seed baselines if they came too.
+optional = {f"{family}_seed{seed}": (method, seed, value)
+            for seed in (123, 2024)
+            for family, method, value in (("zhang", "zhang_marginal", "lambda_1.0_beta_0.0"),
+                                          ("ntp", "ntp", "lambda_0.0_beta_0.0"),
+                                          ("randomized", "randomized", "lambda_0.25_beta_0.0"),
+                                          ("randomized_lambda1.0", "randomized", "lambda_1.0_beta_0.0"),
+                                          ("augmented_ntp", "augmented_ntp", "lambda_0.0_beta_0.0"))}
+def present(path):
+    return (path / "adapter_config.json").is_file() and (path / "adapter_model.safetensors").is_file()
 manifest, missing = {}, []
-for label, (method, value) in wanted.items():
-    path = runs / method / "seed_42" / value
-    if (path / "adapter_config.json").is_file() and (path / "adapter_model.safetensors").is_file():
+for label, (method, seed, value) in wanted.items():
+    path = runs / method / f"seed_{seed}" / value
+    if present(path):
         manifest[label] = str(path)
     else:
         missing.append(str(path))
+for label, (method, seed, value) in optional.items():
+    path = runs / method / f"seed_{seed}" / value
+    if present(path):
+        manifest[label] = str(path)
 if missing:
     raise SystemExit("missing adapters (need adapter_config.json + adapter_model.safetensors):\n  " + "\n  ".join(missing))
 out = Path(a.base).resolve() / "outputs" / a.model_tag / "run_manifests" / "task15.json"

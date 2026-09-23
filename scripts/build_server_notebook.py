@@ -142,6 +142,8 @@ SELECTED_HYBRID = None  # e.g. "uniform:0.125" -- set from the gate, never tuned
                         # RUN_MULTISEED it trains that arm's seeds 123 and 2024
 HYBRID_ARMS = ""        # train only these grid arms, "kind:weight,..." ("" = all); lets two
                         # processes split the grid across GPUs -- the manifest merges
+RESULT_TAG  = ""        # "_confirm": score into task15b_screen_confirm instead of re-scoring the screen
+EVAL_ARMS   = ""        # with RESULT_TAG: only these 15b arms enter that table ("" = all)
 RUN_NEGATIVE_CONTROLS = False  # clean/fragments negative diagnostic; not method selection
 RUN_VERIFIED = False  # six arms from synonyms_train_verified.jsonl, one slot objective each,
                       # scored in their own directory against Task 15's NTP and Zhang
@@ -166,6 +168,7 @@ for _name, _value in {"GPU_ID": GPU_ID, "CONCEPT_MODEL": MODEL, "HF_TOKEN": HF_T
                       "VERIFIED_SMOKE_ONLY": VERIFIED_SMOKE_ONLY,
                       "VERIFIED_LAMBDA": VERIFIED_LAMBDA, "VERIFIED_GAMMA": VERIFIED_GAMMA,
                       "VERIFIED_ARMS": VERIFIED_ARMS, "HYBRID_ARMS": HYBRID_ARMS,
+                      "RESULT_TAG": RESULT_TAG, "EVAL_ARMS": EVAL_ARMS,
                       "RUN_CONFIRM": RUN_CONFIRM, "RUN_EVAL": RUN_EVAL,
                       "RUN_MULTISEED": RUN_MULTISEED, "SPACY_GPU": SPACY_GPU}.items():
     if _value is not None:
@@ -690,8 +693,10 @@ RENAME = [
     ('plt.savefig(DRIVE_RESULTS / RESULT_DIR / "training_curves.png"', 'plt.savefig(RESULT_DIR / "training_curves.png"'),
     # Task 15b keys its artifacts the same way: inside this model's own output
     # directory, with no tag suffix, because the server gives every model its own.
-    ('SCREEN_DIR = DRIVE_RESULTS / f"task15b_screen{_TAG_SUFFIX}"',
-     'SCREEN_DIR = MODEL_OUT / "task15b_screen"'),
+    ('SCREEN_DIR = DRIVE_RESULTS / f"task15b_screen{_TAG_SUFFIX}{RESULT_TAG}"',
+     'SCREEN_DIR = MODEL_OUT / f"task15b_screen{RESULT_TAG}"'),
+    ('SCREEN_DIR_MAIN = DRIVE_RESULTS / f"task15b_screen{_TAG_SUFFIX}"',
+     'SCREEN_DIR_MAIN = MODEL_OUT / "task15b_screen"'),
     ('DRIVE_RESULTS / f"contrastive_negative_report{_TAG_SUFFIX}.json"',
      'MODEL_OUT / "contrastive_negative_report.json"'),
     ('DRIVE_RESULTS / f"contrastive_negative_report_{name}{_TAG_SUFFIX}.json"',
