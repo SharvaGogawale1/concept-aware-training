@@ -76,6 +76,10 @@ RUN_SCREEN = False
 RUN_CONFIRM = False
 # Task 15b only: Zhang's set marginal plus an alternative-only auxiliary term, and
 # the two negative-quality controls.  Seed 42 unless SELECTED_HYBRID is set.
+#   os.environ["HYBRID_ARMS"]     = "uniform:0.125,mass:0.125"  train only these grid arms
+#       (empty = all); a second process on another GPU can take the rest.
+#   os.environ["SELECTED_HYBRID"] = "uniform:0.125"  with RUN_MULTISEED: that arm's seeds
+#       123 and 2024, on the same original file as Task 15's three-seed baselines.
 RUN_HYBRID = False
 # The two negative-quality controls (clean / fragments).  They are a diagnostic
 # for the demoted contrastive term, NOT a method-selection run, so they are off
@@ -88,8 +92,10 @@ RUN_NEGATIVE_CONTROLS = False
 # prints first-step loss magnitudes for the pre-declared lambda rule, and
 # trains nothing else.  Weights are read from the environment so a Colab session
 # and the server twin declare them the same way:
-#   os.environ["VERIFIED_LAMBDA"] = "1.0"    weight on the slot objective (pool/rank/list)
+#   os.environ["VERIFIED_LAMBDA"] = "1.0"    weight on the slot objective (pool/rank/list, alt-only control)
 #   os.environ["VERIFIED_GAMMA"]  = "0.125"  the continuity arm's gamma: Llama .125, Qwen .0625
+#   os.environ["VERIFIED_ARMS"]   = "verified_alt_uniform"  train only these arms (empty =
+#       every arm); a final pass with it empty resumes them all and evaluates.
 RUN_VERIFIED = False
 VERIFIED_SMOKE_STEPS = 0
 # With VERIFIED_SMOKE_STEPS > 0: True = smoke, print, stop (read it by hand);
@@ -412,6 +418,9 @@ nltk.download("omw-1.4", quiet=True)
 run([sys.executable, MAIN / "builddataset/verify_task14_data.py",
      "--repo_root", MAIN, "--download_missing",
      "--report_json", DRIVE_RESULTS / "external_benchmark_integrity.json"], cwd=MAIN)
+# SemEval-07 and the fixed CoInCo subsets, derived from the pinned raw files above;
+# the script pins the derived digests and stops if a rebuild differs.
+run([sys.executable, MAIN / "builddataset/build_lexsub_benchmarks.py", "--repo_root", MAIN], cwd=MAIN)
 (DRIVE_RESULTS / "environment_freeze.txt").write_text(
     subprocess.check_output([sys.executable, "-m", "pip", "freeze"], text=True)
 )
@@ -442,7 +451,8 @@ def finished(path):
 def train_flat(method, seed, concept_weight, *, objective="set_marginal",
                slot_ntp_weight=None, contrast_beta=0.0, exclude_target=False,
                randomized=False, data_augmentation=False, epochs=5, train_file=None,
-               max_samples=None, batch=8, accum=2, alt_aux="none", alt_aux_weight=0.0):
+               max_samples=None, batch=8, accum=2, alt_aux="none", alt_aux_weight=0.0,
+               logging_steps=None, force=False):
     # The aux suffix is added only when the term is on, so every adapter trained
     # before it existed keeps its path and still resumes.
     aux_tag = "" if alt_aux == "none" else f"_aux_{alt_aux}_{alt_aux_weight}"
@@ -465,8 +475,13 @@ def train_flat(method, seed, concept_weight, *, objective="set_marginal",
     if data_augmentation: args += ["--use-data-augmentation"]
     if train_file: args += ["--train-file", train_file]
     if max_samples: args += ["--max-train-samples", max_samples]
+    if logging_steps: args += ["--logging-steps", logging_steps]
     # Released effective batch is 8 x 2 = 16; it is recorded in every config.
-    if RESUME_FINISHED_RUNS and finished(out):
+    if force:
+        # A measurement run (the verified smoke) must never be answered from an old
+        # adapter: its training_history.jsonl is appended to, not replaced.
+        shutil.rmtree(out, ignore_errors=True)
+    elif RESUME_FINISHED_RUNS and finished(out):
         print("resume: already trained, skipping", out)
         return out
     run(args, cwd=EXT)
@@ -640,19 +655,29 @@ if RUN_SCREEN:
         train_file=LEAF / "synonyms_train_aug5x.jsonl", data_augmentation=True)
     REPRO_RUNS["randomized_seed42"] = train_flat("randomized", 42, 0.25, randomized=True)
 
+# Which families get the extra seeds ("zhang,ntp"; empty = all five).  A machine
+# that only needs Zhang's other seeds as seed-matched references for 15b need
+# not spend four arms' worth of GPU on the rest.
+CONFIRM_FAMILIES = [x.strip() for x in os.environ.get("CONFIRM_ARMS", "").split(",") if x.strip()]
+def _confirm(family):
+    return not CONFIRM_FAMILIES or family in CONFIRM_FAMILIES
 if RUN_CONFIRM:
     for seed in SEEDS:
-        REPRO_RUNS[f"ntp_seed{seed}"] = train_flat("ntp", seed, 0.0)
-        REPRO_RUNS[f"augmented_ntp_seed{seed}"] = train_flat("augmented_ntp", seed, 0.0,
-            epochs=1, train_file=LEAF / "synonyms_train_aug5x.jsonl", data_augmentation=True)
-        REPRO_RUNS[f"randomized_seed{seed}"] = train_flat("randomized", seed, 0.25, randomized=True)
-        # Zhang runs the semantic control at lambda=0.25 while the headline
-        # concept arm runs at lambda=1.0.  Any claim that concept training does
-        # or does not beat the control needs it at the SAME weight, otherwise the
-        # comparison confounds the candidate sets with the mixing weight.
-        REPRO_RUNS[f"randomized_lambda1.0_seed{seed}"] = train_flat(
-            "randomized", seed, 1.0, randomized=True)
-        REPRO_RUNS[f"zhang_seed{seed}"] = train_flat("zhang_marginal", seed, 1.0)
+        if _confirm("ntp"):
+            REPRO_RUNS[f"ntp_seed{seed}"] = train_flat("ntp", seed, 0.0)
+        if _confirm("augmented_ntp"):
+            REPRO_RUNS[f"augmented_ntp_seed{seed}"] = train_flat("augmented_ntp", seed, 0.0,
+                epochs=1, train_file=LEAF / "synonyms_train_aug5x.jsonl", data_augmentation=True)
+        if _confirm("randomized"):
+            REPRO_RUNS[f"randomized_seed{seed}"] = train_flat("randomized", seed, 0.25, randomized=True)
+            # Zhang runs the semantic control at lambda=0.25 while the headline
+            # concept arm runs at lambda=1.0.  Any claim that concept training does
+            # or does not beat the control needs it at the SAME weight, otherwise the
+            # comparison confounds the candidate sets with the mixing weight.
+            REPRO_RUNS[f"randomized_lambda1.0_seed{seed}"] = train_flat(
+                "randomized", seed, 1.0, randomized=True)
+        if _confirm("zhang"):
+            REPRO_RUNS[f"zhang_seed{seed}"] = train_flat("zhang_marginal", seed, 1.0)
     # The lambda sweep already trained zhang_marginal at lambda=1.0 on seed 42, and
     # adapter_path() maps both calls to the same directory.  Two dict keys pointing at
     # one adapter would score it twice and report it as two arms.
@@ -917,6 +942,10 @@ and $\\nabla_z[-\\log P(S)] = p - q\\,\\mathbb{1}_S$: the set marginal is self-d
 
 **Gate, fixed before any of these is scored (SWORDS dev only):** STS $\\ge .5469$; GAP and AUROC above Zhang with paired intervals excluding zero; above randomized $\\lambda=.25$ on GAP and AUROC; global NLL $\\le$ NTP $+.20$; observed-target NLL $\\le$ NTP $+.10$. The smallest weight that passes is the method. If none passes, the result is the STS-vs-GAP frontier these arms trace, reported as a trade-off.
 
+- `mass` (declared 2026-09-23) — $-\\log P(A)$ alone: the uniform term minus its within-set KL half. At the same $\\gamma$ the two apply the same total push $1-P(A)$ to the alternative set and the same gradient $p_t$ to the observed token; they differ only in allocating that push by $q_a$ (the model's preference) instead of $1/|A|$ (hardest on the least likely alternative, which in this data is enriched for wrong ones). The screen showed `within_kl` alone paying nearly all of `uniform`'s STS cost for a fifth of its GAP, in both families. **Mass rule, declared before any result:** at the locked $\\gamma$ it joins the seed confirmation only if (1) its paired GAP interval against Zhang is above zero, (2) its paired GAP interval against `uniform` at the same $\\gamma$ reaches zero or above, and (3) $\\mathrm{STS}_{mass}-\\mathrm{STS}_{uniform}\\ge\\tfrac12(\\mathrm{STS}_{Zhang}-\\mathrm{STS}_{uniform})$. If it passes, the two larger weights are scored as a curve, never as a second selection. Its gradient on the observed token equals `uniform`'s, so it is not expected to recover observed-target NLL or content PPL.
+
+**Confirmation.** The selected arm at seeds 123 and 2024 on the same original file as Task 15's three-seed baselines, each seed gated against Zhang of the same seed. CoInCo dev (a fixed 800-target subset) is scored beside SWORDS dev for breadth; it is reported, not gated on.
+
 **The negatives.** A hand read of `negative_sample_50.csv` (2026-09-18): the contrastive loss only fires where a slot has an alternative (31/50), and in 23 of those 31 every negative is a letter or a word-prefix token; 2 of 31 have a semantically meaningful negative. The 0.35 similarity ceiling rejects every real word in a slot with rich alternatives, so only non-words survive, and WordNet lists them. Two controls settle what the published +.005 GAP was: `clean` (complete words in their dominant POS, plus antonyms of the observed word) and `fragments` (only what `clean` throws away). Effective coverage — slots with an alternative AND a negative — is printed for both; the raw 45.6% is not the supervised fraction."""),
         code(r"""
 NEG_VARIANTS = {"clean": ["--strict-lexical", "--antonyms"], "fragments": ["--fragments-only"]}
@@ -932,24 +961,73 @@ PREREGISTERED_GRID = [("uniform", 0.25), ("uniform", 0.5),
 # exactly how a pre-registration gets spent.  The curve was the pre-registered outcome
 # when nothing passed; adding points to a curve is resolution, not a second attempt.
 POSTHOC_GRID = [("uniform", 0.125), ("uniform", 0.0625)]
-HYBRID_GRID = PREREGISTERED_GRID + POSTHOC_GRID
-# "within_kl:0.5" -- set ONLY from the gate above, then rerun with RUN_MULTISEED.
+# Declared 2026-09-23, before any of it was trained.  `mass` is the uniform auxiliary
+# with its within-set KL half removed (uniform = mass + within_kl + log n, exactly):
+# same total push on the alternative set, same gradient on the observed token and on
+# every other token, differing ONLY in how the push is split among the alternatives
+# (q_a, the model's own preference, instead of 1/n).  The first weight is the family's
+# locked gamma from the frontier; the two above it are the curve, run only if the
+# first passes the rule in the decision cell.  Neither pre-registered nor post-hoc:
+# the mass rule below is its own, declared gate.
+LOCKED_GAMMA = 0.125 if MODEL_TAG.startswith("llama") else 0.0625
+MASS_GRID = [("mass", LOCKED_GAMMA * m) for m in (1, 2, 4)]
+HYBRID_GRID = PREREGISTERED_GRID + POSTHOC_GRID + MASS_GRID
+# "uniform:0.125" -- set ONLY from the gate below, then rerun with RUN_MULTISEED.
 SELECTED_HYBRID = os.environ.get("SELECTED_HYBRID")
+# Train only these grid arms in THIS process ("uniform:0.125,mass:0.125"; empty =
+# all).  Two processes on two GPUs can then split the arms; the manifest merges.
+HYBRID_ONLY = [(k, float(w)) for k, w in
+               (x.split(":") for x in os.environ.get("HYBRID_ARMS", "").split(",") if x.strip())]
+assert all(arm in HYBRID_GRID for arm in HYBRID_ONLY), f"HYBRID_ARMS not in the grid: {HYBRID_ONLY}"
+
+def hybrid_label(kind, weight, seed=42):
+    return f"zhang_plus_{kind}_g{weight}_seed{seed}"
+
+def dedupe_runs(runs):
+    # One label per adapter.  Older passes labelled the selected arm's seeds
+    # `calibrated_seed*` and popped the grid label; the grid label is the descriptive
+    # one, so a `calibrated_*` alias of an adapter that has another label is dropped.
+    by_path = {}
+    for label, path in runs.items():
+        by_path.setdefault(str(path), []).append(label)
+    keep = {}
+    for label, path in runs.items():
+        aliases = by_path[str(path)]
+        if label.startswith("calibrated_seed") and any(not a.startswith("calibrated_seed") for a in aliases):
+            continue
+        keep[label] = path
+    return keep
+
+def _merge_save(runs, name):
+    # Merge into what is on disk, never overwrite: another process may be adding
+    # disjoint arms to the same manifest right now.  Deduped AFTER the merge, or
+    # an alias dropped here would come straight back from disk.
+    merged = dedupe_runs({**load_runs(name), **runs})
+    save_runs(merged, name)
+    return merged
+
+OBJECTIVE_RUNS = dedupe_runs(OBJECTIVE_RUNS)
+
 if RUN_HYBRID:
     for kind, weight in HYBRID_GRID:
-        OBJECTIVE_RUNS[f"zhang_plus_{kind}_g{weight}_seed42"] = train_flat(
+        if HYBRID_ONLY and (kind, weight) not in HYBRID_ONLY:
+            continue
+        OBJECTIVE_RUNS[hybrid_label(kind, weight)] = train_flat(
             "zhang_plus_aux", 42, 1.0, alt_aux=kind, alt_aux_weight=weight)
-    # Confirmation of the arm the gate below selected.  RUN_CONFIRM is NOT used
-    # for this: that flag also relaunches the alternative-uniform and legacy
-    # contrastive arms, which are ablations here, not the method.
+        OBJECTIVE_RUNS = _merge_save(OBJECTIVE_RUNS, f"task15b{_TAG_SUFFIX}")
+    # Confirmation of the arm the gate below selected, at the other seeds, on the
+    # SAME original data as the Task 15 baselines, so the main table is mean +- sd
+    # over three seeds for every arm on one file.  RUN_CONFIRM is NOT used for this:
+    # that flag relaunches the alternative-uniform and legacy contrastive arms.
     if SELECTED_HYBRID:
         kind, weight = SELECTED_HYBRID.split(":"); weight = float(weight)
         assert (kind, weight) in HYBRID_GRID, "SELECTED_HYBRID must be one of the screened arms"
         for seed in SEEDS:
-            OBJECTIVE_RUNS[f"calibrated_seed{seed}"] = train_flat(
+            if seed == 42 or (HYBRID_ONLY and (kind, weight) not in HYBRID_ONLY):
+                continue                      # seed 42 IS the grid arm above
+            OBJECTIVE_RUNS[hybrid_label(kind, weight, seed)] = train_flat(
                 "zhang_plus_aux", seed, 1.0, alt_aux=kind, alt_aux_weight=weight)
-        # Same adapter as the seed-42 screen arm; one key per adapter.
-        OBJECTIVE_RUNS.pop(f"zhang_plus_{kind}_g{weight}_seed42", None)
+            OBJECTIVE_RUNS = _merge_save(OBJECTIVE_RUNS, f"task15b{_TAG_SUFFIX}")
 
 if RUN_NEGATIVE_CONTROLS:
     topk_glob = DATA / "c4" / MODEL_TAG / "prompting" / "topk_*.jsonl"
@@ -979,7 +1057,7 @@ if RUN_NEGATIVE_CONTROLS:
                 train_file=NEG_FILES[name])
 
 if RUN_HYBRID or RUN_NEGATIVE_CONTROLS:
-    save_runs(OBJECTIVE_RUNS, f"task15b{_TAG_SUFFIX}")
+    OBJECTIVE_RUNS = _merge_save(OBJECTIVE_RUNS, f"task15b{_TAG_SUFFIX}")
 """),
         md("""## Evaluation
 
@@ -999,6 +1077,11 @@ if RUN_EVAL and OBJECTIVE_RUNS:
     BASELINE_LABELS = ("ntp_seed42", "augmented_ntp_seed42", "randomized_seed42",
                        "randomized_lambda1.0_seed42", "zhang_seed42", "zhang_lambda1.0_seed42")
     baseline_runs = {label: task15_runs[label] for label in BASELINE_LABELS if label in task15_runs}
+    # Zhang's other seeds, when Task 15 trained them: the seed-matched references
+    # for the selected hybrid's confirmation.
+    for label in ("zhang_seed123", "zhang_seed2024"):
+        if label in task15_runs:
+            baseline_runs[label] = task15_runs[label]
     # RUN_CONFIRM in Task 15 pops zhang_lambda1.0_seed42 in favour of zhang_seed42;
     # both name ONE adapter, so keep whichever exists and never both.
     if "zhang_seed42" in baseline_runs:
@@ -1051,11 +1134,22 @@ if RUN_EVAL and OBJECTIVE_RUNS:
              "--checkpoints", *checkpoints, "--tokenizer_path", BASE_MODEL, "--base_model", BASE_MODEL,
              "--swords_json", MAIN / "data/swords/swords-v1.1_dev.json.gz",
              "--results_json", result_dir / "swords.json", "--modes", "left", "full"], MAIN, "SWORDS")
+    # A second human-labelled substitution benchmark, same evaluator, same metrics:
+    # a fixed 800-target subset of CoInCo dev (builddataset/build_lexsub_benchmarks.py).
+    # Reported for breadth beside SWORDS dev; no gate reads it.
+    guarded(result_dir / "coinco_dev.json", checkpoints,
+            [sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/eval_swords.py",
+             "--checkpoints", *checkpoints, "--tokenizer_path", BASE_MODEL, "--base_model", BASE_MODEL,
+             "--swords_json", MAIN / "data/lexsub/coinco_dev_sub800.json.gz",
+             "--results_json", result_dir / "coinco_dev.json", "--modes", "left", "full"], MAIN, "CoInCo dev")
     # One paired interval per reference, looked up by label so an index can never
     # drift onto the wrong arm.  vs zhang is the headline; vs randomized is what
     # says whether a gain is semantic rather than distributional; vs the selected
     # alternative-uniform arm is the only fair test of the contrastive term itself.
     references = {"pretrained": BASE_MODEL, **{label: str(path) for label, path in baseline_runs.items()}}
+    # The uniform hybrid at the locked gamma: the reference the mass rule pairs against.
+    if hybrid_label("uniform", LOCKED_GAMMA) in OBJECTIVE_RUNS:
+        references[hybrid_label("uniform", LOCKED_GAMMA)] = str(OBJECTIVE_RUNS[hybrid_label("uniform", LOCKED_GAMMA)])
     # EVERY alternative-only uniform arm is a reference, not just the selected one.
     # Contrastive has to beat the cheaper way of buying the same concept pressure,
     # which is turning alpha up.  A same-alpha comparison alone cannot show that:
@@ -1068,10 +1162,11 @@ if RUN_EVAL and OBJECTIVE_RUNS:
         if key.startswith("alternative_uniform"):
             references[key] = str(path)
     for label, reference in references.items():
-        run([sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/paired_benchmark_ci.py",
-             "--kind", "swords", "--results-json", result_dir / "swords.json",
-             "--baseline-index", checkpoints.index(reference),
-             "--output", result_dir / f"swords_paired_ci_vs_{label}.json"], cwd=MAIN)
+        for bench in ("swords", "coinco_dev"):
+            run([sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/paired_benchmark_ci.py",
+                 "--kind", "swords", "--results-json", result_dir / f"{bench}.json",
+                 "--baseline-index", checkpoints.index(reference),
+                 "--output", result_dir / f"{bench}_paired_ci_vs_{label}.json"], cwd=MAIN)
     guarded(result_dir / "bm_semlex.json", checkpoints,
             [sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/eval_bm_semlex.py",
              "--checkpoints", *checkpoints, "--tokenizer_path", BASE_MODEL, "--base_model", BASE_MODEL,
@@ -1291,6 +1386,15 @@ def _ci(path, run_path, metric):
         return d["candidate_minus_baseline"], (low * high > 0)
     return None
 
+def _ci_bounds(path, run_path, metric):
+    # The (low, high) 95% interval for one candidate in one paired-CI file.
+    if not Path(path).is_file():
+        return None
+    for entry in json.loads(Path(path).read_text()):
+        if str(entry["candidate"]) == str(run_path) and metric in entry["metrics"]:
+            return tuple(entry["metrics"][metric]["ci95"])
+    return None
+
 def hybrid_gate(verbose=True):
     rows = _gate_rows()
     if rows is None: return None
@@ -1331,11 +1435,12 @@ def hybrid_gate(verbose=True):
         checks["GAP>random"] = bool(got and got[1] and got[0] > 0)
 
         ok = all(checks.values())
-        posthoc = (kind, weight) in POSTHOC_GRID
+        posthoc = (kind, weight) in POSTHOC_GRID or (kind, weight) in MASS_GRID
         if verbose:
             failed = [k for k, v in checks.items() if not v]
             print(f"  {label:36} {'PASS' if ok else 'FAIL'}"
-                  f"{'  [post-hoc, not selectable]' if posthoc else ''}"
+                  f"{'  [post-hoc, not selectable]' if (kind, weight) in POSTHOC_GRID else ''}"
+                  f"{'  [mass: own rule below]' if (kind, weight) in MASS_GRID else ''}"
                   f"  STS {float(row['sts_mean']):.4f}"
                   f"  gNLL {float(row['global_nll']):.4f}"
                   f"  altNLL {float(row['swords_alternative_nll']):.3f}"
@@ -1343,6 +1448,10 @@ def hybrid_gate(verbose=True):
         # A post-hoc point never enters `passing`: it is reported on the frontier curve
         # and cannot become the method by passing a gate it was added after reading.
         if ok and not posthoc: passing.append((weight, kind))
+
+    mass_rule(rows, vs_zhang)
+    confirmation(rows)
+    breadth(rows)
 
     if not passing:
         print("\nNo hybrid arm passes every gate. That is the result: report the "
@@ -1352,6 +1461,70 @@ def hybrid_gate(verbose=True):
     print(f"\nSELECTED_HYBRID = {kind}:{weight}   (smallest passing weight of "
           f"{len(passing)}; set it in the environment and rerun with RUN_MULTISEED)")
     return f"{kind}:{weight}"
+
+def mass_rule(rows, vs_zhang):
+    # The declared rule for the mass arm at the locked gamma (see the markdown above).
+    print("\n== mass rule: uniform minus its within-set KL half, at the locked gamma ==")
+    mass_label, uni_label = hybrid_label("mass", LOCKED_GAMMA), hybrid_label("uniform", LOCKED_GAMMA)
+    zhang = rows.get("zhang seed42") or rows.get("zhang lambda1.0 seed42")
+    mass_row, uni_row = rows.get(mass_label.replace("_", " ")), rows.get(uni_label.replace("_", " "))
+    mass_path = OBJECTIVE_RUNS.get(mass_label)
+    if not (mass_row and uni_row and zhang and mass_path):
+        print("  not scored yet (needs", mass_label, "and", uni_label, "in this table)"); return
+    vs_uni = _ci_bounds(SCREEN_DIR / f"swords_paired_ci_vs_{uni_label}.json", mass_path, "gap")
+    got = _ci(vs_zhang, mass_path, "gap")
+    sts = {k: float(r["sts_mean"]) for k, r in (("mass", mass_row), ("uniform", uni_row), ("zhang", zhang))}
+    need = sts["uniform"] + 0.5 * (sts["zhang"] - sts["uniform"])
+    rule = {
+        "(1) GAP above Zhang, paired interval > 0": bool(got and got[1] and got[0] > 0),
+        "(2) GAP vs uniform at the same gamma, interval reaches >= 0": bool(vs_uni and vs_uni[1] >= 0),
+        f"(3) STS {sts['mass']:.4f} >= {need:.4f} (half of uniform's STS cost given back)": sts["mass"] >= need,
+    }
+    for k, v in rule.items():
+        print(f"  {'PASS' if v else 'FAIL'}  {k}")
+    print("  -> " + (f"mass passes: confirm it across seeds (SELECTED_HYBRID=mass:{LOCKED_GAMMA}) and "
+                     f"score the curve (HYBRID_ARMS=mass:{LOCKED_GAMMA * 2},mass:{LOCKED_GAMMA * 4})"
+                     if all(rule.values()) else "mass does not pass; uniform stays the method"))
+
+def confirmation(rows):
+    # The selected arm's other seeds, each against Zhang of the SAME seed.
+    if not SELECTED_HYBRID:
+        return
+    kind, weight = SELECTED_HYBRID.split(":"); weight = float(weight)
+    print(f"\n== confirmation: {kind}:{weight} vs Zhang, seed-matched ==")
+    for seed in (42, 123, 2024):
+        label = hybrid_label(kind, weight, seed)
+        zlabel = "zhang_seed42" if seed == 42 and "zhang seed42" in rows else f"zhang_seed{seed}"
+        if seed == 42 and zlabel not in rows and "zhang lambda1.0 seed42" in rows:
+            zlabel = "zhang_lambda1.0_seed42"
+        run_path, row = OBJECTIVE_RUNS.get(label), rows.get(label.replace("_", " "))
+        zrow = rows.get(zlabel.replace("_", " "))
+        path = SCREEN_DIR / f"swords_paired_ci_vs_{zlabel}.json"
+        if not (run_path and row and zrow and path.is_file()):
+            print(f"  seed {seed:5d}  not scored yet ({label} vs {zlabel})"); continue
+        checks = {}
+        for metric, key, want_negative in (("gap", "GAP", False), ("auroc", "AUROC", False),
+                                           ("alternatives_nll", "acceptedNLL", True)):
+            got = _ci(path, run_path, metric)
+            checks[key] = bool(got and got[1] and ((got[0] < 0) == want_negative))
+        checks["STS"] = float(row["sts_mean"]) >= float(zrow["sts_mean"]) - STS_ALLOWANCE
+        failed = [k for k, v in checks.items() if not v]
+        print(f"  seed {seed:5d}  {'PASS' if not failed else 'FAIL'}"
+              f"  STS {float(row['sts_mean']):.4f} vs {float(zrow['sts_mean']):.4f}"
+              + ("" if not failed else f"   failed: {', '.join(failed)}"))
+
+def breadth(rows):
+    # SWORDS dev and CoInCo dev side by side for every hybrid arm, vs Zhang.  Reported, not gated.
+    zlabel = "zhang_seed42" if "zhang seed42" in rows else "zhang_lambda1.0_seed42"
+    print(f"\n== breadth: GAP vs {zlabel}, SWORDS dev | CoInCo dev (800 targets) ==")
+    for label, run_path in OBJECTIVE_RUNS.items():
+        if not label.startswith("zhang_plus_"):
+            continue
+        cells = []
+        for bench in ("swords", "coinco_dev"):
+            got = _ci(SCREEN_DIR / f"{bench}_paired_ci_vs_{zlabel}.json", run_path, "gap")
+            cells.append(f"{got[0]:+.4f}{'*' if got[1] else ' '}" if got else "   n/a  ")
+        print(f"  {label:40s} {cells[0]} | {cells[1]}")
 
 GATE_CHOICE = hybrid_gate()
 """),
@@ -1396,10 +1569,15 @@ Same training file for every arm (`synonyms_train_verified.jsonl`: positives pru
 | `verified_rank` | $-\frac1{|A|}\sum_a\log\frac{p_a}{p_a+P(N)}$ | pruned | yes |
 | `verified_list_uniform` | $-\frac1{|A|}\sum_a\log\frac{p_a}{P(A)+P(N)}$ | pruned | yes |
 | `verified_list_verifier` | $-\sum_a w_a\log\frac{p_a}{P(A)+P(N)},\ w_a\propto\max(s_a-\theta,0)$ | pruned | yes |
+| `verified_alt_uniform` | $-\frac1{|A|}\sum_a\log p_a$ (full softmax) | pruned | — |
 
 The four discriminative arms exclude the observed token from $A$ and keep slot NTP at 1.0 (the trainer refuses any other combination, and refuses `--contrast-beta` or `--alt-aux` on top of them). A slot carries the term only when at least one alternative **and** one negative survive tokenization; otherwise it contributes exactly zero and stays in the denominator.
 
 Two claims, gated separately below and never merged: **contrast helps** (a discriminative arm beats `verified_zhang` on GAP and AUROC with paired intervals excluding zero, inside the STS and observed-target allowances) and **per-positive helps** (`verified_rank` beats `verified_pool` the same way). Beating the old noisy baseline establishes neither.
+
+The comparison against `verified_zhang` is confounded: the discriminative arms also drop the target-inclusive marginal, which the screen already showed is load-bearing. `verified_alt_uniform` is the matched control for them -- same file, same $\lambda$, observed token excluded, slot NTP 1.0, no negatives. It still differs in two ways besides the negatives, and the paper must say so: it supervises every slot with an alternative (not only the ~30% with a negative), and it asks for absolute probability rather than probability relative to $N$.
+
+The method itself (the mass arm and the selected hybrid's seeds) is trained and confirmed in the hybrid section above, on Zhang's original file, so the main table never depends on this verifier. This stage only asks whether the verified negatives add anything.
 
 Adapters live under a method name that carries the training file's SHA-256, and a resume is refused if the recorded hash differs, so a pruned-positive run can never reuse an older adapter."""),
         code(r"""
@@ -1410,6 +1588,7 @@ VERIFIED_LAMBDA = float(os.environ.get("VERIFIED_LAMBDA", "1.0"))
 VERIFIED_GAMMA = float(os.environ.get("VERIFIED_GAMMA") or (0.125 if MODEL_TAG == "llama-3.2-1b" else 0.0625))
 VERIFIED_RUNS = load_runs(f"task15b_verified{_TAG_SUFFIX}")
 DISCRIMINATIVE = ("pool", "rank", "list_uniform", "list_verifier")
+VERIFIED_ONLY = [x.strip() for x in os.environ.get("VERIFIED_ARMS", "").split(",") if x.strip()]
 
 if RUN_VERIFIED:
     assert VERIFIED_TRAIN.is_file(), f"{VERIFIED_TRAIN} missing: run scripts/build_verified_negatives.py first"
@@ -1461,45 +1640,66 @@ if RUN_VERIFIED:
         "verified_rank":          dict(objective="rank"),
         "verified_list_uniform":  dict(objective="list_uniform"),
         "verified_list_verifier": dict(objective="list_verifier"),
+        # Matched control for the four above: same lambda, same exclusion and slot
+        # NTP, no negatives.
+        "verified_alt_uniform":   dict(objective="uniform", alt_only=True),
     }
+    unknown = set(VERIFIED_ONLY) - set(ARMS)
+    assert not unknown, f"VERIFIED_ARMS names unknown arms: {sorted(unknown)}"
 
-    def launch(label, spec, *, prefix="", epochs=5, max_samples=None):
+    def launch(label, spec, *, seed=42, prefix="", epochs=5, max_samples=None,
+               logging_steps=None, force=False):
         objective = spec["objective"]
         weight = spec.get("weight", VERIFIED_LAMBDA)
         alt_aux, alt_w = spec.get("alt_aux", "none"), spec.get("alt_aux_weight", 0.0)
         kw = dict(objective=objective, train_file=VERIFIED_TRAIN, epochs=epochs,
-                  max_samples=max_samples, alt_aux=alt_aux, alt_aux_weight=alt_w)
-        if objective in DISCRIMINATIVE:
+                  max_samples=max_samples, alt_aux=alt_aux, alt_aux_weight=alt_w,
+                  logging_steps=logging_steps, force=force)
+        if objective in DISCRIMINATIVE or spec.get("alt_only"):
             kw.update(exclude_target=True, slot_ntp_weight=1.0)
         # The data hash is part of the METHOD name, so this path can only ever hold
         # an adapter trained on this exact file -- and the recorded hash is checked
         # anyway before a resume is accepted.
         method = f"{prefix}{label}_{DATA_TAG}"
         aux_tag = "" if alt_aux == "none" else f"_aux_{alt_aux}_{alt_w}"
-        expected = adapter_path(method, 42, f"lambda_{weight}_beta_0.0{aux_tag}")
-        if RESUME_FINISHED_RUNS and finished(expected):
+        expected = adapter_path(method, seed, f"lambda_{weight}_beta_0.0{aux_tag}")
+        if not force and RESUME_FINISHED_RUNS and finished(expected):
             recorded = json.loads((expected / "concept_training_config.json").read_text()) \
                 if (expected / "concept_training_config.json").is_file() else {}
             if recorded.get("train_file_sha256") != DATA_HASH:
                 raise RuntimeError(f"{expected} was trained on a different file "
                                    f"({recorded.get('train_file_sha256')}); refusing to resume it")
-        return train_flat(method, 42, weight, **kw)
+        return train_flat(method, seed, weight, **kw)
 
     if VERIFIED_SMOKE_STEPS:
         print(f"== smoke: ~{VERIFIED_SMOKE_STEPS} steps per arm, first logged magnitudes ==")
         magnitudes = {}
         for label in ("verified_zhang", "verified_pool", "verified_rank",
                       "verified_list_uniform", "verified_list_verifier"):
+            # force: always a fresh run (never an old adapter's history), and a
+            # logging cadence well inside the smoke so it writes TRAINING rows.
             out = launch(label, ARMS[label], prefix="smoke_", epochs=1,
-                         max_samples=VERIFIED_SMOKE_STEPS * 16)
+                         max_samples=VERIFIED_SMOKE_STEPS * 16,
+                         logging_steps=max(1, VERIFIED_SMOKE_STEPS // 8), force=True)
             history = out / "training_history.jsonl"
             rows = [json.loads(l) for l in history.read_text().splitlines() if l.strip()] \
                 if history.is_file() else []
-            first = next((r for r in rows if "concept_loss" in r), None)
+            # Training rows only.  The end-of-epoch EVAL row also carries concept_loss,
+            # computed on synonyms_val.jsonl, which has no verified negatives -- so for
+            # every discriminative arm it reads exactly 0.0.  Reading it is how the
+            # 2026-09-23 pass silently skipped this rule.  Training rows are the ones
+            # that carry contrast_loss; eval rows never do.
+            train_rows = [r for r in rows if "contrast_loss" in r and "eval_loss" not in r
+                          and r.get("concept_loss") is not None]
+            if not train_rows:
+                raise RuntimeError(f"{label}: the smoke wrote no training row to {history}; "
+                                   "the lambda rule cannot be applied")
+            first = train_rows[0]
             magnitudes[label] = {k: first[k] for k in
-                                 ("ce_loss", "concept_loss", "concept_eligible_share") if first and k in first}
-            print(f"  {label:24s}", {k: round(v, 4) for k, v in magnitudes[label].items()}
-                  or "no logged step (raise VERIFIED_SMOKE_STEPS above logging_steps)")
+                                 ("step", "ce_loss", "concept_loss", "concept_eligible_share") if k in first}
+            magnitudes[label]["smoke_mean_concept_loss"] = \
+                sum(r["concept_loss"] for r in train_rows) / len(train_rows)
+            print(f"  {label:24s}", {k: round(v, 4) for k, v in magnitudes[label].items()})
         # The rule, declared before any result was read: lambda = 1.0 unless the median
         # first-step concept_loss of the four discriminative arms is more than 3x or less
         # than 1/3 of verified_zhang's, in which case the nearest power of two of the
@@ -1508,7 +1708,11 @@ if RUN_VERIFIED:
         ref = magnitudes.get("verified_zhang", {}).get("concept_loss")
         disc = [magnitudes[k]["concept_loss"] for k in ("verified_pool", "verified_rank",
                 "verified_list_uniform", "verified_list_verifier") if magnitudes[k].get("concept_loss")]
-        decision = {"rule": "1.0 unless median(discriminative)/verified_zhang outside [1/3, 3]; then 2^round(log2(zhang/median)) clamped to [1/16,16]",
+        # A zero or missing magnitude is a broken measurement, never "no change".
+        if not ref or len(disc) != 4:
+            raise RuntimeError(f"lambda rule needs five non-zero first-step magnitudes, got "
+                               f"reference={ref}, discriminative={disc}")
+        decision = {"rule": "1.0 unless median(discriminative)/verified_zhang outside [1/3, 3]; then 2^round(log2(zhang/median)) clamped to [1/16,16]; first TRAINING row of each smoke",
                     "magnitudes": magnitudes, "reference": ref, "median_discriminative": None,
                     "lambda_before": VERIFIED_LAMBDA, "lambda_after": VERIFIED_LAMBDA}
         if ref and disc:
@@ -1523,10 +1727,15 @@ if RUN_VERIFIED:
             print("VERIFIED_SMOKE_ONLY: stopping here; set it False (or VERIFIED_SMOKE_STEPS = 0) to train.")
     if not (VERIFIED_SMOKE_STEPS and VERIFIED_SMOKE_ONLY):
         for label, spec in ARMS.items():
+            if VERIFIED_ONLY and label not in VERIFIED_ONLY:
+                continue
             VERIFIED_RUNS[label] = launch(label, spec)
+            # Merge into what is on disk, not overwrite it: a second process may be
+            # training disjoint arms against the same manifest right now.
+            VERIFIED_RUNS = {**load_runs(f"task15b_verified{_TAG_SUFFIX}"), **VERIFIED_RUNS}
+            save_runs(VERIFIED_RUNS, f"task15b_verified{_TAG_SUFFIX}")
         for label, path in VERIFIED_RUNS.items():
             sync_small_artifacts(path, f"task15b_verified_logs{_TAG_SUFFIX}/{label}")
-        save_runs(VERIFIED_RUNS, f"task15b_verified{_TAG_SUFFIX}")
 
 if RUN_VERIFIED and RUN_EVAL and not (VERIFIED_SMOKE_STEPS and VERIFIED_SMOKE_ONLY):
     # Its OWN result directory: the baselines plus these six, about ten checkpoints,
@@ -1583,7 +1792,7 @@ if RUN_VERIFIED and RUN_EVAL and not (VERIFIED_SMOKE_STEPS and VERIFIED_SMOKE_ON
     # Paired intervals against every reference a claim below needs: the released
     # baseline, its pruned-data twin, the continuity arm, and pooled contrast.
     references = {"pretrained": BASE_MODEL, **{label: str(path) for label, path in baseline_runs.items()}}
-    for key in ("verified_zhang", "verified_hybrid", "verified_pool"):
+    for key in ("verified_zhang", "verified_hybrid", "verified_pool", "verified_alt_uniform"):
         if key in VERIFIED_RUNS:
             references[key] = str(VERIFIED_RUNS[key])
     for label, reference in references.items():
@@ -1649,9 +1858,15 @@ def verified_gate():
     print("\n== data effect: pruned positives alone ==")
     zhang_label = "zhang_seed42" if "zhang_seed42" in rows or "zhang seed42" in rows else "zhang_lambda1.0_seed42"
     show("verified_zhang vs zhang (original data)", "verified_zhang", zhang_label)
-    print("\n== claim 1: contrast helps (vs verified_zhang, same data) ==")
+    print("\n== claim 1: discrimination replaces Zhang's marginal (vs verified_zhang, same data) ==")
+    print("   confounded: these arms also drop the target-inclusive term; the matched test is next")
     for arm in ("verified_pool", "verified_rank", "verified_list_uniform", "verified_list_verifier"):
         show(f"{arm} vs verified_zhang", arm, "verified_zhang")
+    print("\n== claim 1, matched: negatives vs alternative-only (vs verified_alt_uniform) ==")
+    print("   same data, lambda, exclusion and slot NTP; still differs in eligibility (~30% of slots)")
+    print("   and in asking for relative rather than absolute probability -- not a pure negatives on/off")
+    for arm in ("verified_pool", "verified_rank", "verified_list_uniform", "verified_list_verifier"):
+        show(f"{arm} vs verified_alt_uniform", arm, "verified_alt_uniform")
     print("\n== claim 1, against the released baseline on original data ==")
     for arm in ("verified_pool", "verified_rank", "verified_list_uniform", "verified_list_verifier"):
         show(f"{arm} vs zhang", arm, zhang_label)
@@ -1660,6 +1875,7 @@ def verified_gate():
     print("\n== decompositions ==")
     show("verified_list_uniform vs verified_pool  (within-positive calibration)", "verified_list_uniform", "verified_pool")
     show("verified_hybrid vs verified_zhang        (continuity arm on clean data)", "verified_hybrid", "verified_zhang")
+
     print("\nNothing is selected here.  Confirm across seeds only what passes its own claim; "
           "SWORDS test stays locked until then.")
 
@@ -1695,8 +1911,11 @@ if RUN_SWORDS_TEST:
             else:
                 print("MISSING baseline, test table will be incomplete:", key)
     OBJECTIVE_RUNS = restore_all(OBJECTIVE_RUNS)
+    kind, weight = SELECTED_HYBRID.split(":"); weight = float(weight)
     for seed in (42, 123, 2024):
-        key = f"calibrated_seed{seed}"
+        key = hybrid_label(kind, weight, seed)
+        if key not in OBJECTIVE_RUNS and f"calibrated_seed{seed}" in OBJECTIVE_RUNS:
+            key = f"calibrated_seed{seed}"          # label used by passes before 2026-09-23
         if key in OBJECTIVE_RUNS:
             locked[key] = str(OBJECTIVE_RUNS[key])
         else:
@@ -1707,26 +1926,33 @@ if RUN_SWORDS_TEST:
             locked[key] = str(OBJECTIVE_RUNS[key])
 
     checkpoints = list(locked.values())
-    print(f"scoring {len(checkpoints)} locked checkpoints on SWORDS TEST")
-    run([sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/eval_swords.py",
-         "--checkpoints", *checkpoints, "--tokenizer_path", BASE_MODEL,
-         "--base_model", BASE_MODEL,
-         "--swords_json", MAIN / "data/swords/swords-v1.1_test.json.gz",
-         "--results_json", SCREEN_DIR / "swords_test.json",
-         "--modes", "left", "full"], cwd=MAIN)
+    # Three held-out substitution benchmarks, one invocation each, same evaluator:
+    # SWORDS test, the fixed 800-target CoInCo test subset, and all of SemEval-2007
+    # Task 10 (see data/lexsub/SOURCE.md).  None of them was read during development.
+    TEST_BENCHMARKS = {"swords_test": MAIN / "data/swords/swords-v1.1_test.json.gz",
+                       "coinco_test": MAIN / "data/lexsub/coinco_test_sub800.json.gz",
+                       "semeval07_test": MAIN / "data/lexsub/semeval07_test.json.gz"}
+    for bench, source in TEST_BENCHMARKS.items():
+        print(f"scoring {len(checkpoints)} locked checkpoints on {bench}")
+        run([sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/eval_swords.py",
+             "--checkpoints", *checkpoints, "--tokenizer_path", BASE_MODEL,
+             "--base_model", BASE_MODEL, "--swords_json", source,
+             "--results_json", SCREEN_DIR / f"{bench}.json",
+             "--modes", "left", "full"], cwd=MAIN)
 
     # Seed-matched paired intervals: each method seed against the SAME seed of
     # each baseline.  Averaging over mismatched seeds would fold seed variance
     # into the effect.
-    for family in ("zhang", "ntp", "augmented_ntp"):
-        for seed in (42, 123, 2024):
-            key = f"{family}_seed{seed}"
-            if key not in locked:
-                continue
-            run([sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/paired_benchmark_ci.py",
-                 "--kind", "swords", "--results-json", SCREEN_DIR / "swords_test.json",
-                 "--baseline-index", checkpoints.index(locked[key]),
-                 "--output", SCREEN_DIR / f"swords_test_paired_ci_vs_{key}.json"], cwd=MAIN)
+    for bench in TEST_BENCHMARKS:
+        for family in ("zhang", "ntp", "augmented_ntp"):
+            for seed in (42, 123, 2024):
+                key = f"{family}_seed{seed}"
+                if key not in locked:
+                    continue
+                run([sys.executable, MAIN / "transformers/examples/pytorch/language-modeling/paired_benchmark_ci.py",
+                     "--kind", "swords", "--results-json", SCREEN_DIR / f"{bench}.json",
+                     "--baseline-index", checkpoints.index(locked[key]),
+                     "--output", SCREEN_DIR / f"{bench}_paired_ci_vs_{key}.json"], cwd=MAIN)
 
     marker.write_text(json.dumps({
         "selected_hybrid": SELECTED_HYBRID,

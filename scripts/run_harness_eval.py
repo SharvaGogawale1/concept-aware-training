@@ -38,6 +38,9 @@ p.add_argument("--tasks", nargs="*", default=KNOWLEDGE + COMMONSENSE)
 p.add_argument("--batch-size", default="auto")
 p.add_argument("--limit", type=int, default=None, help="smoke test: items per task")
 p.add_argument("--dtype", default="bfloat16")
+p.add_argument("--log-samples", action="store_true",
+               help="keep per-question outcomes (lm_eval --log_samples) so arms can be compared "
+                    "PAIRED with scripts/paired_harness_ci.py; an arm scored without them is re-run")
 a = p.parse_args()
 
 manifest = json.loads((Path(a.screen) / "manifest.json").read_text())
@@ -59,7 +62,8 @@ for arm in a.arms:
 
 for label, adapter in todo:
     # Resume only from a FULL pass; a limited result is never evidence.
-    if label in results and not a.limit and results[label].get("_limit") is None:
+    if (label in results and not a.limit and results[label].get("_limit") is None
+            and (results[label].get("_log_samples") or not a.log_samples)):
         print(f"resume: {label} already scored, skipping")
         continue
     model_args = f"pretrained={a.base_model},dtype={a.dtype}"
@@ -70,6 +74,8 @@ for label, adapter in todo:
             "--batch_size", str(a.batch_size), "--output_path", str(raw_root / label)]
     if a.limit:
         argv += ["--limit", str(a.limit)]
+    if a.log_samples:
+        argv += ["--log_samples"]
     print("+", " ".join(argv), flush=True)
     started = time.time()
     proc = subprocess.run(argv, capture_output=True, text=True)
@@ -87,6 +93,8 @@ for label, adapter in todo:
                       for task, vals in scores.items()}
     results[label]["_seconds"] = round(time.time() - started, 1)
     results[label]["_limit"] = a.limit
+    results[label]["_log_samples"] = bool(a.log_samples)
+    results[label]["_raw_dir"] = str(raw_root / label)
     out_path.write_text(json.dumps(results, indent=2))
     print(f"  {label}: {results[label]['_seconds']}s -> {out_path}")
 

@@ -40,6 +40,8 @@ data/bm_semlex/*
 !data/bm_semlex/SOURCE.md
 data/hyperlex-data/*
 !data/hyperlex-data/SOURCE.md
+data/lexsub/*
+!data/lexsub/SOURCE.md
 data/syn/youtube_clean_gold/
 data/hyp/youtube_clean_gold/
 data/youtube_clean_gold_report.json

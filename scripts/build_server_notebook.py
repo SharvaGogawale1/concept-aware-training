@@ -79,6 +79,7 @@ RUN_CONFIRM = False   # retrain the headline arms across SEEDS; Qwen is a seed-4
                       # replication, so off.  It needs RUN_MULTISEED too -- on its own
                       # it loops over [42] alone and every arm is already finished.
 RUN_MULTISEED = False # add seeds 123 and 2024 to SEEDS
+CONFIRM_ARMS = ""     # with RUN_CONFIRM: only these families get the extra seeds, e.g. "zhang" ("" = all)
 RUN_EVAL    = True    # score every checkpoint: SWORDS, STS, perplexity, bm-semlex
 SPACY_GPU   = True    # 8.5x faster extraction; needs cupy-cuda12x, installed below
 
@@ -88,7 +89,8 @@ SPACY_GPU   = True    # 8.5x faster extraction; needs cupy-cuda12x, installed be
 for _name, _value in {"GPU_ID": GPU_ID, "CONCEPT_MODEL": MODEL, "HF_TOKEN": HF_TOKEN or None,
                       "RUN_DATA": RUN_DATA, "RUN_SMOKE": RUN_SMOKE, "RUN_SCREEN": RUN_SCREEN,
                       "RUN_CONFIRM": RUN_CONFIRM, "RUN_EVAL": RUN_EVAL,
-                      "RUN_MULTISEED": RUN_MULTISEED, "SPACY_GPU": SPACY_GPU}.items():
+                      "RUN_MULTISEED": RUN_MULTISEED, "CONFIRM_ARMS": CONFIRM_ARMS,
+                      "SPACY_GPU": SPACY_GPU}.items():
     if _value is not None:
         os.environ[_name] = ("1" if _value else "0") if isinstance(_value, bool) else str(_value)
 
@@ -136,7 +138,10 @@ RUN_MULTISEED = False # add seeds 123 and 2024 to SEEDS
 RUN_HYBRID  = False   # Zhang + alternative-only auxiliary term (5 arms) and the two
                       # negative-quality controls, seed 42.  Off until the 1B gate on
                       # Colab has picked one; then set SELECTED_HYBRID and run only that.
-SELECTED_HYBRID = None  # e.g. "within_kl:0.5" -- transferred from the 1B gate, never tuned here
+SELECTED_HYBRID = None  # e.g. "uniform:0.125" -- set from the gate, never tuned here; with
+                        # RUN_MULTISEED it trains that arm's seeds 123 and 2024
+HYBRID_ARMS = ""        # train only these grid arms, "kind:weight,..." ("" = all); lets two
+                        # processes split the grid across GPUs -- the manifest merges
 RUN_NEGATIVE_CONTROLS = False  # clean/fragments negative diagnostic; not method selection
 RUN_VERIFIED = False  # six arms from synonyms_train_verified.jsonl, one slot objective each,
                       # scored in their own directory against Task 15's NTP and Zhang
@@ -144,6 +149,7 @@ VERIFIED_SMOKE_STEPS = 0     # >0: smoke ~that many steps per arm first and appl
 VERIFIED_SMOKE_ONLY = False  # True: stop after the smoke and print; False: continue to train + eval
 VERIFIED_LAMBDA = 1.0        # weight on the slot objective for pool/rank/list arms -- declared, not tuned
 VERIFIED_GAMMA  = 0.0625     # the continuity arm's gamma from the dev frontier: Qwen .0625, Llama .125
+VERIFIED_ARMS   = ""         # train only these verified arms (comma list, "" = all)
 RUN_EVAL    = True    # score these arms AND the Task 15 comparators: SWORDS with paired
                       # bootstrap intervals, STS, perplexity, concept sets, bm-semlex
 SPACY_GPU   = True    # only matters if this model still needs extraction
@@ -159,6 +165,7 @@ for _name, _value in {"GPU_ID": GPU_ID, "CONCEPT_MODEL": MODEL, "HF_TOKEN": HF_T
                       "RUN_VERIFIED": RUN_VERIFIED, "VERIFIED_SMOKE_STEPS": VERIFIED_SMOKE_STEPS,
                       "VERIFIED_SMOKE_ONLY": VERIFIED_SMOKE_ONLY,
                       "VERIFIED_LAMBDA": VERIFIED_LAMBDA, "VERIFIED_GAMMA": VERIFIED_GAMMA,
+                      "VERIFIED_ARMS": VERIFIED_ARMS, "HYBRID_ARMS": HYBRID_ARMS,
                       "RUN_CONFIRM": RUN_CONFIRM, "RUN_EVAL": RUN_EVAL,
                       "RUN_MULTISEED": RUN_MULTISEED, "SPACY_GPU": SPACY_GPU}.items():
     if _value is not None:
@@ -691,6 +698,7 @@ RENAME = [
      'MODEL_OUT / f"contrastive_negative_report_{name}.json"'),
     ('load_runs(f"task15b{_TAG_SUFFIX}")', 'load_runs("task15b")'),
     ('save_runs(OBJECTIVE_RUNS, f"task15b{_TAG_SUFFIX}")', 'save_runs(OBJECTIVE_RUNS, "task15b")'),
+    ('_merge_save(OBJECTIVE_RUNS, f"task15b{_TAG_SUFFIX}")', '_merge_save(OBJECTIVE_RUNS, "task15b")'),
     ('sync_small_artifacts(path, f"task15b_logs{_TAG_SUFFIX}/{label}")',
      'sync_small_artifacts(path, LOG_DIR / "task15b_logs" / label)'),
     # The verified-supervision stage: same per-model layout, no tag suffix.

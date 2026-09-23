@@ -26,6 +26,30 @@
       "path": "data/bm_semlex/wordnet_nouns_10000.txt",
       "url": "https://raw.githubusercontent.com/ioana-ivan/bm-semlex/2677b1ecdb28d9bd427da51a0b957d4dbe770f14/output/synonyms/negative/n_10000.txt",
       "sha256": "25fbdbc478e41a2d69f6a3d61edee2b5c8f39a80f41ed5bb0a048d3389eacb4f"
+    },
+    {
+      "name": "coinco_dev_parsed",
+      "path": "data/lexsub/raw/coinco_dev.json.gz",
+      "url": "https://raw.githubusercontent.com/p-lambda/swords/04ca75370d0ce098a7f4db68240fc8e79a4f7b3b/assets/parsed/coinco_dev.json.gz",
+      "sha256": "02180be2bf9e3b528682c659c5b410f3baa130dbc19a29be8755a0aae0d9cc5f"
+    },
+    {
+      "name": "coinco_test_parsed",
+      "path": "data/lexsub/raw/coinco_test.json.gz",
+      "url": "https://raw.githubusercontent.com/p-lambda/swords/04ca75370d0ce098a7f4db68240fc8e79a4f7b3b/assets/parsed/coinco_test.json.gz",
+      "sha256": "a6dc4b7708c38e947b6038a5fd2b6f0eab2381da61866afa75570953b3333bf4"
+    },
+    {
+      "name": "semeval07_task10data",
+      "path": "data/lexsub/raw/task10data.tar.gz",
+      "url": "http://www.dianamccarthy.co.uk/files/task10data.tar.gz",
+      "sha256": "8a2b206a2581b35c02c3b64783fddf019a35a43acdc0a821be8cfa26e4aff245"
+    },
+    {
+      "name": "semeval07_melamud_candidates",
+      "path": "data/lexsub/raw/lst.gold.candidates",
+      "url": "https://raw.githubusercontent.com/orenmel/lexsub/0d6e6da0871c79333d955ceb55f5b7b36d95994f/datasets/lst.gold.candidates",
+      "sha256": "d7e8a198a24803639ee2207b2784079b8915ecdfef3f1524008bc257b49cd34f"
     }
   ],
   "archives": [

@@ -22,15 +22,44 @@ parser.add_argument("notebook")
 parser.add_argument("--gpu")
 parser.add_argument("--base", default=".", help="CONCEPT_BASE: holds outputs/")
 parser.add_argument("--model-tag", default="qwen3-1.7b-base")
-parser.add_argument("--stage", choices=["hybrid", "verified"], default="hybrid",
-                    help="hybrid: the frontier screen (default); verified: the six verified-supervision arms")
+parser.add_argument("--stage", choices=["hybrid", "verified", "confirm15"], default="hybrid",
+                    help="hybrid: the frontier screen (default); verified: the verified-supervision arms; "
+                         "confirm15: Task 15's other seeds (use on reproducibilty_15_<tag>.ipynb)")
+parser.add_argument("--hybrid-arms", default="",
+                    help='hybrid stage only: train only these grid arms, e.g. "uniform:0.125,mass:0.125"')
+parser.add_argument("--selected-hybrid", default=None,
+                    help='hybrid stage only: the selected arm, e.g. "uniform:0.125"; with --multiseed trains its seeds')
+parser.add_argument("--multiseed", action="store_true", help="add seeds 123 and 2024 (hybrid / confirm15)")
+parser.add_argument("--no-screen", action="store_true",
+                    help="hybrid stage only: never turn RUN_SCREEN on (a machine without the screen arms)")
+parser.add_argument("--confirm-arms", default="",
+                    help='confirm15 only: families that get the extra seeds, e.g. "zhang" ("" = all)')
 parser.add_argument("--smoke-steps", type=int, default=0,
                     help="verified stage only: >0 trains ~that many steps per arm and prints magnitudes")
 parser.add_argument("--smoke-only", action="store_true",
                     help="verified stage only: stop after the smoke run instead of training")
 parser.add_argument("--gamma", type=float, default=None,
                     help="verified stage only: continuity arm's gamma (default per model: llama .125, qwen .0625)")
+parser.add_argument("--arms", default="",
+                    help='verified stage only: train only these arms (comma list; "" = all)')
+parser.add_argument("--lambda", dest="lam", type=float, default=1.0,
+                    help="verified stage only: weight on the slot objective (smoke rule may change it)")
+parser.add_argument("--no-eval", action="store_true",
+                    help="train and stop (a parallel training process); evaluate in a later pass")
 args = parser.parse_args()
+if args.stage == "hybrid":
+    FLAGS.update({"HYBRID_ARMS": f'"{args.hybrid_arms}"',
+                  "SELECTED_HYBRID": f'"{args.selected_hybrid}"' if args.selected_hybrid else "None",
+                  "RUN_MULTISEED": "True" if args.multiseed else "False",
+                  "RUN_EVAL": "False" if args.no_eval else "True"})
+if args.stage == "confirm15":
+    # Task 15's control cell: only the extra seeds of the chosen families, no screen,
+    # no evaluation here (15b scores them as baselines of its own table).
+    FLAGS.clear()
+    FLAGS.update({"RUN_DATA": "False", "RUN_SMOKE": "False", "RUN_SCREEN": "False",
+                  "RUN_CONFIRM": "True", "RUN_MULTISEED": "True",
+                  "CONFIRM_ARMS": f'"{args.confirm_arms}"',
+                  "RUN_EVAL": "False" if args.no_eval else "True"})
 if args.stage == "verified":
     # The verified pass must not relaunch the hybrid screen: those arms resume by
     # manifest, and RUN_HYBRID=True would otherwise retrain nothing but still add
@@ -41,6 +70,9 @@ if args.stage == "verified":
     FLAGS.update({"RUN_HYBRID": "False", "RUN_SCREEN": "False", "RUN_VERIFIED": "True",
                   "VERIFIED_SMOKE_STEPS": str(args.smoke_steps),
                   "VERIFIED_SMOKE_ONLY": "True" if args.smoke_only else "False",
+                  "VERIFIED_ARMS": f'"{args.arms}"',
+                  "VERIFIED_LAMBDA": str(args.lam),
+                  "RUN_EVAL": "False" if args.no_eval else "True",
                   "VERIFIED_GAMMA": str(args.gamma if args.gamma is not None
                                         else (0.125 if "llama" in args.model_tag else 0.0625))})
 
@@ -60,7 +92,7 @@ for name in ("task15", "task15b"):
           + ("" if not gone else "  -> " + ", ".join(gone)))
     missing_any = missing_any or (bool(gone) and name == "task15b")
 
-if missing_any and args.stage != "verified":
+if missing_any and args.stage == "hybrid" and not args.no_screen:
     FLAGS["RUN_SCREEN"] = "True"
     print("\n=> RUN_SCREEN=True: a screen arm must be retrained to re-enter the table.")
 else:
@@ -90,5 +122,5 @@ print("\nchanged:" if changed else "\nnothing to change (already set)")
 print("\n".join(changed))
 print("\nflags now:")
 for line in cell["source"]:
-    if re.match(r"^\s*(GPU_ID|MODEL|HF_TOKEN|RUN_|SELECTED_|SPACY_)", line):
+    if re.match(r"^\s*(GPU_ID|MODEL|HF_TOKEN|RUN_|SELECTED_|SPACY_|VERIFIED_|HYBRID_|CONFIRM_)", line):
         print("   " + line.rstrip())
