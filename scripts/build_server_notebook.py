@@ -510,6 +510,9 @@ nltk.download("omw-1.4", quiet=True)
 run([sys.executable, MAIN / "builddataset/verify_task14_data.py",
      "--repo_root", MAIN, "--download_missing",
      "--report_json", SHARED / "external_benchmark_integrity.json"], cwd=MAIN)
+# SemEval-07 and the fixed CoInCo subsets, derived from the pinned raw files just
+# verified; the builder pins the derived digests and stops if a rebuild differs.
+run([sys.executable, MAIN / "builddataset/build_lexsub_benchmarks.py", "--repo_root", MAIN], cwd=MAIN)
 (SHARED / "environment_freeze.txt").write_text(
     subprocess.check_output([sys.executable, "-m", "pip", "freeze"], text=True))
 
