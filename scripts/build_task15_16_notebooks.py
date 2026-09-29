@@ -1952,10 +1952,10 @@ if RUN_SWORDS_TEST:
                 locked[key] = str(OBJECTIVE_RUNS[key])
             else:
                 print("MISSING method seed:", key)
-    # The ablations the paper reports beside the method: mass at each shared gamma
-    # (the uniform auxiliary minus its within-set KL half), and the two older ones.
-    for key in [hybrid_label("mass", g) for g in SHARED_GAMMAS] + [
-            "alternative_uniform_seed42", "inclusive_uniform_alpha0.5_seed42"]:
+    # The ablation the paper reports beside the method: mass at each shared gamma
+    # (the uniform auxiliary minus its within-set KL half).  The older standalone
+    # uniform arms are in no test table, so they are not scored here.
+    for key in [hybrid_label("mass", g) for g in SHARED_GAMMAS]:
         if key in OBJECTIVE_RUNS:
             locked[key] = str(OBJECTIVE_RUNS[key])
 
