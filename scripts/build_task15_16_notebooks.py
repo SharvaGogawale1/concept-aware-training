@@ -976,10 +976,27 @@ POSTHOC_GRID = [("uniform", 0.125), ("uniform", 0.0625)]
 # first passes the rule in the decision cell.  Neither pre-registered nor post-hoc:
 # the mass rule below is its own, declared gate.
 LOCKED_GAMMA = 0.125 if MODEL_TAG.startswith("llama") else 0.0625
-MASS_GRID = [("mass", LOCKED_GAMMA * m) for m in (1, 2, 4)]
+# Decided 2026-09-29: every family reports the SAME two weights.  A gamma chosen per
+# family is not a method anyone can apply to a new model, so neither weight is picked
+# per family -- on dev or on test.  .0625 is inside the STS allowance for both families
+# on dev; .125 is inside it for Llama and outside it for Qwen.  Both are reported for
+# both, as a two-point trade-off.  LOCKED_GAMMA above is kept only for the dev-time
+# decision cell, which predates this and documents how the weights were found.
+SHARED_GAMMAS = (0.0625, 0.125)
+MASS_GRID = sorted({("mass", LOCKED_GAMMA * m) for m in (1, 2, 4)}
+                   | {("mass", g) for g in SHARED_GAMMAS}, key=lambda arm: arm[1])
 HYBRID_GRID = PREREGISTERED_GRID + POSTHOC_GRID + MASS_GRID
-# "uniform:0.125" -- set ONLY from the gate below, then rerun with RUN_MULTISEED.
+# "uniform:0.0625,uniform:0.125" -- the locked arms, comma-separated; with
+# RUN_MULTISEED every one of them gets seeds 123 and 2024.
 SELECTED_HYBRID = os.environ.get("SELECTED_HYBRID")
+
+def selected_arms():
+    if not SELECTED_HYBRID:
+        return []
+    arms = [(k.strip(), float(w)) for k, w in
+            (x.split(":") for x in SELECTED_HYBRID.split(",") if x.strip())]
+    assert all(arm in HYBRID_GRID for arm in arms), f"SELECTED_HYBRID not in the grid: {arms}"
+    return arms
 # Train only these grid arms in THIS process ("uniform:0.125,mass:0.125"; empty =
 # all).  Two processes on two GPUs can then split the arms; the manifest merges.
 HYBRID_ONLY = [(k, float(w)) for k, w in
@@ -1025,9 +1042,7 @@ if RUN_HYBRID:
     # SAME original data as the Task 15 baselines, so the main table is mean +- sd
     # over three seeds for every arm on one file.  RUN_CONFIRM is NOT used for this:
     # that flag relaunches the alternative-uniform and legacy contrastive arms.
-    if SELECTED_HYBRID:
-        kind, weight = SELECTED_HYBRID.split(":"); weight = float(weight)
-        assert (kind, weight) in HYBRID_GRID, "SELECTED_HYBRID must be one of the screened arms"
+    for kind, weight in selected_arms():
         for seed in SEEDS:
             if seed == 42 or (HYBRID_ONLY and (kind, weight) not in HYBRID_ONLY):
                 continue                      # seed 42 IS the grid arm above
@@ -1502,10 +1517,11 @@ def mass_rule(rows, vs_zhang):
                      if all(rule.values()) else "mass does not pass; uniform stays the method"))
 
 def confirmation(rows):
-    # The selected arm's other seeds, each against Zhang of the SAME seed.
-    if not SELECTED_HYBRID:
-        return
-    kind, weight = SELECTED_HYBRID.split(":"); weight = float(weight)
+    # Each locked arm's seeds, each against Zhang of the SAME seed.
+    for kind, weight in selected_arms():
+        _confirm_arm(rows, kind, weight)
+
+def _confirm_arm(rows, kind, weight):
     print(f"\n== confirmation: {kind}:{weight} vs Zhang, seed-matched ==")
     for seed in (42, 123, 2024):
         label = hybrid_label(kind, weight, seed)
@@ -1903,11 +1919,14 @@ Main table: NTP, augmented NTP, Zhang set-marginal, alternative-only uniform, co
 
 Everything above is SWORDS **dev**: $\\alpha$, $\\beta$ and $\\gamma$ were all chosen on it, so it is development data and cannot support the headline number. This cell scores test **once**, over every locked arm in a single call, so the method and its baselines are measured on identical rows with identical code.
 
-It refuses to run until `SELECTED_HYBRID` is set, and it writes `swords_test_locked.json` recording the arms and the commit. If that file already exists the cell stops: a second test pass with a changed method is the one thing this protocol exists to prevent. Nothing here may be re-run after reading the result."""),
+It runs only with `RUN_SWORDS_TEST=1` in the environment and `SELECTED_HYBRID` set to exactly the two shared weights (`uniform:0.0625,uniform:0.125`), the same for every model. It writes `swords_test_locked.json` recording the arms and the commit. If that file already exists the cell stops: a second test pass with a changed method is the one thing this protocol exists to prevent. Nothing here may be re-run after reading the result."""),
         code(r"""
-RUN_SWORDS_TEST = False   # set True exactly once, after the method is locked
+RUN_SWORDS_TEST = os.environ.get("RUN_SWORDS_TEST") == "1"   # exactly once, after locking
 if RUN_SWORDS_TEST:
-    assert SELECTED_HYBRID, "lock the method first: the gate sets SELECTED_HYBRID"
+    assert SELECTED_HYBRID, "lock the method first: set SELECTED_HYBRID to the locked arms"
+    assert sorted(selected_arms()) == sorted(("uniform", g) for g in SHARED_GAMMAS), (
+        f"the locked arms are uniform at {SHARED_GAMMAS} for every family; got {selected_arms()}")
+    SCREEN_DIR.mkdir(parents=True, exist_ok=True)
     marker = SCREEN_DIR / "swords_test_locked.json"
     assert not marker.is_file(), (
         f"SWORDS test has already been run: {marker}. Re-running after seeing the "
@@ -1926,17 +1945,17 @@ if RUN_SWORDS_TEST:
             else:
                 print("MISSING baseline, test table will be incomplete:", key)
     OBJECTIVE_RUNS = restore_all(OBJECTIVE_RUNS)
-    kind, weight = SELECTED_HYBRID.split(":"); weight = float(weight)
-    for seed in (42, 123, 2024):
-        key = hybrid_label(kind, weight, seed)
-        if key not in OBJECTIVE_RUNS and f"calibrated_seed{seed}" in OBJECTIVE_RUNS:
-            key = f"calibrated_seed{seed}"          # label used by passes before 2026-09-23
-        if key in OBJECTIVE_RUNS:
-            locked[key] = str(OBJECTIVE_RUNS[key])
-        else:
-            print("MISSING method seed:", key)
-    # The two ablations the paper reports beside the method.
-    for key in ("alternative_uniform_seed42", "inclusive_uniform_alpha0.5_seed42"):
+    for kind, weight in selected_arms():
+        for seed in (42, 123, 2024):
+            key = hybrid_label(kind, weight, seed)
+            if key in OBJECTIVE_RUNS:
+                locked[key] = str(OBJECTIVE_RUNS[key])
+            else:
+                print("MISSING method seed:", key)
+    # The ablations the paper reports beside the method: mass at each shared gamma
+    # (the uniform auxiliary minus its within-set KL half), and the two older ones.
+    for key in [hybrid_label("mass", g) for g in SHARED_GAMMAS] + [
+            "alternative_uniform_seed42", "inclusive_uniform_alpha0.5_seed42"]:
         if key in OBJECTIVE_RUNS:
             locked[key] = str(OBJECTIVE_RUNS[key])
 

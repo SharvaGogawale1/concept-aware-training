@@ -152,6 +152,8 @@ VERIFIED_SMOKE_ONLY = False  # True: stop after the smoke and print; False: cont
 VERIFIED_LAMBDA = 1.0        # weight on the slot objective for pool/rank/list arms -- declared, not tuned
 VERIFIED_GAMMA  = 0.0625     # the continuity arm's gamma from the dev frontier: Qwen .0625, Llama .125
 VERIFIED_ARMS   = ""         # train only these verified arms (comma list, "" = all)
+RUN_SWORDS_TEST = False  # the ONE locked test pass (SWORDS/CoInCo/SemEval test); needs
+                         # SELECTED_HYBRID = "uniform:0.0625,uniform:0.125". Never re-run.
 RUN_EVAL    = True    # score these arms AND the Task 15 comparators: SWORDS with paired
                       # bootstrap intervals, STS, perplexity, concept sets, bm-semlex
 SPACY_GPU   = True    # only matters if this model still needs extraction
@@ -170,7 +172,8 @@ for _name, _value in {"GPU_ID": GPU_ID, "CONCEPT_MODEL": MODEL, "HF_TOKEN": HF_T
                       "VERIFIED_ARMS": VERIFIED_ARMS, "HYBRID_ARMS": HYBRID_ARMS,
                       "RESULT_TAG": RESULT_TAG, "EVAL_ARMS": EVAL_ARMS,
                       "RUN_CONFIRM": RUN_CONFIRM, "RUN_EVAL": RUN_EVAL,
-                      "RUN_MULTISEED": RUN_MULTISEED, "SPACY_GPU": SPACY_GPU}.items():
+                      "RUN_MULTISEED": RUN_MULTISEED, "SPACY_GPU": SPACY_GPU,
+                      "RUN_SWORDS_TEST": RUN_SWORDS_TEST}.items():
     if _value is not None:
         os.environ[_name] = ("1" if _value else "0") if isinstance(_value, bool) else str(_value)
 

@@ -15,7 +15,7 @@ from pathlib import Path
 FLAGS = {"RUN_DATA": "False", "RUN_SCREEN": "False", "RUN_HYBRID": "True",
          "RUN_EVAL": "True", "RUN_CONFIRM": "False", "RUN_MULTISEED": "False",
          "RUN_NEGATIVE_CONTROLS": "False", "SELECTED_HYBRID": "None",
-         "SELECTED_ALPHA": "0.5", "SELECTED_BETA": "1.0"}
+         "SELECTED_ALPHA": "0.5", "SELECTED_BETA": "1.0", "RUN_SWORDS_TEST": "False"}
 
 parser = argparse.ArgumentParser()
 parser.add_argument("notebook")
@@ -34,6 +34,9 @@ parser.add_argument("--result-tag", default="",
                     help='hybrid stage only: score into task15b_screen<tag>, e.g. "_confirm"')
 parser.add_argument("--eval-arms", default="",
                     help="hybrid stage only: with --result-tag, only these 15b arm labels enter the table")
+parser.add_argument("--swords-test", action="store_true",
+                    help="hybrid stage only: the ONE locked test pass -- no training, no dev "
+                         "scoring; needs --selected-hybrid uniform:0.0625,uniform:0.125")
 parser.add_argument("--no-screen", action="store_true",
                     help="hybrid stage only: never turn RUN_SCREEN on (a machine without the screen arms)")
 parser.add_argument("--confirm-arms", default="",
@@ -57,6 +60,8 @@ if args.stage == "hybrid":
                   "SELECTED_HYBRID": f'"{args.selected_hybrid}"' if args.selected_hybrid else "None",
                   "RUN_MULTISEED": "True" if args.multiseed else "False",
                   "RUN_EVAL": "False" if args.no_eval else "True"})
+    if args.swords_test:
+        FLAGS.update({"RUN_SWORDS_TEST": "True", "RUN_HYBRID": "False", "RUN_EVAL": "False"})
 if args.stage == "confirm15":
     # Task 15's control cell: only the extra seeds of the chosen families, no screen,
     # no evaluation here (15b scores them as baselines of its own table).
