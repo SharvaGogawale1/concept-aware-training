@@ -79,7 +79,9 @@ elif miner_running; then
   log "a miner for $TAG is already running; waiting for it to exit"
   while miner_running; do sleep 120; done
 fi
-if data_is_valid; then
+if [ "$STAGE" != verified ]; then
+  :   # hybrid and confirm15 never read the verified file, so never mine it
+elif data_is_valid; then
   log "verified data for $TAG is valid; not re-mining"
 else
   log "mining verified negatives for $TAG on GPU $GPU (~10 h)"
