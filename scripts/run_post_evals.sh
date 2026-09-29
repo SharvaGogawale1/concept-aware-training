@@ -8,8 +8,11 @@
 #   run_post_evals.sh llama-3.2-1b meta-llama/Llama-3.2-1B 1
 #   run_post_evals.sh qwen3-1.7b-base Qwen/Qwen3-1.7B-Base 0
 #
-# Run from the task15 base directory.  Uses two conda envs: `harness` (lm_eval) and
-# `concept` (the probes); override with HARNESS_ENV / CONCEPT_ENV.
+# Run from the task15 base directory.  Uses two conda envs by their Python paths
+# (`conda run` is not reliable in a non-interactive script): `harness` for lm_eval,
+# `concept` for the probes; override with HARNESS_PY / CONCEPT_PY.  HF_HOME is the
+# one run_verified_pipeline.sh uses, so gated models authenticate the same way.
+# Ends with the paired per-question harness test: ours and mass vs Zhang, seed-matched.
 set -euo pipefail
 TAG=$1; MODEL=$2; GPU=$3
 BASE=${CONCEPT_BASE:-$PWD}
@@ -17,8 +20,9 @@ cd "$BASE"
 H=concept_aware/concept-aware-training/scripts
 OUT=outputs/$TAG
 M=$OUT/run_manifests
-export CUDA_VISIBLE_DEVICES=$GPU HF_HUB_CACHE=$BASE/concept_aware/hf_cache/hub PYTHONUTF8=1 PYTHONIOENCODING=utf-8
-HARNESS_ENV=${HARNESS_ENV:-harness}; CONCEPT_ENV=${CONCEPT_ENV:-concept}
+export CUDA_VISIBLE_DEVICES=$GPU HF_HOME=$BASE/concept_aware/hf_cache PYTHONUTF8=1 PYTHONIOENCODING=utf-8
+HARNESS_PY=${HARNESS_PY:-$HOME/miniconda3/envs/harness/bin/python}
+CONCEPT_PY=${CONCEPT_PY:-$HOME/miniconda3/envs/concept/bin/python}
 log() { echo "[$(date '+%F %T')] $*"; }
 
 SEEDS="42 123 2024"
@@ -51,17 +55,29 @@ if [ -n "$MISSING" ]; then
   log "not trained yet, stopping before any scoring: $MISSING"; exit 1
 fi
 
+for py in "$HARNESS_PY" "$CONCEPT_PY"; do
+  [ -x "$py" ] || { log "missing interpreter: $py (set HARNESS_PY / CONCEPT_PY)"; exit 1; }
+done
+
+# The harness always scores the untouched model first; it is not a manifest arm.
 log "harness: $(echo $ARMS | wc -w) checkpoints on GPU $GPU"
-conda run --no-capture-output -n "$HARNESS_ENV" python $H/run_harness_eval.py \
-  --screen "$MERGED" --base-model "$MODEL" --out $OUT/harness_confirm.json --log-samples --arms $ARMS
+"$HARNESS_PY" $H/run_harness_eval.py \
+  --screen "$MERGED" --base-model "$MODEL" --out $OUT/harness_confirm.json --log-samples --arms ${ARMS#pretrained }
 
 log "word similarity"
-conda run --no-capture-output -n "$CONCEPT_ENV" python $H/eval_word_similarity.py \
+"$CONCEPT_PY" $H/eval_word_similarity.py \
   --base-model "$MODEL" --manifests $M/task15.json $M/task15b.json --arms $ARMS \
   --out $OUT/word_similarity.json
 
 log "classification probe (Iyer's datasets, Zhang's protocol)"
-conda run --no-capture-output -n "$CONCEPT_ENV" python $H/eval_classification_probe.py \
+"$CONCEPT_PY" $H/eval_classification_probe.py \
   --base-model "$MODEL" --manifests $M/task15.json $M/task15b.json --arms $ARMS \
   --out $OUT/classification_probe.json
+log "paired harness test: ours and mass vs Zhang, seed-matched"
+PAIRS=""
+for g in 0.0625 0.125; do
+  for s in $SEEDS; do PAIRS+=" --pair zhang_seed$s:zhang_plus_uniform_g${g}_seed$s"; done
+  PAIRS+=" --pair zhang_seed42:zhang_plus_mass_g${g}_seed42"
+done
+"$CONCEPT_PY" $H/paired_harness_ci.py --harness $OUT/harness_confirm.json $PAIRS
 log "done: $TAG"
