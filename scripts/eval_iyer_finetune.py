@@ -13,14 +13,15 @@ pinned datasets and splits, fine-tuned as Iyer et al. (2026), Appendix B, descri
 Details the paper does not give, taken from the Unsloth Alpaca recipe that the listed
 settings match: 5 warmup steps, weight decay 0.01, LoRA dropout 0, loss on the whole
 formatted example (prompt + answer + EOS).  Instructions and label words are ours.
-Their "GLUE" column is MNLI (the appendix's GLUE examples and labels are MNLI's), so
+Their "GLUE" column appears to be MNLI (the appendix's GLUE examples and labels are MNLI's), so
 MNLI is scored first; the other six GLUE tasks follow and give the 7-task mean used by
 the probe table.
 
 The post-trained checkpoint is the 4-bit base with its concept adapter kept frozen and
-active; the task LoRA is a second adapter on top, so the concept model is exactly the
-one every other evaluation scores (no merge and re-quantisation, which could wash out
-a small adapter).  "pretrained" gets the task LoRA alone.  The task LoRA's
+active; the task LoRA is a second adapter on top, so the concept weights are exactly
+the ones every other evaluation scores (no merge and re-quantisation, which could wash
+out a small adapter).  Compute is bf16 rather than the evaluations' fp16, for stable
+training; this is the same for every arm.  "pretrained" gets the task LoRA alone.  The task LoRA's
 initialisation, the 800 training and 200 validation examples, and the evaluation
 subset are identical for every arm.
 
@@ -35,7 +36,7 @@ complete arm comparisons for the tasks it finished; a rerun resumes.
         --arms zhang_seed42 zhang_plus_uniform_g0.0625_seed42 zhang_plus_uniform_g0.125_seed42 \
         --out outputs/llama-3.2-1b/iyer_finetune.json
 """
-import argparse, hashlib, json, math, sys, time
+import argparse, gc, hashlib, json, math, sys, time
 from pathlib import Path
 
 import numpy as np
@@ -342,6 +343,7 @@ def main():
             log(f"{name} {arm}: match {res['match_accuracy']:.3f} (unparseable {res['unparseable_rate']:.2f}), "
                 f"ranked {res['ranked_accuracy']:.3f} ({res['_seconds']:.0f}s)")
             del peft, model
+            gc.collect()                                # HF models hold reference cycles
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
