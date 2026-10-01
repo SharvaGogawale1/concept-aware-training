@@ -27,10 +27,10 @@ echo "Laya's repo at $(git -C "$LAYA" rev-parse HEAD)"
 if [ ! -x "$ENV_PY" ]; then
   "$CONDA" create -y -q -n laya -c conda-forge --override-channels python=3.12   # no Anaconda ToS prompt
 fi
-"$ENV_PY" -m pip install -q "numpy<2"
-"$ENV_PY" -m pip install -q torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
-"$ENV_PY" -m pip install -q -e "$LAYA/transformers"
-"$ENV_PY" -m pip install -q "datasets==2.19.1" "pyarrow==16.1.0" "huggingface-hub==0.24.6" \
+"$ENV_PY" -m pip install -q --no-cache-dir "numpy<2"
+"$ENV_PY" -m pip install -q --no-cache-dir torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
+"$ENV_PY" -m pip install -q --no-cache-dir -e "$LAYA/transformers"
+"$ENV_PY" -m pip install -q --no-cache-dir "datasets==2.19.1" "pyarrow==16.1.0" "huggingface-hub==0.24.6" \
   "accelerate==0.34.2" "evaluate==0.4.3" scikit-learn pandas sentencepiece protobuf
 "$ENV_PY" - <<'PY'
 import torch, transformers, datasets, accelerate

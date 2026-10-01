@@ -43,7 +43,8 @@ LM=transformers/examples/pytorch/language-modeling
 DATA=$LAYA/data/syn/youtube
 LAYA_PY=${LAYA_PY:-$HOME/miniconda3/envs/laya/bin/python}
 CONCEPT_PY=${CONCEPT_PY:-$HOME/miniconda3/envs/concept/bin/python}
-OUT=$BASE/concept_aware/runs/$TAG/iyer_replica
+# The seven checkpoints (~18 GB) can live elsewhere, e.g. on the NAS: IYER_REPLICA_DIR=/path ...
+OUT=${IYER_REPLICA_DIR:-$BASE/concept_aware/runs/$TAG/iyer_replica}
 MANIFEST=outputs/$TAG/run_manifests/iyer_replica.json
 RESULTS=outputs/$TAG
 export CUDA_VISIBLE_DEVICES=$GPU HF_HOME=$BASE/concept_aware/hf_cache PYTHONUTF8=1 PYTHONIOENCODING=utf-8
@@ -54,7 +55,7 @@ ARMS="iyer_ntp_syn iyer_nsp_aug_ctx iyer_nsp_aug_dict iyer_nsp_loss_ctx iyer_nsp
 EXTRA=()
 if [ "$SMOKE" = --smoke ]; then
   ARMS="iyer_ntp_syn iyer_nsp_loss_ctx iyer_nsp_loss_ctx_fixed"
-  OUT=$BASE/concept_aware/runs/$TAG/iyer_replica_smoke
+  OUT=${OUT}_smoke
   MANIFEST=$OUT/manifest.json
   RESULTS=$OUT
   EXTRA=(--max_steps 2 --max_train_samples 64 --max_eval_samples 16)
@@ -91,9 +92,10 @@ PY
 }
 
 if [ "$PHASE" = all ] || [ "$PHASE" = train ]; then
-  free_gb=$(df -BG --output=avail "$BASE" | tail -1 | tr -dc 0-9)
-  [ "$free_gb" -ge 25 ] || [ -n "$SMOKE" ] || { log "only ${free_gb} GB free; seven 1B checkpoints need ~18 GB plus headroom"; exit 1; }
   mkdir -p "$OUT"
+  free_gb=$(df -BG --output=avail "$OUT" | tail -1 | tr -dc 0-9)
+  [ "$free_gb" -ge 25 ] || [ -n "$SMOKE" ] || { log "only ${free_gb} GB free under $OUT; seven 1B checkpoints need ~18 GB plus headroom"; exit 1; }
+  log "checkpoints go to $OUT (${free_gb} GB free there)"
   for arm in $ARMS; do
     dir=$OUT/$arm
     if [ -e "$dir/.replica_done" ]; then log "trained already: $arm"; record "$arm" "$dir"; continue; fi
