@@ -9,6 +9,7 @@ the stored per-item results, so they are available before the run's own end-of-r
     python scripts/summarize_finetune.py outputs/llama-3.2-1b/iyer_finetune.json
     python scripts/summarize_finetune.py outputs/*/seqcls_finetune.json --ref zhang_seed42
     python scripts/summarize_finetune.py outputs/*/iyer_finetune.json --baselines   # + label shares
+    python scripts/summarize_finetune.py outputs/llama-3.2-1b/seqcls_finetune{,_replica}.json --merge
 
 --baselines loads each task's evaluation subset (a minute or two, from the HF cache) and
 adds the majority-class row.  A cell whose accuracy equals one label's share of the
@@ -43,8 +44,29 @@ def label_shares(tasks):
     return out
 
 
-def summarize(path, ref, shares=None):
-    data = json.loads(Path(path).read_text())
+def merged(paths):
+    """One result dict from several files of one protocol and base model, e.g. our arms and
+    the Iyer-replication arms, which run in separate processes and so write separate files.
+    Refuses files whose evaluation data differ (per-task fingerprints), since the paired
+    differences need identical items."""
+    out, prints = {"_meta": {}}, {}
+    for path in paths:
+        data = json.loads(Path(path).read_text())
+        meta = data.get("_meta", {})
+        base = out["_meta"].setdefault("base_model", meta.get("base_model"))
+        if meta.get("base_model") != base:
+            raise SystemExit(f"{path}: base model {meta.get('base_model')} differs from {base}")
+        for t, fp in meta.get("fingerprints", {}).items():
+            if prints.setdefault(t, fp) != fp:
+                raise SystemExit(f"{path}: {t} was scored on different data; cannot merge")
+        for t in TASKS:
+            for arm, r in data.get(t, {}).items():
+                out.setdefault(t, {}).setdefault(arm, r)
+    return out
+
+
+def summarize(path, ref, shares=None, data=None):
+    data = data if data is not None else json.loads(Path(path).read_text())
     meta = data.get("_meta", {})
     arms = list(dict.fromkeys(a for t in TASKS for a in data.get(t, {})))
     if not arms:
@@ -113,8 +135,13 @@ def main():
     p.add_argument("--ref", default="zhang_seed42", help="arm the paired differences are taken against")
     p.add_argument("--baselines", action="store_true",
                    help="load the evaluation subsets: majority-class row, and flag one-label answers")
+    p.add_argument("--merge", action="store_true",
+                   help="one table from all FILES (same protocol and base model), e.g. ours + the replication")
     a = p.parse_args()
     shares = label_shares(TASKS) if a.baselines else None
+    if a.merge:
+        summarize(" + ".join(a.files), a.ref, shares, data=merged(a.files))
+        return
     for f in a.files:
         summarize(f, a.ref, shares)
 

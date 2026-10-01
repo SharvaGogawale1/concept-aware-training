@@ -22,8 +22,11 @@ import torch
 import torch.nn.functional as F
 
 
-def resolve_checkpoints(labels, manifests):
-    """label -> adapter path (None for the untouched model), from manifest JSONs."""
+def resolve_checkpoints(labels, manifests, allow_full=False):
+    """label -> adapter path (None for the untouched model), from manifest JSONs.
+
+    allow_full also accepts a fully fine-tuned model directory (config.json, no adapter),
+    for callers that load such a directory as the base model themselves."""
     table = {}
     for path in manifests:
         for key, value in json.loads(Path(path).read_text()).items():
@@ -36,7 +39,8 @@ def resolve_checkpoints(labels, manifests):
         if label not in table:
             raise SystemExit(f"{label} is in none of the manifests: {manifests}")
         adapter = Path(table[label])
-        if not (adapter / "adapter_config.json").is_file():
+        full = allow_full and (adapter / "config.json").is_file()
+        if not (adapter / "adapter_config.json").is_file() and not full:
             raise SystemExit(f"{label}: no adapter_config.json under {adapter}")
         out[label] = str(adapter)
     return out

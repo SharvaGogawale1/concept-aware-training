@@ -18,13 +18,25 @@ class DifferentiableNCPTrainer(Trainer):
 
     The log_sum_exp term = log p(any valid concept | context), the correct training signal
     for a set-valued label. Gradients flow through log_softmax back into all model parameters.
+
+    reduction="mean" instead averages log p(c | context) over the completions, the objective
+    Iyer et al. (2026) write down and their released CustomTrainer computes (there under
+    torch.no_grad, so with zero gradient).  With single_token_only=True, completions that are
+    more than one token are skipped, as that trainer skips them.  Together these give the
+    released objective with its gradient restored, scored at the concept slot in the
+    leading-space convention.
     """
 
-    def __init__(self, *args, completions_lookup=None, tokenizer=None, alpha: float = 1.0, **kwargs):
+    def __init__(self, *args, completions_lookup=None, tokenizer=None, alpha: float = 1.0,
+                 reduction: str = "logsumexp", single_token_only: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
+        if reduction not in ("logsumexp", "mean"):
+            raise ValueError(f"reduction must be 'logsumexp' or 'mean', got {reduction!r}")
         self.completions_lookup = completions_lookup or {}
         self.processing_class = tokenizer
         self.alpha = alpha
+        self.reduction = reduction
+        self.single_token_only = single_token_only
         self._token_id_cache: dict = {}
 
     def _get_concept_first_token_id(self, word: str):
@@ -36,7 +48,8 @@ class DifferentiableNCPTrainer(Trainer):
         # the zero-extra-forward-pass property). Mirrors eval_concept_ppl_v2.
         if word not in self._token_id_cache:
             enc = self.processing_class(" " + word.strip(), add_special_tokens=False)["input_ids"]
-            self._token_id_cache[word] = enc[0] if len(enc) > 0 else None
+            usable = len(enc) == 1 if self.single_token_only else len(enc) > 0
+            self._token_id_cache[word] = enc[0] if usable else None
         return self._token_id_cache[word]
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
@@ -101,9 +114,13 @@ class DifferentiableNCPTrainer(Trainer):
                     continue
 
                 ids_t = torch.tensor(concept_ids, device=logits.device, dtype=torch.long)
-                # log p(any valid concept | context) — marginal likelihood over the concept set
-                log_p_set = torch.logsumexp(log_probs[ids_t], dim=0)
-                ncp_loss = ncp_loss + (-log_p_set)
+                if self.reduction == "logsumexp":
+                    # log p(any valid concept | context) — marginal likelihood over the concept set
+                    slot_score = torch.logsumexp(log_probs[ids_t], dim=0)
+                else:
+                    # mean_c log p(c | context) — the released objective
+                    slot_score = log_probs[ids_t].mean()
+                ncp_loss = ncp_loss + (-slot_score)
                 valid_count += 1
 
         if valid_count > 0:

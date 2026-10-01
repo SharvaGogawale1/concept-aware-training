@@ -111,6 +111,16 @@ class ModelArguments:
         default=1.0,
         metadata={"help": "Weight of the differentiable NCP loss term (alpha * NCP added to CLM loss)."},
     )
+    ncp_reduction: str = field(
+        default="logsumexp",
+        metadata={"help": "logsumexp: -log sum_c p(c|ctx) (set marginal); mean: -mean_c log p(c|ctx) "
+                          "(Iyer et al.'s objective).", "choices": ["logsumexp", "mean"]},
+    )
+    ncp_single_token_only: bool = field(
+        default=False,
+        metadata={"help": "Skip completions longer than one token (as Iyer et al.'s CustomTrainer does) "
+                          "instead of supervising their first token."},
+    )
 
     def __post_init__(self):
         if self.config_overrides is not None and (self.config_name is not None or self.model_name_or_path is not None):
@@ -424,6 +434,8 @@ def main():
         callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
         completions_lookup=completions_lookup,
         alpha=model_args.ncp_alpha,
+        reduction=model_args.ncp_reduction,
+        single_token_only=model_args.ncp_single_token_only,
     )
 
     if training_args.do_train:

@@ -143,6 +143,8 @@ class Formatter:
 def build_model(base_model, adapter, quantize, device):
     from transformers import AutoModelForCausalLM
     from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
+    if adapter and not (Path(adapter) / "adapter_config.json").is_file():
+        base_model, adapter = adapter, None             # a fully fine-tuned model: it is the base
     kwargs = {"device_map": {"": device}} if device.startswith("cuda") else {}   # on a Mac, device_map picks MPS
     if quantize:
         from transformers import BitsAndBytesConfig
@@ -307,7 +309,7 @@ def main():
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     tok = AutoTokenizer.from_pretrained(a.base_model)
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
-    checkpoints = resolve_checkpoints(a.arms, a.manifests)
+    checkpoints = resolve_checkpoints(a.arms, a.manifests, allow_full=True)
     out_path = Path(a.out)
     if a.smoke:
         out_path = out_path.with_name(f"{out_path.stem}_smoke{out_path.suffix}")
