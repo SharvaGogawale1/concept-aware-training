@@ -22,12 +22,13 @@ set -euo pipefail
 TAG=$1; MODEL=$2; GPU=$3; shift 3
 EXTRA=("$@")
 # STAGE=verified (default) mines the data first; STAGE=hybrid runs the original-data
-# hybrid stage of 15b; STAGE=confirm15 runs Task 15's extra seeds.  The last two
+# hybrid stage of 15b; STAGE=confirm15 runs Task 15's extra seeds; STAGE=task15 is a
+# new family's first pass (extraction, smoke, seed-42 baselines).  The last three
 # never touch the verified data.
 STAGE=${STAGE:-verified}
 SUFFIX=${RUN_NAME:+_$RUN_NAME}
 case $STAGE in
-  confirm15) SRC=reproducibilty_15.ipynb;  NB=reproducibilty_15_$TAG$SUFFIX.ipynb ;;
+  confirm15|task15) SRC=reproducibilty_15.ipynb;  NB=reproducibilty_15_$TAG$SUFFIX.ipynb ;;
   *)         SRC=reproducibilty_15b.ipynb; NB=reproducibilty_15b_$TAG$SUFFIX.ipynb ;;
 esac
 BASE=${CONCEPT_BASE:-$PWD}

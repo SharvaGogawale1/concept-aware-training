@@ -22,14 +22,15 @@ parser.add_argument("notebook")
 parser.add_argument("--gpu")
 parser.add_argument("--base", default=".", help="CONCEPT_BASE: holds outputs/")
 parser.add_argument("--model-tag", default="qwen3-1.7b-base")
-parser.add_argument("--stage", choices=["hybrid", "verified", "confirm15"], default="hybrid",
+parser.add_argument("--stage", choices=["hybrid", "verified", "confirm15", "task15"], default="hybrid",
                     help="hybrid: the frontier screen (default); verified: the verified-supervision arms; "
-                         "confirm15: Task 15's other seeds (use on reproducibilty_15_<tag>.ipynb)")
+                         "confirm15: Task 15's other seeds; task15: a new family's first pass -- extract, "
+                         "smoke, seed-42 baselines (the last two on reproducibilty_15_<tag>.ipynb)")
 parser.add_argument("--hybrid-arms", default="",
                     help='hybrid stage only: train only these grid arms, e.g. "uniform:0.125,mass:0.125"')
 parser.add_argument("--selected-hybrid", default=None,
                     help='hybrid stage only: the selected arm, e.g. "uniform:0.125"; with --multiseed trains its seeds')
-parser.add_argument("--multiseed", action="store_true", help="add seeds 123 and 2024 (hybrid / confirm15)")
+parser.add_argument("--multiseed", action="store_true", help="add seeds 123 and 2024 (hybrid / confirm15 / task15)")
 parser.add_argument("--result-tag", default="",
                     help='hybrid stage only: score into task15b_screen<tag>, e.g. "_confirm"')
 parser.add_argument("--eval-arms", default="",
@@ -40,7 +41,7 @@ parser.add_argument("--swords-test", action="store_true",
 parser.add_argument("--no-screen", action="store_true",
                     help="hybrid stage only: never turn RUN_SCREEN on (a machine without the screen arms)")
 parser.add_argument("--confirm-arms", default="",
-                    help='confirm15 only: families that get the extra seeds, e.g. "zhang" ("" = all)')
+                    help='confirm15 / task15: families that get the extra seeds, e.g. "zhang" ("" = all)')
 parser.add_argument("--smoke-steps", type=int, default=0,
                     help="verified stage only: >0 trains ~that many steps per arm and prints magnitudes")
 parser.add_argument("--smoke-only", action="store_true",
@@ -69,6 +70,15 @@ if args.stage == "confirm15":
     FLAGS.update({"RUN_DATA": "False", "RUN_SMOKE": "False", "RUN_SCREEN": "False",
                   "RUN_CONFIRM": "True", "RUN_MULTISEED": "True",
                   "CONFIRM_ARMS": f'"{args.confirm_arms}"',
+                  "RUN_EVAL": "False" if args.no_eval else "True"})
+if args.stage == "task15":
+    # A family with nothing on disk yet: extract the concept sets, smoke-test the
+    # objective, train the seed-42 baselines, and (RUN_CONFIRM over SEEDS=[42]) the
+    # randomized lambda=1 control.  --multiseed adds seeds 123 and 2024 in this pass.
+    FLAGS.clear()
+    FLAGS.update({"RUN_DATA": "True", "RUN_SMOKE": "True", "RUN_SCREEN": "True",
+                  "RUN_CONFIRM": "True", "RUN_MULTISEED": "True" if args.multiseed else "False",
+                  "CONFIRM_ARMS": f'"{args.confirm_arms}"', "SPACY_GPU": "True",
                   "RUN_EVAL": "False" if args.no_eval else "True"})
 if args.stage == "verified":
     # The verified pass must not relaunch the hybrid screen: those arms resume by
@@ -105,7 +115,7 @@ for name in ("task15", "task15b"):
 if missing_any and args.stage == "hybrid" and not args.no_screen:
     FLAGS["RUN_SCREEN"] = "True"
     print("\n=> RUN_SCREEN=True: a screen arm must be retrained to re-enter the table.")
-else:
+elif args.stage == "hybrid":
     print("\n=> RUN_SCREEN=False: every screen arm reloads from the manifest.")
 
 # ---- edit the control cell ---------------------------------------------------
