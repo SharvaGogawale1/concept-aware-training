@@ -25,8 +25,10 @@ git -C "$LAYA" checkout -q "$COMMIT"
 echo "Laya's repo at $(git -C "$LAYA" rev-parse HEAD)"
 
 if [ ! -x "$ENV_PY" ]; then
-  "$CONDA" create -y -q -n laya -c conda-forge --override-channels python=3.12   # no Anaconda ToS prompt
+  "$CONDA" create -y -q -n laya -c conda-forge --override-channels python=3.12 pip   # no Anaconda ToS prompt
 fi
+# conda-forge's python ships without pip; an env created before that was added lacks it.
+"$ENV_PY" -m pip --version >/dev/null 2>&1 || "$CONDA" install -y -q -n laya -c conda-forge --override-channels pip
 "$ENV_PY" -m pip install -q --no-cache-dir "numpy<2"
 "$ENV_PY" -m pip install -q --no-cache-dir torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
 "$ENV_PY" -m pip install -q --no-cache-dir -e "$LAYA/transformers"
