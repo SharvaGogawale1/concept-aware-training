@@ -138,6 +138,8 @@ def finetune(model, fmt, task, device, pad_id, log, steps=100):
             if v < best:
                 best = v
                 best_state = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad}
+    if best_state is None:
+        raise RuntimeError(f"validation loss was never finite: {curve}")
     with torch.no_grad():
         for n, p in model.named_parameters():
             if n in best_state:
