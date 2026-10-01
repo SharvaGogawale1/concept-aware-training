@@ -79,6 +79,15 @@ STAGE=task15 RUN_NAME=first bash $P/run_verified_pipeline.sh "$TAG" "$MODEL" "$G
 have_arms $M/task15.json ntp_seed42 augmented_ntp_seed42 randomized_seed42 randomized_lambda1.0_seed42 zhang_seed42 \
   || { log "phase 1 finished without every seed-42 baseline; stopping"; exit 1; }
 
+# The locked test pass refuses to run twice (its marker), so a rerun after it finished skips it.
+test_pass() {
+  if [ -e outputs/$TAG/task15b_screen_test/swords_test_locked.json ]; then
+    log "test pass already done (outputs/$TAG/task15b_screen_test/swords_test_locked.json); not rerun"
+    return 0
+  fi
+  STAGE=hybrid RUN_NAME=test bash $P/run_verified_pipeline.sh "$TAG" "$MODEL" "$GB" --no-screen \
+      --selected-hybrid $LOCKED --result-tag _test --swords-test
+}
 # The two chains are written with && on purpose: bash ignores `set -e` inside anything
 # on the left of `||`, so a failed stage would otherwise run straight into the next one.
 chain_b() {
@@ -90,8 +99,7 @@ chain_b() {
   STAGE=hybrid RUN_NAME=sharedgamma bash $P/run_verified_pipeline.sh "$TAG" "$MODEL" "$GB" --no-screen \
       --hybrid-arms $GRID --selected-hybrid $LOCKED --multiseed --result-tag _shared_gamma \
       --eval-arms "$(echo $ARMS | tr ' ' ',')" &&
-  STAGE=hybrid RUN_NAME=test bash $P/run_verified_pipeline.sh "$TAG" "$MODEL" "$GB" --no-screen \
-      --selected-hybrid $LOCKED --result-tag _test --swords-test &&
+  test_pass &&
   log "gpu-b chain done"
 }
 chain_a() {
