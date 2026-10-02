@@ -353,17 +353,29 @@ def main():
         labels = [-100 if t == pad_id else t for t in ids]
         return {"input_ids": ids, "attention_mask": attn, "labels": labels}
 
+    # completions_lookup is filled as a SIDE EFFECT of tokenize_function.  A cached map
+    # skips the function entirely and leaves the lookup empty, which silently turns the
+    # NCP term off (it happened: a smoke run cached the map and the real run trained CLM
+    # alone).  Worker processes would fill their own copies and lose them the same way.
+    # So the map always runs, in this process, and an empty lookup is an error.
+    if data_args.preprocessing_num_workers and data_args.preprocessing_num_workers > 1:
+        raise ValueError("--preprocessing_num_workers > 1 would build the concept lookup in worker "
+                         "processes and lose it; leave it unset")
     with training_args.main_process_first(desc="dataset map tokenization"):
         if not data_args.streaming:
             tokenized_datasets = raw_datasets.map(
                 tokenize_function,
                 batched=False,
-                num_proc=data_args.preprocessing_num_workers,
-                load_from_cache_file=not data_args.overwrite_cache,
+                load_from_cache_file=False,
                 desc="Running tokenizer on dataset",
             )
         else:
             tokenized_datasets = raw_datasets.map(tokenize_function, batched=False)
+    if syn_column_name and not data_args.streaming:
+        filled = sum(1 for v in completions_lookup.values() if v)
+        if filled == 0:
+            raise RuntimeError("the concept lookup is empty after tokenization: the NCP term would never apply")
+        logger.info(f"concept lookup: {filled} contexts with a non-empty concept set")
 
     max_pos_embeddings = getattr(config, "max_position_embeddings", 1024)
     if data_args.block_size is None:
