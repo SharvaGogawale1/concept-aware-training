@@ -10,8 +10,10 @@ from Hugging Face:
       CoLA, SST-2, MRPC, QQP, MNLI-matched, QNLI, RTE  -- scored on validation,
       because GLUE's test labels are hidden.
   SNLI, SPAM (SpamAssassin; its parquet conversion, pinned), HATE (Davidson et al.), FAKE (PolitiFact), LOG
-  (logical fallacy).  EmpatheticDialogues is left out: it ships only as a loader
-  script that current `datasets` cannot run.
+  (logical fallacy), EMO (EmpatheticDialogues: utterance -> one of 32 emotions, the
+  task in Iyer et al.'s Appendix F).  EMO's repo is a loader script that current
+  `datasets` cannot run, so Hugging Face's parquet conversion of it is pinned by commit;
+  its splits match the paper's 76,673 / 12,030 / 10,943 utterances exactly.
 
 MTEB's procedure, per task: shuffle the training indices with
 np.random.RandomState(seed), keep the first `samples_per_label` rows of each label,
@@ -68,7 +70,12 @@ TASKS = {
              "train", "test", ("news",), "label"),
     "logic": ("tasksource/logical-fallacy", None, "37e9b0537a86e72e9eaf6ee8c9a27d872a944103",
               "train", "test", ("source_article",), "logical_fallacies"),
+    "emo": ("parquet", {split: "hf://datasets/facebook/empathetic_dialogues@d5b57ae707b0b9a384af8ed50c043c608d597ca7"
+                               f"/default/{split}/0000.parquet" for split in ("train", "test")},
+            None, "train", "test", ("utterance",), "context"),
 }
+# Text clean-up applied to a task's text columns before anything else sees them.
+CLEAN = {"emo": lambda text: text.replace("_comma_", ",")}   # the dataset escapes commas
 GLUE_TASKS = ["cola", "sst2", "mrpc", "qqp", "mnli", "qnli", "rte"]
 SEED, N_EXPERIMENTS, MAX_EVAL, MAX_TRAIN_POOL = 42, 10, 10_000, 50_000
 
@@ -93,6 +100,9 @@ def load_task(name, limit=None):
         train, evalset = train.select(sorted(tr_idx)), train.select(sorted(ev_idx))
     else:
         evalset = ds[eval_split].filter(lambda ex: ex[label_col] is not None and ex[label_col] != -1)
+    if name in CLEAN:
+        fix = lambda ex: {c: CLEAN[name](ex[c]) for c in cols}
+        train, evalset = train.map(fix), evalset.map(fix)
     if len(evalset) > MAX_EVAL:
         evalset = evalset.select(sorted(rng.choice(len(evalset), MAX_EVAL, replace=False)))
     if len(train) > MAX_TRAIN_POOL:                     # sampling pool only; MTEB draws <=64/label

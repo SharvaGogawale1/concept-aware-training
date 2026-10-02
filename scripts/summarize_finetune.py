@@ -22,7 +22,7 @@ from pathlib import Path
 
 import numpy as np
 
-TASKS = ["mnli", "snli", "hate", "spam", "fake", "logic", "cola", "sst2", "mrpc", "qqp", "qnli", "rte"]
+TASKS = ["emo", "mnli", "snli", "hate", "spam", "fake", "logic", "cola", "sst2", "mrpc", "qqp", "qnli", "rte"]
 GLUE = ["cola", "sst2", "mrpc", "qqp", "mnli", "qnli", "rte"]
 
 

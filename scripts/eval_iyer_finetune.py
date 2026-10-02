@@ -57,8 +57,10 @@ ALPACA = ("Below is an instruction that describes a task, paired with an input t
 
 NLI3 = {"0": "entailment", "1": "neutral", "2": "contradiction"}
 NLI2 = {"0": "entailment", "1": "not entailment"}
-# task: (instruction, field names shown in the input, raw label -> answer word)
+# task: (instruction, field names shown in the input, raw label -> answer word).  An
+# instruction with {labels} lists the answer words (tasks with many labels).
 SPECS = {
+    "emo": ("Which emotion does the speaker feel? Answer one of: {labels}.", ("Utterance",), None),
     "mnli": ("Does the premise entail the hypothesis? Answer entailment, neutral, or contradiction.",
              ("Premise", "Hypothesis"), NLI3),
     "snli": ("Does the premise entail the hypothesis? Answer entailment, neutral, or contradiction.",
@@ -70,7 +72,7 @@ SPECS = {
     # 0 = false, 1 = true (checked against the claims at the pinned revision).
     "fake": ("Is this political claim true or false? Answer true or false.", (None,),
              {"0": "false", "1": "true"}),
-    "logic": (None, (None,), None),                   # instruction lists the 13 fallacies; labels are words
+    "logic": ("Which logical fallacy does the text contain? Answer one of: {labels}.", (None,), None),
     "cola": ("Is this sentence grammatically acceptable? Answer acceptable or unacceptable.",
              (None,), {"0": "unacceptable", "1": "acceptable"}),
     "sst2": ("What is the sentiment of this sentence? Answer positive or negative.",
@@ -84,7 +86,7 @@ SPECS = {
     "rte": ("Does the first sentence entail the second? Answer entailment or not entailment.",
             ("Sentence 1", "Sentence 2"), NLI2),
 }
-TASK_ORDER = list(SPECS)                               # Iyer's six columns first
+TASK_ORDER = list(SPECS)                               # Iyer's seven columns first
 GLUE_TASKS = probe.GLUE_TASKS
 
 
@@ -98,8 +100,8 @@ def load(name):
         probe._texts = joined
     instruction, fields, verbal = SPECS[name]
     words = [verbal[n] if verbal else n for n in t["labels"]]
-    if instruction is None:
-        instruction = "Which logical fallacy does the text contain? Answer one of: " + ", ".join(words) + "."
+    if "{labels}" in instruction:
+        instruction = instruction.format(labels=", ".join(words))
     rng = np.random.RandomState(SEED)
     order = rng.permutation(len(t["train_y"]))
     tr, va = order[:N_TRAIN], order[N_TRAIN:N_TRAIN + N_VAL]
