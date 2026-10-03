@@ -55,9 +55,10 @@ PY
 current=$(ls -t verified_${T}_*.log 2>/dev/null | head -1)
 [ -n "$current" ] && { echo "-- newest pass log: $current"; last "$current" 3 | cut -c1-200; }
 
-hr "Downstream fine-tunes (finished task x arm runs; 7 systems x 13 tasks = 91 when complete)"
-for f in outputs/{llama-3.2-1b,qwen3-1.7b-base,$T}/{seqcls,iyer}_finetune{,_replica}.json; do
+hr "Downstream fine-tunes (finished task x arm runs; complete = 91 for 7 systems, 143 for Llama's 11 in *_ftseed*)"
+for f in outputs/{llama-3.2-1b,qwen3-1.7b-base,$T}/{seqcls,iyer}_finetune*.json; do
   [ -f "$f" ] || continue
+  case $f in *_smoke.json) continue ;; esac
   line=$("$PY" $S/summarize_finetune.py "$f" 2>/dev/null | grep "runs finished") || line="(file is being written; run again)"
   printf '%-52s %s\n' "$f" "$(echo "$line" | sed 's/^ *//')"
 done

@@ -174,6 +174,7 @@ def score(pred, ys, n_labels):
 
 
 def main():
+    global SEED
     p = argparse.ArgumentParser()
     p.add_argument("--base-model", required=True)
     p.add_argument("--manifests", nargs="*", default=[])
@@ -184,7 +185,11 @@ def main():
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--no-quantize", action="store_true", help="fp32, no bitsandbytes (CPU smoke tests)")
     p.add_argument("--smoke", action="store_true", help="3 steps, 16 validation and 16 eval items")
+    p.add_argument("--seed", type=int, default=SEED,
+                   help="fine-tune seed: which training/validation examples, head and task-LoRA init, order.  "
+                        "The evaluation items do not depend on it.  Use a separate --out per seed.")
     a = p.parse_args()
+    SEED = iyer.SEED = a.seed
     if a.smoke:
         iyer.N_TRAIN, iyer.N_VAL, iyer.MAX_EVAL = 3 * 2 * 4, 16, 16
 

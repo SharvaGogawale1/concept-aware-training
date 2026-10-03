@@ -10,6 +10,9 @@ the stored per-item results, so they are available before the run's own end-of-r
     python scripts/summarize_finetune.py outputs/*/seqcls_finetune.json --ref zhang_seed42
     python scripts/summarize_finetune.py outputs/*/iyer_finetune.json --baselines   # + label shares
     python scripts/summarize_finetune.py outputs/llama-3.2-1b/seqcls_finetune{,_replica}.json --merge
+    python scripts/summarize_finetune.py --pool-seeds \
+        outputs/llama-3.2-1b/seqcls_finetune.json,outputs/llama-3.2-1b/seqcls_finetune_replica.json \
+        outputs/llama-3.2-1b/seqcls_finetune_ftseed{1,2}.json --ref iyer_ntp_syn
 
 --baselines loads each task's evaluation subset (a minute or two, from the HF cache) and
 adds the majority-class row.  A cell whose accuracy equals one label's share of the
@@ -63,6 +66,55 @@ def merged(paths):
             for arm, r in data.get(t, {}).items():
                 out.setdefault(t, {}).setdefault(arm, r)
     return out
+
+
+def pooled(groups, ref):
+    """Mean +- sd over fine-tune seeds.  Each group is one seed's file(s), comma-separated
+    (e.g. our arms + the replication).  Only arms and tasks present in every seed are used.
+    The evaluation items are the same in every seed, so the difference against `ref` is
+    averaged over seeds item by item and bootstrapped over items; the per-seed differences
+    show whether the seeds agree."""
+    datas = [merged(g.split(",")) for g in groups]
+    first = datas[0]
+    seqcls = any("eval" in r for t in TASKS for r in first.get(t, {}).values())
+    acc = (lambda r: r["eval"]["accuracy"]) if seqcls else (lambda r: r["match_accuracy"])
+    items = (lambda r: r["per_item_test"]) if seqcls else (lambda r: r["per_item_match"])
+    arms = [a for a in dict.fromkeys(a for t in TASKS for a in first.get(t, {}))
+            if all(a in d.get(t, {}) for d in datas for t in TASKS if t in first)]
+    tasks = [t for t in TASKS if all(all(a in d.get(t, {}) for a in arms) for d in datas)]
+    print(f"\n{len(groups)} fine-tune seeds pooled ({'classification head' if seqcls else 'generated answer'}), "
+          f"{len(arms)} systems, {len(tasks)} tasks: test accuracy (%), mean +- sd over seeds")
+    width = max(13, *(len(a) for a in arms))
+    print("  " + "task".ljust(7) + "".join(a.rjust(width + 2) for a in arms))
+    for t in tasks:
+        cells = []
+        for a in arms:
+            v = 100 * np.array([acc(d[t][a]) for d in datas])
+            cells.append(f"{v.mean():5.1f} +- {v.std(ddof=1):3.1f}")
+        print("  " + t.ljust(7) + "".join(c.rjust(width + 2) for c in cells))
+    if all(t in tasks for t in GLUE):
+        cells = []
+        for a in arms:
+            v = 100 * np.array([np.mean([acc(d[t][a]) for t in GLUE]) for d in datas])
+            cells.append(f"{v.mean():5.1f} +- {v.std(ddof=1):3.1f}")
+        print("  " + "GLUE-7".ljust(7) + "".join(c.rjust(width + 2) for c in cells))
+    if ref not in arms:
+        print(f"  (no paired differences: {ref} is not in every seed)")
+        return
+    print(f"  difference vs {ref}, points: seed-averaged [95% CI over items] (per-seed differences)  * = CI excludes 0")
+    for a in arms:
+        if a == ref:
+            continue
+        parts = []
+        for t in tasks:
+            per_item = np.mean([np.asarray(items(d[t][a]), float) - np.asarray(items(d[t][ref]), float)
+                                for d in datas], axis=0)
+            per_seed = [100 * (np.mean(items(d[t][a])) - np.mean(items(d[t][ref]))) for d in datas]
+            boots = per_item[np.random.RandomState(42).randint(0, len(per_item), (10_000, len(per_item)))].mean(1)
+            lo, hi = np.percentile(boots, [2.5, 97.5]) * 100
+            parts.append(f"{t} {100 * per_item.mean():+.1f} [{lo:+.1f},{hi:+.1f}]{'*' if lo > 0 or hi < 0 else ''}"
+                         f" ({'/'.join(f'{x:+.1f}' for x in per_seed)})")
+        print(f"    {a}: " + "; ".join(parts))
 
 
 def summarize(path, ref, shares=None, data=None):
@@ -137,7 +189,13 @@ def main():
                    help="load the evaluation subsets: majority-class row, and flag one-label answers")
     p.add_argument("--merge", action="store_true",
                    help="one table from all FILES (same protocol and base model), e.g. ours + the replication")
+    p.add_argument("--pool-seeds", action="store_true",
+                   help="each FILES argument is one fine-tune seed (comma-separate files to merge within a "
+                        "seed): mean +- sd over seeds, and seed-averaged paired differences vs --ref")
     a = p.parse_args()
+    if a.pool_seeds:
+        pooled(a.files, a.ref)
+        return
     shares = label_shares(TASKS) if a.baselines else None
     if a.merge:
         summarize(" + ".join(a.files), a.ref, shares, data=merged(a.files))
