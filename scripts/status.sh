@@ -18,7 +18,19 @@ df -h "$BASE" | tail -1
 hr "Our processes (pid, running time, command)"
 ps -u "$USER" -o pid=,etime=,args= | grep -E "papermill|run_new_family|eval_seqcls|eval_iyer|run_clm|train\.py|embedding_synonyms|get_content_words|lm_eval|eval_swords|eval_mteb|eval_classification|eval_word" \
   | grep -v grep | sed -E 's#/home/[^ ]*/(python[0-9.]*|bin/python)#python#' | cut -c1-160
-tmux ls 2>/dev/null | cut -d: -f1 | tr '\n' ' '; echo
+
+hr "tmux sessions: busy ones with their last line, then the idle ones (finished or never used)"
+if command -v tmux >/dev/null && tmux ls >/dev/null 2>&1; then
+  idle=""
+  while read -r name cmd; do
+    case $cmd in
+      bash|zsh|sh|"") idle+="$name " ;;
+      *) line=$(tmux capture-pane -pt "$name" 2>/dev/null | tr '\r' '\n' | grep -v '^\s*$' | tail -1 | cut -c1-140)
+         printf '  %-12s %s\n' "$name" "$line" ;;
+    esac
+  done < <(tmux list-panes -a -F '#{session_name} #{pane_current_command}' | sort -u -k1,1)
+  echo "  idle: $idle"
+fi
 
 hr "Falcon ($T)"
 [ -e family_$T.failed ] && echo "!! FAILED marker present: family_$T.failed -- read the gpuA/gpuB logs"
@@ -43,11 +55,24 @@ PY
 current=$(ls -t verified_${T}_*.log 2>/dev/null | head -1)
 [ -n "$current" ] && { echo "-- newest pass log: $current"; last "$current" 3 | cut -c1-200; }
 
-hr "Downstream fine-tunes (finished task x arm runs)"
+hr "Downstream fine-tunes (finished task x arm runs; 7 systems x 13 tasks = 91 when complete)"
 for f in outputs/{llama-3.2-1b,qwen3-1.7b-base,$T}/{seqcls,iyer}_finetune{,_replica}.json; do
   [ -f "$f" ] || continue
   line=$("$PY" $S/summarize_finetune.py "$f" 2>/dev/null | grep "runs finished") || line="(file is being written; run again)"
   printf '%-52s %s\n' "$f" "$(echo "$line" | sed 's/^ *//')"
+done
+
+hr "EMO in the frozen probe (systems scored, of 21)"
+for t in llama-3.2-1b qwen3-1.7b-base $T; do
+  python3 - "outputs/$t/classification_probe.json" "$t" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except (FileNotFoundError, json.JSONDecodeError):
+    print(f"  {sys.argv[2]}: no readable probe file"); sys.exit()
+arms = [k for k in d if not k.startswith("_")]
+print(f"  {sys.argv[2]:18s} {sum('emo' in d[a] for a in arms)}/{len(arms)}")
+PY
 done
 
 hr "Iyer replication"
