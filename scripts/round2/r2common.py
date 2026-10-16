@@ -164,10 +164,15 @@ def write_json(path, payload):
     tmp.replace(path)
 
 
+def inside_r2(path):
+    """True when `path` is under results/round2, compared lexically so that a
+    subdirectory symlinked to the NAS (checkpoints/, per_target/) still counts."""
+    return os.path.normpath(os.path.abspath(path)).startswith(os.path.normpath(os.path.abspath(R2)) + os.sep)
+
+
 def refuse_overwrite(path):
     """New outputs only: a path that exists outside results/round2 is never written."""
-    path = Path(path).resolve()
-    if not str(path).startswith(str(R2.resolve())) and path.exists():
+    if not inside_r2(path) and Path(path).exists():
         raise FileExistsError(f"refusing to write an existing path outside results/round2: {path}")
 
 

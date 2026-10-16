@@ -130,7 +130,8 @@ def cmd_plan(args):
         print(f"queue {q} ({', '.join(fams)}): {n} runs to train, ~{minutes / 60:.1f} h "
               f"(per-run estimate: " + ", ".join(f"{f} {est[f][0]:.0f} min from {est[f][1]} runs" for f in fams) + ")")
     clash = [r["out"] for r in rows if r["action"].startswith("TRAIN") and Path(r["out"]).exists()]
-    outside = [r["out"] for r in rows if not str(Path(r["out"]).resolve()).startswith(str(C.R2.resolve()))]
+    # Lexical, not resolved: results/round2/checkpoints may be a symlink to the NAS.
+    outside = [r["out"] for r in rows if not C.inside_r2(r["out"])]
     print(f"\npath check: {len(clash)} TRAIN outputs already exist (partial runs, renamed aside before "
           f"retraining); {len(outside)} outputs outside results/round2; every existing checkpoint is read-only.")
     C.write_json(C.R2 / "plans" / f"tier{args.tier}.json", {"rows": rows, "estimates_min": est,
