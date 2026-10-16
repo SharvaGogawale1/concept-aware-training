@@ -4,6 +4,18 @@
 > new arm runs before this file is committed (`scripts/round2/run_round2.py` checks for the
 > banner and for the git hash below). Fields marked *fixed by the brief* are not open.
 
+## 0. Scope of this round (decided 2026-10-17)
+
+Trained now (Tier 1, 30 runs): **Alt-Balance** at γ ∈ {0.0625, 0.125} × seeds {42, 123, 2024} × 3
+models (18 runs), and **Alt-Mass** seeds 123 and 2024 at both γ × 3 models (12 runs). The October
+Alt-Mass runs exist at seed 42 only, so comparing the four cells of the 2×2 fairly needs its other
+two seeds as well; with them, every cell has three seeds. Concept loss and Alt-Mass+Balance reuse
+the October checkpoints (three seeds each; Task 1 test B licenses the reuse of the balanced runs).
+
+Not in this round unless the authors add them: the uncapped control, the member-wise (Iyer et al.)
+baseline, the coefficient sweep, scoring on the sealed holdout, and the 8B scale-up. Sections below
+that describe them stay as written so that adding them later does not change this protocol's rules.
+
 - Protocol version: 1
 - Approved by: **AUTHORS** (names, date)
 - Git hash of the code this protocol was written against: **AUTHORS** (`git rev-parse HEAD` at commit time)

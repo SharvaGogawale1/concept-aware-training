@@ -160,6 +160,7 @@ def main():
     if (C.SEALED / "FREEZE.md").exists():
         sys.exit("FREEZE.md exists: the holdout IDs can no longer change.")
 
+    print(f"[{C.now_utc()}] loading CoInCo, SWORDS and the used 800-target subsets", flush=True)
     sources = {split: load(RAW / f"coinco_{split}.json.gz") for split in ("dev", "test")}
     used = set()
     for path in USED:
@@ -229,7 +230,9 @@ def main():
     write_json_gz(tmp, merged)
     per_model = {}
     eligible = set(pool)
+    print(f"[{C.now_utc()}] pool before the tokenizer check: {len(pool)} targets", flush=True)
     for tok in args.tokenizers.split(","):
+        print(f"[{C.now_utc()}] tokenizer check: {tok} (a few minutes each)", flush=True)
         ok = tokenizer_eligible(tmp, tok)
         per_model[tok] = {"eligible": len(ok & set(pool)), "excluded": sorted(set(pool) - ok)}
         eligible &= ok

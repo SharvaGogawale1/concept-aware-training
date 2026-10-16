@@ -41,7 +41,7 @@ def locked_arms(tag):
 
 def run(argv, cwd, gpu, log):
     env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu), "PYTHONUTF8": "1",
-           "PYTHONIOENCODING": "utf-8", "HF_HOME": os.environ.get("HF_HOME", str(C.WORK / "hf_cache"))}
+           "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1", "HF_HOME": os.environ.get("HF_HOME", str(C.WORK / "hf_cache"))}
     start = time.time()
     with open(log, "a", encoding="utf-8") as handle:
         handle.write("+ " + " ".join(map(str, argv)) + "\n")
@@ -83,6 +83,8 @@ def main():
         for bench in benches:
             out = REPRO / tag / f"{bench}.json"
             if not out.is_file():
+                print(f"[{C.now_utc()}] scoring {bench} for {tag}: {len(ckpts)} checkpoints "
+                      f"(progress in {log})", flush=True)
                 minutes += run([args.python, EVAL_DIR / "eval_swords.py", "--checkpoints", *ckpts,
                                 "--tokenizer_path", model, "--base_model", model,
                                 "--swords_json", sources[bench], "--results_json", out,
@@ -101,6 +103,7 @@ def main():
             out = REPRO / tag / "perplexity.json"
             ck = arms[ARMS["concept"]]
             if not out.is_file():
+                print(f"[{C.now_utc()}] C4 test NLL for {tag}", flush=True)
                 minutes += run([args.python, "eval/eval_perplexity_explicit.py", "--checkpoints", ck,
                                 "--base-model", model, "--test-jsonl", C.leaf(tag) / "synonyms_test.jsonl",
                                 "--output", out], C.EXT, args.gpu, log)

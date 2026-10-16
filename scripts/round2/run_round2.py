@@ -187,7 +187,7 @@ def train_one(row, gpu, python):
             "--gradient-accumulation-steps", "2", *C.gamma_flags(objective, gamma)]
     env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu), "CONCEPT_DATA_ROOT": str(C.DATA),
            "CONCEPT_CHECKPOINT_ROOT": str(C.R2 / "ckpt_scratch"), "PYTHONUTF8": "1",
-           "PYTHONIOENCODING": "utf-8", "HF_HOME": os.environ.get("HF_HOME", str(C.WORK / "hf_cache"))}
+           "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1", "HF_HOME": os.environ.get("HF_HOME", str(C.WORK / "hf_cache"))}
     started, t0 = C.now_utc(), time.time()
     with open(log, "w", encoding="utf-8") as handle:
         handle.write("+ " + " ".join(argv) + "\n")

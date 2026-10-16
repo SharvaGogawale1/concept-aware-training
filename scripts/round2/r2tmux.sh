@@ -31,5 +31,5 @@ if tmux has-session -t "=$NAME" 2>/dev/null; then
 fi
 printf -v INNER '%q ' bash "$SELF" --inner "$LOG" "$PY" "$@"
 tmux new-session -d -s "$NAME" -c "$REPO" \
-  "env CONCEPT_BASE=$BASE HF_HOME=$HFH PYTHONUTF8=1 PYTHONIOENCODING=utf-8 $INNER"
+  "env CONCEPT_BASE=$BASE HF_HOME=$HFH PYTHONUTF8=1 PYTHONIOENCODING=utf-8 PYTHONUNBUFFERED=1 $INNER"
 echo "started tmux session '$NAME'  log: $LOG"
