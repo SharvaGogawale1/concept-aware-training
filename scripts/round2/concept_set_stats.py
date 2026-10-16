@@ -67,7 +67,8 @@ def main():
     out = {tag: stats(tag, args.split) for tag in args.families.split(",")}
     C.write_json(C.R2 / "concept_sets" / f"A_distribution_{args.split}.json", out)
     for tag, s in out.items():
-        print(f"{tag:18s} positions={s['supervised_positions']:6d}  share|A|>=2={s['share_A_ge_2']:.3f}  "
+        print(f"{tag:18s} positions={s['supervised_positions']:6d}  of tokens={s['supervised_share_of_tokens']:.3f}  "
+              f"share|A|>=2={s['share_A_ge_2']:.3f}  "
               f"|A|=0 {s['share_A_eq_0']:.3f}  |A|=1 {s['share_A_eq_1']:.3f}  mean|A|={s['mean_A']:.2f}")
         print("   hist:", s["A_hist"])
 

@@ -209,9 +209,12 @@ def describe(run, manifests, data_hashes):
 
 
 def mismatches(rows):
-    """Shared settings that differ from the paper, per run (Task 0.4)."""
+    """Shared settings that differ from the paper, per run (Task 0.4).  Smoke runs (a few
+    steps, never evaluated) are listed separately by the caller, not here."""
     out = []
     for row in rows:
+        if "/smoke" in row["checkpoint_path"]:
+            continue
         if not row["has_concept_config"]:
             out.append((row["checkpoint_path"], "no concept_training_config.json"))
             continue
@@ -284,7 +287,13 @@ def main():
         "by_model_objective": Counter(f"{r['model_tag']} {r['objective']}" for r in rows),
         "seeds_by_model_objective_gamma": seed_report(rows),
         "settings_mismatch_vs_paper": mismatches(rows),
-        "manifest_paths_missing_on_disk": sorted(labelled - found)
+        "smoke_runs_ignored": sorted(r["checkpoint_path"] for r in rows if "/smoke" in r["checkpoint_path"]),
+        # A manifest path with no adapter_config.json is either gone, or a FULL-model
+        # checkpoint (the Iyer replication trains whole models): say which.
+        "manifest_paths_missing_on_disk": sorted(p for p in labelled - found if not Path(p).exists())
+        if args.runs_root is None else "n/a (custom roots)",
+        "manifest_paths_full_model_not_lora": sorted(
+            p for p in labelled - found if (Path(p) / "config.json").is_file())
         if args.runs_root is None else "n/a (custom roots)",
         "train_file_hash_differs_from_disk": [r["checkpoint_path"] for r in rows
                                               if r["train_file_matches_disk"] is False],
@@ -296,7 +305,7 @@ def main():
     C.write_json(out / "run_audit_report.json", report)
     print(f"{len(rows)} runs -> {out / 'run_manifest_existing.csv'}")
     print(json.dumps({k: v for k, v in report.items() if k != "seeds_by_model_objective_gamma"},
-                     indent=1, default=str)[:6000])
+                     indent=1, default=str))
 
 
 if __name__ == "__main__":
