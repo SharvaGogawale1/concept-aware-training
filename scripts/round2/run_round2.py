@@ -45,21 +45,55 @@ def train_file_hash(tag):
     return C.sha256(f) if f.is_file() else None
 
 
-def existing_equivalent(tag, objective, gamma, seed, data_hash):
-    """An October checkpoint that trained exactly this objective (Task 1 test H), or None."""
-    if objective not in OLD_KIND:
+def audited_train_hash(tag):
+    """SHA-256 of synonyms_train.jsonl recorded by audit_concept_data.py when the data was built."""
+    f = C.OUTPUTS / tag / "data_audit.json"
+    if not f.is_file():
         return None
-    label = f"zhang_plus_{OLD_KIND[objective]}_g{gamma:g}_seed{seed}"
+    for split in json.loads(f.read_text()).get("splits", []):
+        if split.get("split") == "train":
+            return split.get("sha256")
+    return None
+
+
+def existing_equivalent(tag, objective, gamma, seed, data_hash):
+    """(path, note) of an October checkpoint that trained exactly this objective (Task 1
+    test H), or (None, reason).
+
+    The adapter path is written by the notebooks from the exact training arguments
+    (seed_<s>/lambda_<l>_beta_<b>_aux_<kind>_<gamma>), so it must match; recorded config
+    fields must agree with it.  Runs from before 2026-09-22 recorded no data hash: they are
+    accepted only if the family's training file today still has the hash audited when it was
+    built, i.e. the file never changed in between.
+    """
+    if objective not in OLD_KIND:
+        return None, ""
+    kind = OLD_KIND[objective]
+    label = f"zhang_plus_{kind}_g{gamma:g}_seed{seed}"
     path = manifest(tag, "task15b").get(label)
     if not path or not (Path(path) / "adapter_config.json").is_file():
-        return None
-    cfg = read_config(path)
-    ok = (cfg and cfg.get("alt_aux") == OLD_KIND[objective]
-          and math.isclose(float(cfg.get("alt_aux_weight", 0)), gamma)
-          and int(cfg.get("seed", -1)) == seed and float(cfg.get("concept_loss_weight", 0)) == 1.0
-          and float(cfg.get("target_mass", 0)) == 0.6
-          and (data_hash is None or cfg.get("train_file_sha256") == data_hash))
-    return path if ok else None
+        return None, "no October checkpoint"
+    if Path(path).name != f"lambda_1.0_beta_0.0_aux_{kind}_{gamma}" or Path(path).parent.name != f"seed_{seed}":
+        return None, f"path does not encode {kind} {gamma} seed {seed}: {path}"
+    cfg = read_config(path) or {}
+    fields_ok = (cfg.get("alt_aux", kind) == kind
+                 and math.isclose(float(cfg.get("alt_aux_weight", gamma)), gamma)
+                 and int(cfg.get("seed", seed)) == seed
+                 and float(cfg.get("concept_loss_weight", 1.0)) == 1.0
+                 and float(cfg.get("target_mass", 0.6)) == 0.6
+                 and float(cfg.get("contrast_beta", 0.0) or 0.0) == 0.0
+                 and not cfg.get("exclude_target", False))
+    if not fields_ok:
+        return None, "recorded config disagrees with the plan"
+    recorded = cfg.get("train_file_sha256")
+    if data_hash is None:
+        return path, "reuse"
+    if recorded:
+        return (path, "reuse") if recorded == data_hash else (None, "trained on a different data file")
+    audited = audited_train_hash(tag)
+    if audited and audited == data_hash:
+        return path, "reuse (no data hash recorded; training file unchanged since it was audited)"
+    return None, "no data hash recorded and the training file cannot be shown unchanged"
 
 
 def arms(tier, families):
@@ -80,14 +114,14 @@ def arms(tier, families):
             raise ValueError(tier)
         for block, objective, gamma, seed in plan:
             out = C.checkpoint_dir(tag, objective, gamma, seed)
-            old = existing_equivalent(tag, objective, gamma, seed, data_hash)
+            old, why = existing_equivalent(tag, objective, gamma, seed, data_hash)
             done = (out / "adapter_config.json").is_file() and _completed(out)
             if done:
                 action = "done (round 2)"
             elif old:
-                action = "reuse"
+                action = why
             elif block == "reuse":
-                action = "TRAIN (missing October checkpoint)"
+                action = f"TRAIN (October checkpoint not reusable: {why})"
             else:
                 action = "TRAIN"
             rows.append({"block": block, "family": tag, "objective": objective, "gamma": gamma,
