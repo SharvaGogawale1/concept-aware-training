@@ -68,3 +68,16 @@ build/
 external/learning-concepts/
 !external/README.md
 !external/*.patch
+
+# Round 2 (factorial experiments).  The protocol files must be committed before the
+# runs they govern; checkpoints, logs and derived benchmark data stay out of git.
+!ROUND2_PROTOCOL.md
+!sealed/*.md
+!docs/iyer_mapping.md
+results/round2/checkpoints/
+results/round2/ckpt_scratch/
+results/round2/smoke/
+results/round2/logs/
+results/round2/sealed_data/
+results/round2/per_target/
+results/round2/repro/*/
