@@ -18,8 +18,9 @@ that describe them stay as written so that adding them later does not change thi
 
 - Protocol version: 1
 - Approved by: **AUTHORS** (names, date)
-- Git hash of the code this protocol was written against: **AUTHORS** (`git rev-parse HEAD` at commit time)
-- Trainer patch SHA-256 (`external/learning-concepts.patch`): **AUTHORS**
+- Git hash: the commit that removes this file's TEMPLATE banner (`git log -1 -- ROUND2_PROTOCOL.md`).
+- Trainer patch SHA-256 (`external/learning-concepts.patch`): bd7d72c7dfff2e3b570794ed47e78034416afe97607b2a531b51b18306285137
+  (the patch every Tier-1 run was trained with; recorded per run in `round2_run.json`).
 
 ## 1. Objectives (fixed by the brief)
 
@@ -68,7 +69,11 @@ per model:
 where $Y_{mb}$ is the cell with mass on/off ($m$) and balance on/off ($b$). Inference:
 paired hierarchical bootstrap, 10,000 replicates (resample matched seeds with replacement,
 then targets with replacement, method pairing preserved). Holm–Bonferroni across the 3 models,
-separately for each of the two main effects. α (family-wise) = **AUTHORS** (default 0.05).
+separately for each of the two main effects. α (family-wise) = 0.05.
+
+**This round** does not score the sealed holdout (§0). As the brief specifies for that case, the
+report opens with the same block computed on SWORDS test and marks it *secondary*: the October
+test sets were read before the new arms existed (ledger `added_after_first_test_read=true`).
 
 ## 4. Key secondary endpoint
 
@@ -92,27 +97,31 @@ new arms are flagged `added_after_first_test_read=true` and are secondary by con
 
 ## 6. Member-wise (Iyer et al.) baseline (Task 4)
 
-- Mapping: `docs/iyer_mapping.md` (**AUTHORS** approve after reading).
-- α grid: **AUTHORS** — budget = the dev settings our γ received before October, one seed,
-  per model (Task 0.3: Llama 4, Qwen 4, Falcon 2).
+**Not in this round (§0).** If added later: mapping in `docs/iyer_mapping.md`, approved after
+reading; α grid with the budget the balanced γ received before October, one seed, per model
+(Task 0.3: Llama 4, Qwen 4, Falcon 2).
 - Selection rule (fixed by the brief): the α with the highest SWORDS-dev GAP subject to
   mean STS ≥ Concept-loss mean STS − δ.
-- δ = **AUTHORS** (the October gate used 0.005).
+- δ = 0.005 (the October gate's STS allowance), if the baseline is added.
 - If Iyer et al.'s weighting is fully specified, it is used as is and no α is tuned.
 
-## 7. Decision table and inclusion rules (research plan §§4–5)
+## 7. Decision table and inclusion rules
 
-**AUTHORS**: paste the decision table and the inclusion rules from `01_research_plan_v3.md`
-§§4–5 here. That file was not available to the coding agent.
+**Decision table: none pre-declared for this round.** The research plan's decision table
+(§§4–5 of `01_research_plan_v3.md`) was not available when this was written. This round
+therefore *estimates* the factorial effects and reports them with their intervals; it
+selects no arm and declares no winner from them. A decision table must be added here, by a
+new commit, before any sealed-holdout pass.
 
-| outcome on the primary endpoint | conclusion | **AUTHORS** |
-|---|---|---|
-| | | |
-
-Inclusion rules (runs, seeds, targets): **AUTHORS**. Defaults the code applies unless changed
-here: a run that fails or diverges (non-finite loss) is retried once with the same seed and
-otherwise reported as failed, never replaced by another seed; targets are those eligible for
-all three tokenizers (`sealed/holdout_creation_report.md`).
+**Inclusion rules (apply to every table of this round):**
+- Runs: every Tier-1 run with ledger status `ok`, and the October checkpoints listed as
+  `reuse` by `run_round2.py plan --tier 1`. A failed or diverged run is retried once with the
+  same seed; if it fails again it is reported as failed, never replaced by another seed.
+- Seeds: 42, 123, 2024 in every cell; effects are seed-matched.
+- Targets: all targets each evaluator scores, identical for every arm of a model (Task 0
+  verified this for the October files); each table states its eligible count, including the
+  reduced counts of accepted-alternative NLL and rejected share (prefix collisions).
+- Scorers: the left-context scorer is the main one; the full-context scorer is reported beside it.
 
 ## 8. Sealed holdout
 
