@@ -139,6 +139,7 @@ def harness(tag, ckpts, gpu, harness_py, log):
                      "wall_minutes": f"{(time.time() - t0) / 60:.1f}", "gpu": str(gpu),
                      "git_commit": C.git_commit(), "note": f"{len(labels)} arms; exit {code}"})
     print(f"  harness {'ok' if code == 0 else 'FAILED (see ' + str(log) + ')'}", flush=True)
+    return code != 0
 
 
 def main():
@@ -149,12 +150,16 @@ def main():
     ap.add_argument("--steps", default=None, help="comma-separated subset of this pass's steps")
     ap.add_argument("--no-harness", action="store_true")
     ap.add_argument("--python", default=sys.executable)
-    ap.add_argument("--harness-python", default=str(Path.home() / "miniconda3/envs/harness/bin/python"))
+    ap.add_argument("--harness-python", default=str(Path.home() / "venvs/harness/bin/python"),
+                    help="lm-eval 0.4.13 over the concept env (plans/round2_server_runbook.md)")
     args = ap.parse_args()
     if args.pass_ == "test":
         problems = protocol_ok()
         if problems:
             sys.exit("refusing the test pass: ROUND2_PROTOCOL.md " + "; ".join(problems))
+    with_harness = args.pass_ == "test" and not args.no_harness and (not args.steps or "harness" in args.steps.split(","))
+    if with_harness and not Path(args.harness_python).is_file():
+        sys.exit(f"no harness Python at {args.harness_python} (pass --harness-python, or --no-harness)")
     tag = args.family
     ckpts = finished_runs(tag)
     if not ckpts:
@@ -182,8 +187,8 @@ def main():
             ledger(tag, ckpt, step, args.pass_, status, started, minutes, args.gpu,
                    "" if status == "ok" else f"exit {code}; see {log.name}")
             print(f"  {status:6s} {step:15s} {flat(ckpt):34s} {minutes:5.1f} min", flush=True)
-    if args.pass_ == "test" and not args.no_harness and (not args.steps or "harness" in steps):
-        harness(tag, ckpts, args.gpu, args.harness_python, root / "harness.log")
+    if with_harness:
+        failures += harness(tag, ckpts, args.gpu, args.harness_python, root / "harness.log")
     print(f"[{C.now_utc()}] {tag} {args.pass_} pass done; {failures} failed step(s)", flush=True)
     sys.exit(1 if failures else 0)
 
