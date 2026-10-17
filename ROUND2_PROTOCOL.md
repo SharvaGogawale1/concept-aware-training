@@ -1,8 +1,8 @@
-# Round 2 protocol — TEMPLATE, not yet approved
+# Round 2 protocol
 
-> Fill every field marked **AUTHORS**, delete this banner, and commit. No test pass of a
-> new arm runs before this file is committed (`scripts/round2/run_round2.py` checks for the
-> banner and for the git hash below). Fields marked *fixed by the brief* are not open.
+> Approved and committed before any test pass of a new arm; `scripts/round2/evaluate_round2.py`
+> refuses a test pass unless this file is committed, unmodified and approved. Changing it later
+> needs a new commit that says what changed and why.
 
 ## 0. Scope of this round (decided 2026-10-17)
 
@@ -17,7 +17,9 @@ baseline, the coefficient sweep, scoring on the sealed holdout, and the 8B scale
 that describe them stay as written so that adding them later does not change this protocol's rules.
 
 - Protocol version: 1
-- Approved by: **AUTHORS** (names, date)
+- Approved by: the repository owner (git user SharvaGogawale1), 2026-10-17, in the working
+  session, after Tier-1 training and before any scoring of the new runs. PI sign-off is not
+  recorded here.
 - Git hash: the commit that removes this file's TEMPLATE banner (`git log -1 -- ROUND2_PROTOCOL.md`).
 - Trainer patch SHA-256 (`external/learning-concepts.patch`): bd7d72c7dfff2e3b570794ed47e78034416afe97607b2a531b51b18306285137
   (the patch every Tier-1 run was trained with; recorded per run in `round2_run.json`).
