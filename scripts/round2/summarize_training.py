@@ -2,8 +2,10 @@
 
 For each run, the logged R (mass_term), B (balance_term), S (uncapped_term), CE and concept
 loss at the first logged step and at the end (mean of the last 5 logged steps), plus the
-recorded train_runtime.  Grouped by model x objective x gamma with each seed shown, and
-flagged when a value is non-finite or one seed sits far from the other two.
+recorded train_runtime; non-finite values are flagged.  Logged values are single-batch losses
+and the batch order depends only on the seed, so they are compared across OBJECTIVES within a
+seed (identical batches), never across seeds: the paired table gives, per model x seed x gamma,
+R(Alt-Mass) - R(Alt-Balance) and B(Alt-Balance) - B(Alt-Mass), both expected below zero.
 
     python scripts/round2/summarize_training.py
 Writes results/round2/training_summary.csv and prints the table.
@@ -77,12 +79,8 @@ def main():
                "flag": ("non-finite " + ",".join(sorted(set(nonfinite)))) if nonfinite else ""}
         out_rows.append(row)
         table[(tag, objective, gamma)].append(row)
-    for key, rows in table.items():
+    for rows in table.values():
         rows.sort(key=lambda r: int(r["seed"].split("_")[1]))
-        for k in TERMS:
-            i = far_seed([r[f"last_{k}"] for r in rows])
-            if i is not None:
-                rows[i]["flag"] = (rows[i]["flag"] + f"; seed far from the others on last {k}").strip("; ")
     out = C.R2 / "training_summary.csv"
     fields = sorted({k for r in out_rows for k in r}, key=lambda k: (k not in ("model", "objective", "gamma", "seed"), k))
     with open(out, "w", newline="") as handle:
@@ -97,6 +95,18 @@ def main():
         for r in table[key]:
             cells = " ".join(f"{r[f'first_{k}']:7.3f}->{r[f'last_{k}']:7.3f}" for k in TERMS)
             print(f"{r['model']:16s} {r['objective']:12s} {r['gamma']:7s} {r['seed']:9s} {cells}  {r['flag']}")
+    by = {(r["model"], r["objective"], r["gamma"], r["seed"]): r for r in out_rows if "last_mass_term" in r}
+    pairs = sorted({(m, g, sd) for (m, o, g, sd) in by if (m, "alt_mass", g, sd) in by and (m, "alt_balance", g, sd) in by})
+    print(f"\npaired on identical batches (same seed): end-of-training differences")
+    print(f"{'model':16s} {'gamma':7s} {'seed':9s} {'R(mass)-R(bal)':>15s} {'B(bal)-B(mass)':>15s}")
+    hits = [0, 0]
+    for m, g, sd in pairs:
+        dr = by[(m, "alt_mass", g, sd)]["last_mass_term"] - by[(m, "alt_balance", g, sd)]["last_mass_term"]
+        db = by[(m, "alt_balance", g, sd)]["last_balance_term"] - by[(m, "alt_mass", g, sd)]["last_balance_term"]
+        hits[0] += dr < 0
+        hits[1] += db < 0
+        print(f"{m:16s} {g:7s} {sd:9s} {dr:15.3f} {db:15.3f}")
+    print(f"expected sign (< 0): mass {hits[0]}/{len(pairs)}, balance {hits[1]}/{len(pairs)}")
     flagged = [r for r in out_rows if r.get("flag")]
     print(f"\nflags: {len(flagged)}" + "".join(f"\n  {r['model']} {r['objective']} {r['gamma']} {r['seed']}: {r['flag']}"
                                         for r in flagged))
