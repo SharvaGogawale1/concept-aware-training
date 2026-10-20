@@ -244,7 +244,9 @@ def train_one(row, gpu, python):
             for line in hist.read_text().splitlines() if line.strip()
             for v in json.loads(line).values())
         data_hash = train_file_hash(tag)
-        if bad:
+        if not cfg:
+            status, note = "failed", "exit 0 but no concept_training_config.json was written"
+        elif bad:
             status, note = "failed", f"recorded gammas differ from the plan: {bad}"
         elif nonfinite:
             status, note = "diverged", "non-finite value in training_history.jsonl"

@@ -44,6 +44,9 @@ HARNESS_TASKS = ("arc_challenge", "arc_easy", "openbookqa", "hellaswag", "piqa",
 HARNESS_GROUPS = {"knowledge_mean": HARNESS_TASKS[:3], "commonsense_mean": HARNESS_TASKS[3:]}
 OCT_DIRS = ("task15b_screen_test", "task15b_screen_shared_gamma", "task15b_screen_confirm")
 CELL_ORDER = ("concept", "alt_mass", "alt_balance", "alt_mass_balance")     # Y00 Y10 Y01 Y11
+WHOLESET = "concept_uncapped"                                                # Concept loss + whole-set (T2-c)
+WS_ORDER = ("concept", "alt_mass", WHOLESET)                                 # its own design, primary gamma only
+ALL_ARMS = CELL_ORDER + (WHOLESET,)
 
 # metric -> (label, display scale, better)
 METRICS = {
@@ -71,8 +74,15 @@ CONTRASTS = (
     ("F1", "balance_vs_concept", "Alt-Balance - Concept loss", (-1, 0, 1, 0)),
     ("F1", "mb_vs_concept", "Alt-Mass+Balance - Concept loss", (-1, 0, 0, 1)),
 )
+# Whole-set control (protocol v2 §4, §5 families 1 and 3), weights over WS_ORDER.  Computed on
+# its own three-arm design so that the 2x2 effects above are unchanged by its presence.
+WS_CONTRASTS = (
+    ("F3", "mass_vs_wholeset", "Alt-Mass - Concept loss + whole-set", (0, 1, -1)),
+    ("F1", "wholeset_vs_concept", "Concept loss + whole-set - Concept loss", (-1, 0, 1)),
+)
 FAMILY_NAMES = {"primary": "opening block (secondary)", "F1": "each arm vs Concept loss",
-                "F2": "among the alternative arms", "F5": "factorial effects"}
+                "F2": "among the alternative arms", "F3": "Alt-Mass vs Concept loss + whole-set",
+                "F5": "factorial effects"}
 HEADLINE = [(b, s, "gap") for b in LEXSUB for s in SCORERS] + [
     ("swords_test", "left", "alternatives_nll"), ("swords_test", "left", "rejected_mass_share"),
     ("sts", "", "sts_mean"), ("c4_test", "", "global_nll"), ("bm_semlex", "left", "accuracy"),
@@ -95,6 +105,16 @@ def needed_arms():
         arms += [("alt_balance", g, s, "round2") for s in C.SEEDS]
         arms += [("alt_mass_balance", g, s, "october") for s in C.SEEDS]
     return arms
+
+
+def wholeset_arms():
+    return [(WHOLESET, C.PRIMARY_GAMMA, s, "round2") for s in C.SEEDS]
+
+
+def wholeset_started(tag, src):
+    """True once any whole-set run of this model has a test-pass output; then every one is required."""
+    return any((src.r2 / "eval" / tag / step / f"{flat(*a[:3])}.json").is_file()
+               for a in wholeset_arms() for step in LEXSUB)
 
 
 def october_label(objective, gamma, seed):
@@ -207,6 +227,10 @@ def load_model(tag, src):
     """(bench, scorer, metric) -> {arm: {item: value}}, files, missing, notes."""
     data, files, missing, notes = defaultdict(dict), {}, [], []
     arms = needed_arms()
+    if wholeset_started(tag, src):
+        arms += wholeset_arms()
+    else:
+        notes.append(f"{tag}: no whole-set (T2-c) run scored yet; Family 3 omitted")
 
     def put(bench, scorer, metric, arm, values):
         data[(bench, scorer, metric)][arm[:3]] = values
@@ -309,18 +333,18 @@ def stat(values):
     return float(np.mean([np.mean(v) for v in by.values()])), sum(len(v) for v in by.values())
 
 
-def design(per_arm, gamma, seeds):
+def design(per_arm, gamma, seeds, order=CELL_ORDER):
     """Unit-level sums X[cell, seed, unit], item counts n[unit], strata index arrays."""
-    keys = [(c, None if c == "concept" else gamma, s) for c in CELL_ORDER for s in seeds]
+    keys = [(c, None if c == "concept" else gamma, s) for c in order for s in seeds]
     common = set.intersection(*({k for k, v in per_arm[a].items() if finite(v)} for a in keys))
     items = sorted(common)
     units = sorted({it[:2] for it in items})
     uidx = {u: i for i, u in enumerate(units)}
-    X = np.zeros((len(CELL_ORDER), len(seeds), len(units)))
+    X = np.zeros((len(order), len(seeds), len(units)))
     n = np.zeros(len(units))
     cols = np.array([uidx[it[:2]] for it in items], dtype=int)
     np.add.at(n, cols, 1)
-    for ci, c in enumerate(CELL_ORDER):
+    for ci, c in enumerate(order):
         for si, s in enumerate(seeds):
             vals = per_arm[(c, None if c == "concept" else gamma, s)]
             np.add.at(X[ci, si], cols, [vals[it] for it in items])
@@ -357,7 +381,13 @@ def bootstrap(D, n, strata, reps, key, chunk=500):
     return hier, tonly
 
 
+ZERO_TOL = 1e-12   # far below any real replicate (0/1 metrics move in steps of ~1e-4)
+
+
 def p_two_sided(reps):
+    # A 0/1 metric gives many replicates that are exactly zero; summation order turns them into
+    # +-1e-17 differently per platform, which moved p by up to 0.16 between the server and a laptop.
+    reps = np.where(np.abs(reps) < ZERO_TOL, 0.0, reps)
     B = len(reps)
     return min(1.0, 2 * min((1 + np.sum(reps <= 0)) / (B + 1), (1 + np.sum(reps >= 0)) / (B + 1)))
 
@@ -376,22 +406,28 @@ def analyse(models, reps, partial):
     for tag, (data, files) in models.items():
         for (bench, scorer, metric), per_arm in sorted(data.items(), key=lambda kv: kv[0]):
             group = "harness" if bench.startswith("harness") else bench
-            for arm, values in sorted(per_arm.items(), key=lambda kv: (CELL_ORDER.index(kv[0][0]), kv[0][1] or 0, kv[0][2])):
+            for arm, values in sorted(per_arm.items(), key=lambda kv: (ALL_ARMS.index(kv[0][0]), kv[0][1] or 0, kv[0][2])):
                 v, k = stat(values)
                 f, source = files[(group, arm)]
                 longs.append({"model": tag, "benchmark": bench, "scorer": scorer, "metric": metric,
                               "objective": arm[0], "arm": C.DISPLAY[arm[0]],
                               "gamma": "" if arm[1] is None else f"{arm[1]:g}", "seed": arm[2],
                               "source": source, "value": v, "n_items": k, "file": str(f)})
-            for gamma in C.MAIN_GAMMAS:
+            # (gamma, arm order, contrasts, which cells to write): the 2x2 at both gammas, then the
+            # whole-set design at the primary gamma, whose concept and Alt-Mass cells are already written.
+            blocks = [(g, CELL_ORDER, CONTRASTS, CELL_ORDER) for g in C.MAIN_GAMMAS]
+            blocks.append((C.PRIMARY_GAMMA, WS_ORDER, WS_CONTRASTS, (WHOLESET,)))
+            for gamma, order, contrasts, write_cells in blocks:
                 seeds = [s for s in C.SEEDS if all((c, None if c == "concept" else gamma, s) in per_arm
-                                                   for c in CELL_ORDER)]
+                                                   for c in order)]
                 if not seeds:
                     continue
-                X, n, strata, n_items = design(per_arm, gamma, seeds)
+                X, n, strata, n_items = design(per_arm, gamma, seeds, order)
                 if n_items == 0:
                     continue
-                for ci, c in enumerate(CELL_ORDER):
+                for ci, c in enumerate(order):
+                    if c not in write_cells:
+                        continue
                     per_seed = [float(np.mean([X[ci, si, idx].sum() / n[idx].sum() for idx in strata]))
                                 for si in range(len(seeds))]
                     cells.append({"model": tag, "benchmark": bench, "scorer": scorer, "metric": metric,
@@ -400,13 +436,13 @@ def analyse(models, reps, partial):
                                   "sd_seeds": float(np.std(per_seed, ddof=1)) if len(seeds) > 1 else "",
                                   "per_seed": " ".join(f"{s}:{v:.6g}" for s, v in zip(seeds, per_seed)),
                                   "n_items": n_items, "n_seeds": len(seeds)})
-                W = np.array([w for *_, w in CONTRASTS], dtype=float)
+                W = np.array([w for *_, w in contrasts], dtype=float)
                 D = np.einsum("kc,csu->ksu", W, X)
                 est = point(D, n, strata)
-                key = f"{tag}|{bench}|{scorer}|{metric}|{gamma:g}"
+                key = f"{tag}|{bench}|{scorer}|{metric}|{gamma:g}" + ("|wholeset" if order is WS_ORDER else "")
                 hier, tonly = bootstrap(D, n, strata, reps, key)
                 single = all(len(idx) == 1 for idx in strata)
-                for k, (family, ckey, cname, _) in enumerate(CONTRASTS):
+                for k, (family, ckey, cname, _) in enumerate(contrasts):
                     lo, hi = np.percentile(hier[:, k], [2.5, 97.5])
                     tlo, thi = (np.percentile(tonly[:, k], [2.5, 97.5]) if not single else (None, None))
                     effects.append({"family": family, "model": tag, "benchmark": bench, "scorer": scorer,
@@ -470,8 +506,8 @@ def report(path, cells, effects, missing, notes, harness_check, partial, reps):
     L.append("# Round 2 (Tier 1): Alt-Mass and Alt-Balance, factorial effects\n")
     if partial:
         L.append("> **PARTIAL — monitoring only.** Some cells lack seeds; nothing here is a result.\n")
-    L.append(f"Generated {C.now_utc()} at git {C.git_commit()}, from `ROUND2_PROTOCOL.md` v1 (approved "
-             "2026-10-17). Every new arm was scored on test sets that were read before it existed "
+    L.append(f"Generated {C.now_utc()} at git {C.git_commit()}, under `ROUND2_PROTOCOL.md` "
+             f"{protocol_version()}. Every new arm was scored on test sets that were read before it existed "
              "(ledger `added_after_first_test_read=true`), so everything below is secondary by "
              "construction. No arm is selected and no winner is declared (protocol §7).\n")
     L.append(f"Inference: paired hierarchical bootstrap, {reps:,} replicates (seeds resampled, then "
@@ -511,16 +547,22 @@ def report(path, cells, effects, missing, notes, harness_check, partial, reps):
         L.append(f"| {b} | {s} | {m} | " + " | ".join("/".join(map(str, sorted(by.get(t, [])))) or "—" for t in C.FAMILIES) + " |")
 
     for gamma in (f"{C.PRIMARY_GAMMA:g}", f"{C.SENSITIVITY_GAMMA:g}"):
+        cols = ALL_ARMS if any(c["objective"] == WHOLESET and c["gamma"] == gamma for c in cells) else CELL_ORDER
         L.append(f"\n## Cell means, γ = {gamma} (headline metrics; all metrics in cells.csv)\n")
-        L += ["| benchmark | model | " + " | ".join(C.DISPLAY[c] for c in CELL_ORDER) + " |", "|---|---|" + "---|" * 4]
+        L += ["| benchmark | model | " + " | ".join(C.DISPLAY[c] for c in cols) + " |", "|---|---|" + "---|" * len(cols)]
         for b, s, m in HEADLINE:
             for tag in C.FAMILIES:
                 cm = {c["objective"]: c for c in cells if (c["model"], c["benchmark"], c["scorer"], c["metric"], c["gamma"]) == (tag, b, s, m, gamma)}
                 if cm:
                     L.append(f"| {label(b, s, m)} | {tag} | " + " | ".join(
-                        f"{fmt(m, cm[c]['mean'])} ± {fmt(m, cm[c]['sd_seeds'] or 0)}" for c in CELL_ORDER) + " |")
-        for family in ("F5", "F2", "F1"):
-            names = [c for c in CONTRASTS if c[0] == family]
+                        f"{fmt(m, cm[c]['mean'])} ± {fmt(m, cm[c]['sd_seeds'] or 0)}" if c in cm else "—"
+                        for c in cols) + " |")
+        for family in ("F5", "F2", "F1", "F3"):
+            names = [c for c in CONTRASTS + WS_CONTRASTS if c[0] == family]
+            have = {e["contrast"] for e in effects if e["family"] == family and e["gamma"] == gamma}
+            names = [c for c in names if c[1] in have]
+            if not names:
+                continue
             L.append(f"\n### Family {family[1:]} ({FAMILY_NAMES[family]}), γ = {gamma}\n")
             L += ["| benchmark | model | " + " | ".join(n[2] for n in names) + " |", "|---|---|" + "---|" * len(names)]
             for b, s, m in HEADLINE:
@@ -537,9 +579,9 @@ def report(path, cells, effects, missing, notes, harness_check, partial, reps):
     else:
         L.append("No round-2 harness file with an Untouched row yet.")
     L.append("\n## Not in this report\n")
-    L.append("- Families 3 and 4 (uncapped control, Member-wise (Iyer et al.)) and the sealed holdout: "
-             "not in this round (§0).")
-    L.append("- KL(u‖q) and open-vocabulary Hit@50: no evaluator in the round-2 test pass writes them.")
+    L.append("- Family 4 (Member-wise, Iyer et al.): not in the experiment list (§0). The sealed holdout: "
+             "scored once at the end, by its own evaluator, not here (§8).")
+    L.append("- KL(u‖q) on C4 and open-vocabulary Hit@50: no evaluator in the round-2 test pass writes them.")
     L.append("- Observed share on lexsub is p(target) / (p(target) + M(accepted alternatives)), from the "
              "evaluator's per-target gold and inclusive NLLs.")
     L += [f"- {n}" for n in notes]
@@ -547,6 +589,12 @@ def report(path, cells, effects, missing, notes, harness_check, partial, reps):
         L.append(f"\n## Missing inputs ({len(missing)})\n")
         L += [f"- {m}" for m in sorted(set(missing))]
     Path(path).write_text("\n".join(L) + "\n")
+
+
+def protocol_version():
+    text = (C.MAIN / "ROUND2_PROTOCOL.md").read_text().splitlines()
+    line = next((l for l in text if l.startswith("- Protocol version:")), "")
+    return "version " + line.split(":", 1)[1].strip() if line else "(version line missing)"
 
 
 def harness_untouched(src, tag):
@@ -571,6 +619,7 @@ def main():
     ap.add_argument("--r2", default=str(C.R2), help="round-2 results root (holds eval/)")
     ap.add_argument("--outputs", default=str(C.OUTPUTS), help="October outputs root (read-only)")
     ap.add_argument("--out", default=None, help="default: <r2>/analysis")
+    ap.add_argument("--overwrite", action="store_true", help="replace an existing analysis in --out")
     args = ap.parse_args()
     src = Sources(Path(args.outputs), Path(args.r2))
     models, missing, notes, check = {}, [], [], []
@@ -587,6 +636,8 @@ def main():
             print("  " + m)
         sys.exit(1)
     out = Path(args.out) if args.out else Path(args.r2) / "analysis"
+    if (out / "effects.csv").exists() and not args.overwrite:
+        sys.exit(f"{out} already holds an analysis; pass a new --out (or --overwrite to replace it)")
     out.mkdir(parents=True, exist_ok=True)
     longs, cells, effects = analyse(models, args.reps, bool(missing))
     write_csv(out / "metrics_long.csv", longs)
@@ -598,8 +649,9 @@ def main():
         sys.exit(f"forbidden terms in the outputs: {hits}")
     print(f"{len(longs)} run-metric rows, {len(effects)} effects -> {out}" + (" (PARTIAL)" if missing else ""))
     for e in effects:
-        if e["family"] == "primary":
-            print(f"  {e['model']:16s} {e['contrast_name']:20s} {cell_text(e)}")
+        if e["family"] == "primary" or (e["family"] == "F3" and (e["benchmark"], e["scorer"], e["metric"])
+                                         == ("swords_test", "left", "gap")):
+            print(f"  {e['model']:16s} {e['contrast_name']:36s} {cell_text(e)}")
 
 
 if __name__ == "__main__":

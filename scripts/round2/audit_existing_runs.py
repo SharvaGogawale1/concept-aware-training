@@ -107,7 +107,8 @@ def history_stats(path):
             except json.JSONDecodeError:
                 continue
             rows += 1
-            for key in ("loss", "ce_loss", "concept_loss", "alt_aux_loss", "eval_loss"):
+            for key in ("loss", "ce_loss", "concept_loss", "alt_aux_loss", "eval_loss",
+                        "mass_term", "balance_term", "uncapped_term"):
                 v = row.get(key)
                 if isinstance(v, (int, float)) and not math.isfinite(v):
                     nan = True

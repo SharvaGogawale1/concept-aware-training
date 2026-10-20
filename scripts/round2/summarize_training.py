@@ -46,19 +46,6 @@ def history(path):
     return rows, runtime
 
 
-def far_seed(values):
-    """Index of a seed far from the other two: its gap to their mean exceeds 3x their own
-    gap and 5% of the mean.  None with fewer than three seeds."""
-    if len(values) < 3:
-        return None
-    for i, v in enumerate(values):
-        rest = [x for j, x in enumerate(values) if j != i]
-        centre, spread = statistics.fmean(rest), abs(rest[0] - rest[1])
-        if abs(v - centre) > max(3 * spread, 0.05 * abs(centre)):
-            return i
-    return None
-
-
 def main():
     table = defaultdict(list)
     out_rows = []
@@ -107,6 +94,15 @@ def main():
         hits[1] += db < 0
         print(f"{m:16s} {g:7s} {sd:9s} {dr:15.3f} {db:15.3f}")
     print(f"expected sign (< 0): mass {hits[0]}/{len(pairs)}, balance {hits[1]}/{len(pairs)}")
+    ws = sorted({(m, g, sd) for (m, o, g, sd) in by if o == "concept_uncapped" and (m, "alt_mass", g, sd) in by})
+    if ws:
+        print(f"\nwhole-set control vs Alt-Mass, same seed and batches: S(whole-set) - S(Alt-Mass)")
+        n_ok = 0
+        for m, g, sd in ws:
+            ds = by[(m, "concept_uncapped", g, sd)]["last_uncapped_term"] - by[(m, "alt_mass", g, sd)]["last_uncapped_term"]
+            n_ok += ds < 0
+            print(f"{m:16s} {g:7s} {sd:9s} {ds:15.3f}")
+        print(f"expected sign (< 0): {n_ok}/{len(ws)}")
     flagged = [r for r in out_rows if r.get("flag")]
     print(f"\nflags: {len(flagged)}" + "".join(f"\n  {r['model']} {r['objective']} {r['gamma']} {r['seed']}: {r['flag']}"
                                         for r in flagged))

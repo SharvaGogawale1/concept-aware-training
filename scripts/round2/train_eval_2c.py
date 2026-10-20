@@ -7,6 +7,7 @@ fails or diverges is retried once with the same seed (ROUND2_PROTOCOL.md section
 again it stays failed.  The test pass then scores every finished checkpoint of the model that
 has no output yet: evaluate_round2.py skips files that exist, and the harness keeps the arms
 already in harness.json, so the Tier-1 results are only read.
+Exit code 1 means a training run failed twice OR a test-pass step failed; the log says which.
 """
 from __future__ import annotations
 
