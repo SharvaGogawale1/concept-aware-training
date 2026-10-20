@@ -12,14 +12,31 @@ Alt-Mass runs exist at seed 42 only, so comparing the four cells of the 2×2 fai
 two seeds as well; with them, every cell has three seeds. Concept loss and Alt-Mass+Balance reuse
 the October checkpoints (three seeds each; Task 1 test B licenses the reuse of the balanced runs).
 
-Not in this round unless the authors add them: the uncapped control, the member-wise (Iyer et al.)
-baseline, the coefficient sweep, scoring on the sealed holdout, and the 8B scale-up. Sections below
-that describe them stay as written so that adding them later does not change this protocol's rules.
+Added 2026-10-20 (version 2, §9), before any of these runs was trained:
 
-- Protocol version: 1
-- Approved by: the repository owner (git user SharvaGogawale1), 2026-10-17, in the working
-  session, after Tier-1 training and before any scoring of the new runs. PI sign-off is not
-  recorded here.
+- **Concept loss + whole-set** (T2-c, 9 runs): γ_u = 0.125 × seeds {42, 123, 2024} × 3 models.
+  This is *extra whole-set supervision*: the uncapped term $S$ is added to the unchanged $L_Z$,
+  whose τ cutoff stays; it does not remove that cutoff. It asks whether Alt-Mass helps because it
+  targets the alternatives (the concept set without the observed word) or because it supervises
+  the concept set more strongly. One weight only; no sweep.
+- **C4 training-distribution diagnostic** (evaluation only, no training): $M(A)$, $M(C)$,
+  $p(y)/M(C)$ and $\mathrm{KL}(u_A\Vert q_A)$ on held-out C4, for the four 2×2 cells at both γ and
+  for Concept loss + whole-set. The alternatives are extracted automatically, not judged by people.
+- **Sealed holdout**, scored once at the end, after the decision table is committed (§7, §8).
+
+This is the complete experiment list for the paper. Not in it: the member-wise (Iyer et al.)
+baseline, the coefficient sweep, the 8B scale-up, and other weights for the whole-set control.
+Sections below that describe them stay as written.
+
+Whatever its outcome, Concept loss + whole-set is reported in this paper: a row in the main
+comparison, its diagnostics in the appendix. Attribution: Chen's request was the three component
+variants (Alt-Mass, Alt-Balance, Alt-Mass+Balance); the whole-set control is an additional
+methodological recommendation, not part of that request.
+
+- Protocol version: 2 (changes in §9)
+- Approved by: the repository owner (git user SharvaGogawale1), in the working session:
+  version 1 on 2026-10-17, after Tier-1 training and before any scoring of the new runs;
+  version 2 on 2026-10-20, before any T2-c run was trained. PI sign-off is not recorded here.
 - Git hash: the commit that removes this file's TEMPLATE banner (`git log -1 -- ROUND2_PROTOCOL.md`).
 - Trainer patch SHA-256 (`external/learning-concepts.patch`): bd7d72c7dfff2e3b570794ed47e78034416afe97607b2a531b51b18306285137
   (the patch every Tier-1 run was trained with; recorded per run in `round2_run.json`).
@@ -34,7 +51,7 @@ in log space, $q_t(a)=p_t(a)/M_t(A_t)$.
 |---|---|---|
 | ALT MASS | $R_t=-\log M_t(A_t)$ | `--gamma-mass` |
 | ALT BALANCE | $B_t=\mathrm{KL}(\mathrm{uniform}(A_t)\Vert q_t)$ | `--gamma-balance` |
-| UNCAPPED CONCEPT | $S_t=-\log M_t(C_t)$, every $t\in\mathcal I$, no $\tau$ cutoff | `--gamma-uncapped` |
+| UNCAPPED CONCEPT (extra whole-set supervision) | $S_t=-\log M_t(C_t)$, every $t\in\mathcal I$, no $\tau$ cutoff on $S$ itself | `--gamma-uncapped` |
 
 Loss: $L_Z+\frac1{|\mathcal I|}\sum_t(\gamma_mR_t+\gamma_bB_t+\gamma_uS_t)$, with $L_Z$ unchanged
 (Zhang et al.: $\lambda=1$, $\tau=0.6$, normalized by $|\mathcal I|$). $|A_t|=0$: $R_t=B_t=0$;
@@ -46,7 +63,7 @@ $|A_t|=1$: $B_t=0$.
 | `alt_mass` | Alt-Mass | γ | 0 | 0 |
 | `alt_balance` | Alt-Balance | 0 | γ | 0 |
 | `alt_mass_balance` | Alt-Mass+Balance | γ | γ | 0 |
-| `concept_uncapped` | Concept loss + uncapped | 0 | 0 | γ |
+| `concept_uncapped` | Concept loss + whole-set | 0 | 0 | γ |
 
 `alt_mass_balance` reuses the October balanced (`--alt-aux uniform`) checkpoints: Task 1
 test B shows $\nabla U=\nabla(R+B)$ through the training-loss code path.
@@ -79,8 +96,21 @@ test sets were read before the new arms existed (ledger `added_after_first_test_
 
 ## 4. Key secondary endpoint
 
-Alt-Mass − (Concept loss + uncapped), γ = 0.125, on sealed-holdout GAP, $M(A)$ and observed
-share; same bootstrap; Holm across the 3 models.
+Alt-Mass − (Concept loss + whole-set), γ = 0.125, on sealed-holdout GAP, $M(A)$ and observed
+share; same bootstrap; Holm across the 3 models. Before the holdout pass, the same comparison is
+computed on SWORDS test, CoInCo-800 test and SemEval-07 (Family 3, marked secondary) and on the
+C4 diagnostic.
+
+How the comparison is read (fixed 2026-10-20, before the T2-c runs were trained), per model,
+left-scorer GAP, Holm-adjusted p < 0.05:
+
+- Alt-Mass above Concept loss + whole-set: the gain is specific to targeting the alternatives.
+- Concept loss + whole-set above Alt-Mass: the alternative-specific explanation is not supported.
+- Neither: the two are not distinguished. The paper then reports the Alt-Mass gain as a gain from
+  supervising the concept set and does not claim that excluding the observed word is necessary.
+  A non-significant difference is not evidence that they are equal; its interval is reported.
+
+Models can disagree; the text then reports each model and claims only what all three show.
 
 ## 5. Other secondary endpoints and comparison families (Task 6)
 
@@ -88,7 +118,7 @@ Families (Holm within each family, across model × dataset cells; never pooled a
 
 1. each arm vs Concept loss;
 2. Mass+Balance vs Mass; Mass+Balance vs Balance; Mass vs Balance;
-3. Alt-Mass vs Concept loss + uncapped;
+3. Alt-Mass vs Concept loss + whole-set;
 4. Member-wise vs each 2×2 cell;
 5. factorial effects (main effects, interaction) per model, dataset, metric, γ.
 
@@ -116,7 +146,7 @@ selects no arm and declares no winner from them. A decision table must be added 
 new commit, before any sealed-holdout pass.
 
 **Inclusion rules (apply to every table of this round):**
-- Runs: every Tier-1 run with ledger status `ok`, and the October checkpoints listed as
+- Runs: every Tier-1 and T2-c run with ledger status `ok`, and the October checkpoints listed as
   `reuse` by `run_round2.py plan --tier 1`. A failed or diverged run is retried once with the
   same seed; if it fails again it is reported as failed, never replaced by another seed.
 - Seeds: 42, 123, 2024 in every cell; effects are seed-matched.
@@ -130,3 +160,13 @@ new commit, before any sealed-holdout pass.
 2,000 CoInCo targets, `sealed/sealed_holdout_ids.json` (committed before this protocol).
 Evaluated once, for every arm listed in `sealed/FREEZE.md`, in one pass; the evaluator refuses
 without `FREEZE.md` and writes a lock afterwards.
+
+## 9. Changes
+
+- **Version 2 (2026-10-20), before any T2-c run was trained.** Adds Concept loss + whole-set
+  (T2-c, 9 runs) and the C4 diagnostic to the scope and closes the experiment list (§0); renames
+  "Concept loss + uncapped" to "Concept loss + whole-set" (display only: the objective key
+  `concept_uncapped` and the flag `--gamma-uncapped` are unchanged) (§1, §5); fixes how the
+  whole-set comparison is read (§4); extends the inclusion rules to T2-c (§7). Why: the factorial
+  shows that Mass carries the ranking gain, but not whether targeting the alternatives is what
+  matters; a paper about supervising unobserved alternatives has to answer that.

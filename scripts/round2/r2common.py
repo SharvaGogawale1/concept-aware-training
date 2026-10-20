@@ -64,7 +64,7 @@ DISPLAY = {
     "alt_mass": "Alt-Mass",
     "alt_balance": "Alt-Balance",
     "alt_mass_balance": "Alt-Mass+Balance",
-    "concept_uncapped": "Concept loss + uncapped",
+    "concept_uncapped": "Concept loss + whole-set",
     "ntp": "NTP",
     "untouched": "Untouched",
     "augmented_ntp": "Augmented NTP",
