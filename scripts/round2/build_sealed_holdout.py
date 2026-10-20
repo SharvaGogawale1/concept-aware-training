@@ -1,7 +1,10 @@
 """Task 2: sealed CoInCo holdout IDs.  Builds IDs only; never loads a model or scores.
 
 Pool = every CoInCo target (dev + test, as parsed by the SWORDS repo) that
-  - is not in coinco_dev_sub800 / coinco_test_sub800 (the subsets used so far), and
+  - is not in coinco_dev_sub800 / coinco_test_sub800 (the subsets used so far),
+  - does not share a sentence with any target of either subset (version 2: version 1
+    excluded used targets only, and 912 of its 2,000 targets sat in a sentence whose other
+    target had already been scored; a CoInCo context is one sentence), and
   - does not sit in a context that appears in SWORDS dev or test.  "Appears" is two
     checks, both reported: the CoInCo ids SWORDS records for its targets
     (extra.coinco_ids, same split, same word -> that CoInCo context), and the CoInCo
@@ -13,13 +16,17 @@ Eligibility = the existing rules, unchanged:
   eval_swords.load_swords:              offset aligned, >= 2 substitutes
   eval_swords.score_record + filter:    >= 2 non-target substitutes encodable, in both
                                         scorers, for EVERY tokenizer (intersection)
-Sample = 2,000 targets, stratified by POS x lemma-frequency bucket, proportional
-allocation (largest remainder), seeded, without replacement; all of them if fewer.
+Holdout = EVERY eligible target (version 2; decided 2026-10-20).  Precision is limited by
+the number of distinct sentences, not targets, so nothing is sampled away: the POS x
+lemma-frequency strata are recorded, not used to draw.  --n (dry runs only) restores the
+version-1 stratified draw: proportional allocation (largest remainder), seeded, without
+replacement.  The build stops if fewer than MIN_SENTENCES clean sentences remain.
 
     python scripts/round2/build_sealed_holdout.py            # server: all three tokenizers
 Writes sealed/sealed_holdout_ids.json and sealed/holdout_creation_report.md, and the
-derived evaluation file results/round2/sealed_data/coinco_sealed.json.gz (not committed;
-its SHA-256 is pinned in the IDs file).
+derived evaluation file results/round2/sealed_data/coinco_sealed_v2.json.gz (not committed;
+its SHA-256 is pinned in the IDs file).  Version 1's files are kept in sealed/superseded_v1/
+and results/round2/sealed_data/coinco_sealed.json.gz as the audit record.
 """
 from __future__ import annotations
 
@@ -38,8 +45,14 @@ import r2common as C
 RAW = C.MAIN / "data/lexsub/raw"
 USED = [C.MAIN / "data/lexsub/coinco_dev_sub800.json.gz", C.MAIN / "data/lexsub/coinco_test_sub800.json.gz"]
 SWORDS = [C.MAIN / "data/swords/swords-v1.1_dev.json.gz", C.MAIN / "data/swords/swords-v1.1_test.json.gz"]
-TARGET_N = 2000
-SEED = 20261016
+TARGET_N = 0              # 0 = every eligible target (version 2); version 1 drew 2,000
+SEED = 20261016           # unchanged from version 1; only used when --n samples
+VERSION = 2
+MIN_SENTENCES = 400       # below this, stop and report rather than build a weak holdout
+SUPERSEDED = C.SEALED / "superseded_v1" / "sealed_holdout_ids.json"
+EXCLUSION_RULE = ("a target is excluded if it is in coinco_dev_sub800 or coinco_test_sub800, if its "
+                  "sentence (CoInCo context) holds any target of either subset, or if its sentence is "
+                  "a SWORDS dev/test context (by CoInCo id or by text)")
 MIN_POOL = 500            # below this, stop and report rather than build a weak holdout
 # Quartiles of the per-target (lemma, POS) count over all 15,415 CoInCo targets,
 # computed before any sampling: 25% = 3, 50% = 8, 75% = 21.
@@ -148,23 +161,32 @@ def allocate(strata, n, rng):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--tokenizers", default=",".join(C.FAMILIES.values()))
-    ap.add_argument("--n", type=int, default=TARGET_N)
+    ap.add_argument("--n", type=int, default=TARGET_N, help="0 = all eligible targets (the real holdout)")
     ap.add_argument("--force", action="store_true", help="rewrite an existing IDs file (only before FREEZE)")
     ap.add_argument("--out-dir", default=str(C.SEALED), help="dry runs only; the real IDs live in sealed/")
     args = ap.parse_args()
     out_dir = Path(args.out_dir)
     data_dir = C.R2 / "sealed_data" if out_dir == C.SEALED else out_dir
     ids_path = out_dir / "sealed_holdout_ids.json"
+    data_path = data_dir / f"coinco_sealed_v{VERSION}.json.gz"
     if ids_path.exists() and not args.force:
         sys.exit(f"{ids_path} exists; the holdout is drawn once.  --force only before FREEZE.md.")
     if (C.SEALED / "FREEZE.md").exists():
         sys.exit("FREEZE.md exists: the holdout IDs can no longer change.")
+    if data_path.exists():
+        sys.exit(f"{data_path} exists; move it aside rather than overwrite it")
 
     print(f"[{C.now_utc()}] loading CoInCo, SWORDS and the used 800-target subsets", flush=True)
     sources = {split: load(RAW / f"coinco_{split}.json.gz") for split in ("dev", "test")}
     used = set()
     for path in USED:
         used |= set(load(path)["targets"])
+    # Sentences of the used targets, through the raw files' own context ids.
+    raw_ctx = {tid: t["context_id"] for src in sources.values() for tid, t in src["targets"].items()}
+    missing = used - set(raw_ctx)
+    if missing:
+        sys.exit(f"{len(missing)} used 800-subset targets are not in the raw CoInCo files")
+    used_ctx = {raw_ctx[t] for t in used}
     swords_contexts, swords_coinco = [], {"dev": set(), "test": set()}
     for path in SWORDS:
         sw = load(path)
@@ -200,6 +222,9 @@ def main():
             counts[f"{split}: all"] += 1
             if tid in used:
                 counts[f"{split}: excluded, in a used 800-subset"] += 1
+                continue
+            if t["context_id"] in used_ctx:
+                counts[f"{split}: excluded, shares a sentence with a used 800-subset target"] += 1
                 continue
             if t["context_id"] in named:
                 counts[f"{split}: excluded, context of a SWORDS target (by CoInCo id)"] += 1
@@ -237,16 +262,24 @@ def main():
         per_model[tok] = {"eligible": len(ok & set(pool)), "excluded": sorted(set(pool) - ok)}
         eligible &= ok
     tmp.unlink()
-    if len(eligible) < MIN_POOL:
-        sys.exit(f"only {len(eligible)} eligible targets (< {MIN_POOL}); stop and report -- "
-                 "do not build a holdout from previously used data")
+    ctx_of = {t: raw_ctx[t] for t in eligible}
+    n_sent = len(set(ctx_of.values()))
+    print(f"[{C.now_utc()}] eligible: {len(eligible)} targets in {n_sent} clean sentences", flush=True)
+    if len(eligible) < MIN_POOL or n_sent < MIN_SENTENCES:
+        sys.exit(f"only {len(eligible)} eligible targets in {n_sent} sentences (floors {MIN_POOL} / "
+                 f"{MIN_SENTENCES}); stop and report -- do not build a holdout from previously used data")
 
     strata = defaultdict(list)
     for tid in eligible:
         _, pos, bucket, _ = pool[tid]
         strata[f"{pos}|{bucket}"].append(tid)
-    chosen = allocate(strata, args.n, random.Random(SEED))
+    chosen = allocate(strata, args.n or len(eligible), random.Random(SEED))
     ids = sorted(t for v in chosen.values() for t in v)
+    if not args.n:
+        assert set(ids) == eligible, "the real holdout takes every eligible target"
+    per_ctx = Counter(ctx_of[t] for t in ids)
+    if set(per_ctx) & used_ctx:
+        sys.exit("a drawn target shares a sentence with a used target; the exclusion failed")
 
     final = {k: {**views["dev"][k], **views["test"][k]} for k in views["dev"]}
     keep = set(ids)
@@ -255,12 +288,25 @@ def main():
     final["substitute_labels"] = {s: final["substitute_labels"][s] for s in final["substitutes"]}
     final["contexts"] = {c: v for c, v in final["contexts"].items()
                          if c in {t["context_id"] for t in final["targets"].values()}}
-    data_path = data_dir / "coinco_sealed.json.gz"
     write_json_gz(data_path, final)
 
+    old = json.loads(SUPERSEDED.read_text()) if SUPERSEDED.is_file() else None
     payload = {
+        "version": VERSION,
         "ids": ids,
         "n": len(ids),
+        "n_sentences": len(per_ctx),
+        "targets_per_sentence": {str(k): v for k, v in sorted(Counter(per_ctx.values()).items())},
+        "eligible_sentences": len(set(ctx_of.values())),
+        "exclusion_rule": EXCLUSION_RULE,
+        "sampling": "none: every eligible target" if not args.n else f"stratified draw of {args.n}",
+        "min_sentences": MIN_SENTENCES,
+        "supersedes": None if old is None else {
+            "file": str(SUPERSEDED.relative_to(C.MAIN)), "sha256": C.sha256(SUPERSEDED), "n": old["n"],
+            "reason": "version 1 excluded the used 800-subset targets but not their sentences; "
+                      f"{sum(raw_ctx.get(t) in used_ctx for t in old['ids'])} of its {old['n']} targets "
+                      "shared a sentence with an already-scored target.  No model was scored on it.",
+            "overlap_with_v2": len(set(old["ids"]) & set(ids))},
         "seed": SEED,
         "strata": {k: len(v) for k, v in chosen.items()},
         "stratum_pool_sizes": {k: len(v) for k, v in sorted(strata.items())},
@@ -281,22 +327,33 @@ def main():
     }
     C.write_json(ids_path, payload)
     write_report(payload, out_dir)
-    print(f"{len(ids)} sealed targets of {len(eligible)} eligible -> {ids_path}")
+    print(f"{len(ids)} sealed targets in {len(per_ctx)} sentences, of {len(eligible)} eligible targets in "
+          f"{payload['eligible_sentences']} sentences -> {ids_path}")
 
 
 def write_report(p, out_dir):
     lines = ["# Sealed holdout: creation report", "",
              f"Created {p['created_utc']} at commit `{p['git_commit']}` by "
              "`scripts/round2/build_sealed_holdout.py`. No model was loaded or scored.", "",
-             f"**{p['n']} targets** drawn (seed {p['seed']}) from **{p['eligible_all_tokenizers']}** "
-             f"eligible CoInCo targets; {p['substitutes']} substitutes.", "",
+             f"**{p['n']} targets in {p['n_sentences']} sentences**, sampling: {p['sampling']} "
+             f"(seed {p['seed']} applies only to a draw), from **{p['eligible_all_tokenizers']}** eligible "
+             f"CoInCo targets in {p['eligible_sentences']} sentences (floor {p['min_sentences']} sentences); "
+             f"{p['substitutes']} substitutes.", "",
+             f"Version {p['version']}. Exclusion rule: {p['exclusion_rule']}.", "",
+             "Targets per sentence in the draw: " + ", ".join(f"{k}: {v} sentences"
+                                                             for k, v in p["targets_per_sentence"].items()) + ".", ""]
+    if p["supersedes"]:
+        s = p["supersedes"]
+        lines += [f"Supersedes `{s['file']}` (sha256 {s['sha256']}, {s['n']} targets): {s['reason']} "
+                  f"{s['overlap_with_v2']} of its targets are drawn again here.", ""]
+    lines += [
              "## Pool construction and exclusions", "", "| step | targets |", "|---|---|"]
     lines += [f"| {k} | {v} |" for k, v in p["pool_counts"].items()]
     lines += ["", "## Tokenizer eligibility (evaluator's own skip rules, both scorers)", "",
               "| tokenizer | eligible | excluded |", "|---|---|---|"]
     lines += [f"| {k} | {v['eligible']} | {v['excluded_n']} |" for k, v in p["per_tokenizer"].items()]
     lines += ["", "Only targets eligible for all three tokenizers are sampled.", "",
-              "## Strata (POS x lemma-frequency bucket)", "",
+              "## Strata (POS x lemma-frequency bucket; recorded, not sampled when every target is taken)", "",
               "Frequency = count of the target's (lemma, POS) among all 15,415 CoInCo targets; "
               "bucket edges are that distribution's quartiles (<=3, 4-8, 9-21, >=22).", "",
               "| stratum | eligible | drawn |", "|---|---|---|"]

@@ -33,11 +33,13 @@ comparison, its diagnostics in the appendix. Attribution: Chen's request was the
 variants (Alt-Mass, Alt-Balance, Alt-Mass+Balance); the whole-set control is an additional
 methodological recommendation, not part of that request.
 
-- Protocol version: 2 (changes in §9)
+- Protocol version: 3 (changes in §9)
 - Approved by: the repository owner (git user SharvaGogawale1), in the working session:
   version 1 on 2026-10-17, after Tier-1 training and before any scoring of the new runs;
-  version 2 on 2026-10-20, before any T2-c run was trained. PI sign-off is not recorded here.
-- Git hash: the commit that removes this file's TEMPLATE banner (`git log -1 -- ROUND2_PROTOCOL.md`).
+  version 2 on 2026-10-20, before any T2-c run was trained; version 3 on 2026-10-20, before
+  any model was scored on any holdout version. PI sign-off is not recorded here.
+- Git hashes: version 1 is commit 051f5cd (the commit that removed the TEMPLATE banner);
+  later versions are listed in §9 (`git log -- ROUND2_PROTOCOL.md`).
 - Trainer patch SHA-256 (`external/learning-concepts.patch`): bd7d72c7dfff2e3b570794ed47e78034416afe97607b2a531b51b18306285137
   (the patch every Tier-1 run was trained with; recorded per run in `round2_run.json`).
 
@@ -51,7 +53,7 @@ in log space, $q_t(a)=p_t(a)/M_t(A_t)$.
 |---|---|---|
 | ALT MASS | $R_t=-\log M_t(A_t)$ | `--gamma-mass` |
 | ALT BALANCE | $B_t=\mathrm{KL}(\mathrm{uniform}(A_t)\Vert q_t)$ | `--gamma-balance` |
-| UNCAPPED CONCEPT (extra whole-set supervision) | $S_t=-\log M_t(C_t)$, every $t\in\mathcal I$, no $\tau$ cutoff on $S$ itself | `--gamma-uncapped` |
+| UNCAPPED CONCEPT (extra whole-set supervision) | $S_t=-\log M_t(C_t)$, every $t\in\mathcal I$, no $\tau$ cutoff on $S$ itself; $C_t=\{y_t\}\cup A_t$, each member counted once | `--gamma-uncapped` |
 
 Loss: $L_Z+\frac1{|\mathcal I|}\sum_t(\gamma_mR_t+\gamma_bB_t+\gamma_uS_t)$, with $L_Z$ unchanged
 (Zhang et al.: $\lambda=1$, $\tau=0.6$, normalized by $|\mathcal I|$). $|A_t|=0$: $R_t=B_t=0$;
@@ -90,9 +92,10 @@ paired hierarchical bootstrap, 10,000 replicates (resample matched seeds with re
 then targets with replacement, method pairing preserved). Holm–Bonferroni across the 3 models,
 separately for each of the two main effects. α (family-wise) = 0.05.
 
-**This round** does not score the sealed holdout (§0). As the brief specifies for that case, the
-report opens with the same block computed on SWORDS test and marks it *secondary*: the October
-test sets were read before the new arms existed (ledger `added_after_first_test_read=true`).
+**The Tier-1 analysis** (`analyze_round2.py`) does not score the sealed holdout; that happens once,
+at the end (§0, §8). As the brief specifies for that case, the Tier-1 report opens with the same
+block computed on SWORDS test and marks it *secondary*: the October test sets were read before the
+new arms existed (ledger `added_after_first_test_read=true`).
 
 ## 4. Key secondary endpoint
 
@@ -114,7 +117,9 @@ Models can disagree; the text then reports each model and claims only what all t
 
 ## 5. Other secondary endpoints and comparison families (Task 6)
 
-Families (Holm within each family, across model × dataset cells; never pooled across families):
+Families (Holm within each family, across its contrasts × models × datasets, separately per metric,
+scorer and γ; never pooled across families; `analyze_round2.py` keys the family by (family, metric,
+scorer, γ), so the left-GAP factorial family is 27 tests and a single-dataset metric's is 9):
 
 1. each arm vs Concept loss;
 2. Mass+Balance vs Mass; Mass+Balance vs Balance; Mass vs Balance;
@@ -122,8 +127,9 @@ Families (Holm within each family, across model × dataset cells; never pooled a
 4. Member-wise vs each 2×2 cell;
 5. factorial effects (main effects, interaction) per model, dataset, metric, γ.
 
-Metrics: GAP, accepted-alternative NLL, rejected share, STS, C4 NLL, open-vocabulary Hit@50,
-$M(A)$, KL$(u\Vert q)$, observed share. Datasets: SWORDS test, CoInCo-800 test, SemEval-07
+Metrics: GAP, accepted-alternative NLL, rejected share, STS, C4 NLL, observed share; on held-out C4
+(the diagnostic of §0): $M(A)$, $M(C)$, $p(y)/M(C)$, KL$(u_A\Vert q_A)$. Open-vocabulary Hit@50 was
+listed in versions 1–2 and is dropped (no evaluator; not in the experiment list). Datasets: SWORDS test, CoInCo-800 test, SemEval-07
 (left and full scorers), held-out C4, STS, bm-semlex, six-task harness. Old test-set passes of
 new arms are flagged `added_after_first_test_read=true` and are secondary by construction.
 
@@ -157,16 +163,44 @@ new commit, before any sealed-holdout pass.
 
 ## 8. Sealed holdout
 
-2,000 CoInCo targets, `sealed/sealed_holdout_ids.json` (committed before this protocol).
-Evaluated once, for every arm listed in `sealed/FREEZE.md`, in one pass; the evaluator refuses
-without `FREEZE.md` and writes a lock afterwards.
+**Version 2 (decided 2026-10-20): every eligible CoInCo target whose sentence was never inspected.**
+A target is eligible if it is not in either 800-target subset, its sentence (CoInCo context) holds
+no target of either subset, its sentence is not a SWORDS dev/test context (by CoInCo id or by text),
+it has at least one accepted and one rejected substitute, and the evaluator can score it with every
+tokenizer. Nothing is sampled: precision is limited by the number of distinct sentences, not
+targets, so every clean sentence is used. The local dry run gives 3,370 targets in 784 sentences
+(up to 16 targets per sentence); the server build (`build_sealed_holdout.py`) must reproduce those
+counts exactly, and stops below 400 sentences. IDs: `sealed/sealed_holdout_ids.json` (version 2),
+with the evaluation file's SHA-256; evaluation file `results/round2/sealed_data/coinco_sealed_v2.json.gz`.
+
+Version 1 (2,000 targets, drawn 2026-10-16 at commit 30db55d) excluded the used targets but not
+their sentences: 912 of its 2,000 targets shared a sentence with an already-scored target. It is
+kept as the audit record in `sealed/superseded_v1/`. No model was scored on it (ledger: no holdout
+row; no sealed evaluator existed).
+
+Analysis on the holdout: paired as in §3, with the **sentence** as the resampling unit (targets are
+nested in sentences); seeds resampled first, then sentences, one draw shared by every arm and seed.
+
+Before scoring, a new commit adds `sealed/FREEZE.md` with the decision table (§7): the five
+conditions (the four 2×2 cells at γ = 0.125 and Concept loss + whole-set), the comparisons (§3
+main effects, §4 whole-set), the primary metric (left-scorer GAP), the Holm scheme, the retention
+bounds, and how each outcome is read. The holdout is then scored once, for every arm in
+`FREEZE.md`, in one pass; the evaluator (to be written) refuses without `FREEZE.md` and writes a
+lock afterwards. The outcome is reported whatever it is.
 
 ## 9. Changes
 
-- **Version 2 (2026-10-20), before any T2-c run was trained.** Adds Concept loss + whole-set
+- **Version 2 (2026-10-20, commit 97a3816), before any T2-c run was trained.** Adds Concept loss + whole-set
   (T2-c, 9 runs) and the C4 diagnostic to the scope and closes the experiment list (§0); renames
   "Concept loss + uncapped" to "Concept loss + whole-set" (display only: the objective key
   `concept_uncapped` and the flag `--gamma-uncapped` are unchanged) (§1, §5); fixes how the
   whole-set comparison is read (§4); extends the inclusion rules to T2-c (§7). Why: the factorial
   shows that Mass carries the ranking gain, but not whether targeting the alternatives is what
   matters; a paper about supervising unobserved alternatives has to answer that.
+- **Version 3 (2026-10-20, the commit that adds this entry), before any model was scored on any holdout version.** §8: the sealed
+  holdout is every eligible target in the never-inspected sentences (3,370 targets, 784 sentences
+  in the local dry run), replacing the 2,000-target version-1 draw whose sentence overlap with the
+  scored CoInCo-800 subsets was found from the IDs alone, before any scoring; sentence-level resampling; the FREEZE.md
+  contents. §3: "this round" → "the Tier-1 analysis", since the holdout is now in scope. §5: the
+  Holm family is spelled out as the code applies it (contrasts × models × datasets); Hit@50 dropped;
+  the C4 diagnostic metrics named. §1: $C_t$ counts each member once. §0: git-hash line fixed.
