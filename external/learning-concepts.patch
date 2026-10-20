@@ -971,10 +971,10 @@ index 5ac3bfe..5ef53aa 100644
              "input_ids": input_ids,
 diff --git a/eval/eval_concept_sets.py b/eval/eval_concept_sets.py
 new file mode 100644
-index 0000000..2066e29
+index 0000000..73901ec
 --- /dev/null
 +++ b/eval/eval_concept_sets.py
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,118 @@
 +"""Intrinsic metrics for Zhang-format gold-inclusive single-token concept sets."""
 +
 +import argparse
@@ -987,6 +987,18 @@ index 0000000..2066e29
 +from transformers import AutoTokenizer
 +
 +from eval_perplexity_explicit import load_model
++
++
++def alternative_balance_kl(alternative_logp):
++    """KL(uniform(A) || q_A) with q_A = p restricted to A and renormalised.
++
++    The arithmetic of the trainer's balance term B (`_compute_factorial_terms`):
++    -log|A| - (mean log p_a - log M(A)).  Zero for |A| = 1; None for |A| = 0.
++    """
++    count = alternative_logp.numel()
++    if count == 0:
++        return None
++    return float(-math.log(count) - (alternative_logp.mean() - torch.logsumexp(alternative_logp, dim=0)))
 +
 +
 +@torch.no_grad()
@@ -1017,6 +1029,8 @@ index 0000000..2066e29
 +                "set_nll": float(-torch.logsumexp(values, dim=0)),
 +                "observed_target_nll": float(-values[0]),
 +                "alternative_nll": float(-torch.logsumexp(values[1:], dim=0)) if len(values) > 1 else None,
++                "n_alternatives": len(values) - 1,
++                "alternative_balance_kl": alternative_balance_kl(values[1:]),
 +                "candidate_entropy": float(-(normalised * normalised.log()).sum()),
 +                "minimum_candidate_probability": float(probs.min()),
 +                "hierarchy_coverage": (
@@ -1044,7 +1058,7 @@ index 0000000..2066e29
 +        "n_slots": len(records),
 +        **{key: mean(key) for key in [
 +            "set_mass", "set_nll", "observed_target_nll", "alternative_nll",
-+            "candidate_entropy", "minimum_candidate_probability",
++            "candidate_entropy", "minimum_candidate_probability", "alternative_balance_kl",
 +        ]},
 +        "strata": strata,
 +        "per_slot": records,
@@ -1351,10 +1365,10 @@ index 0000000..2be839a
 \ No newline at end of file
 diff --git a/tests/test_factorial.py b/tests/test_factorial.py
 new file mode 100644
-index 0000000..efcb368
+index 0000000..573a987
 --- /dev/null
 +++ b/tests/test_factorial.py
-@@ -0,0 +1,400 @@
+@@ -0,0 +1,420 @@
 +"""Round-2 factorial terms: R (mass), B (balance), S (uncapped) on top of L_Z.
 +
 +Letters follow the agent brief, Task 1:
@@ -1365,10 +1379,12 @@ index 0000000..efcb368
 +  E  R's gradient: -grad = q (1 - M(A)) on A, -p(y) on the observed token
 +  G  finite for p < 1e-30                H  old `mass` / `uniform` paths unchanged
 +  I  the Figure 1 example                J  S's gradient, and S active where L_Z is off
++  K  eval_concept_sets' KL(u_A||q_A) is B, slot by slot (the C4 diagnostic)
 +"""
 +import json
 +import math
 +import platform
++import sys
 +from pathlib import Path
 +from types import SimpleNamespace
 +
@@ -1714,6 +1730,24 @@ index 0000000..efcb368
 +    assert s.item() > 0
 +    s.backward()
 +    assert x.grad.abs().max() > 1e-3
++
++
++# --- K ---------------------------------------------------------------------------
++
++@pytest.mark.parametrize("seed", range(3))
++def test_k_evaluator_kl_is_the_trained_balance_term(seed):
++    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "eval"))
++    from eval_concept_sets import alternative_balance_kl
++    logits, b, s, y, alts = _slots(seed=seed)
++    balance = _terms(logits, b, s, y, alts)["balance"]
++    logp = F.log_softmax(logits[0].float(), dim=-1)
++    for i, ids in enumerate(alts):
++        kl = alternative_balance_kl(logp[i, ids])
++        if not ids:
++            assert kl is None
++        else:
++            assert kl == pytest.approx(float(balance[i]), abs=1e-5)
++            assert kl >= -1e-6
 +
 +
 +# --- wiring ----------------------------------------------------------------------

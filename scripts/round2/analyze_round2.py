@@ -60,7 +60,9 @@ METRICS = {
     "acc": ("harness accuracy", 100, "higher"),
     "knowledge_mean": ("harness knowledge mean", 100, "higher"),
     "commonsense_mean": ("harness commonsense mean", 100, "higher"),
-    "set_nll": ("C4 concept-set NLL", 1, "lower"), "alternative_nll": ("C4 -log M(A)", 1, "lower"),
+    # C4 training-distribution diagnostic (protocol §0): descriptive, so no direction is better.
+    "set_mass": ("C4 M(C)", 100, ""), "alternative_mass": ("C4 M(A)", 100, ""),
+    "alternative_balance_kl": ("C4 KL(u_A||q_A)", 1, ""),
 }
 # (family, key, display, weights over CELL_ORDER)
 CONTRASTS = (
@@ -87,6 +89,8 @@ HEADLINE = [(b, s, "gap") for b in LEXSUB for s in SCORERS] + [
     ("swords_test", "left", "alternatives_nll"), ("swords_test", "left", "rejected_mass_share"),
     ("sts", "", "sts_mean"), ("c4_test", "", "global_nll"), ("bm_semlex", "left", "accuracy"),
     ("harness", "", "knowledge_mean"), ("harness", "", "commonsense_mean")]
+DIAGNOSTIC = [("c4_concept_sets", "", m) for m in
+              ("alternative_mass", "set_mass", "observed_share", "alternative_balance_kl")]
 
 
 class Missing(Exception):
@@ -94,7 +98,8 @@ class Missing(Exception):
 
 
 def flat(objective, gamma, seed):
-    return f"{objective}_g{gamma:g}_seed_{seed}"
+    """Concept loss has no gamma; its files carry g0, as C.run_id does."""
+    return f"{objective}_g{gamma or 0:g}_seed_{seed}"
 
 
 def needed_arms():
@@ -170,6 +175,23 @@ class Sources:
         want = f"{tag}/{arm[0]}/g{arm[1]:g}/seed_{arm[2]}"
         if len(rows) != 1 or not rows[0]["checkpoint"].rstrip("/").endswith(want):
             sys.exit(f"{f} does not hold exactly the checkpoint {want}")
+        return rows[0], f
+
+    def concept_sets(self, tag, arm, source):
+        """C4 concept sets: every arm, October ones included, re-scored by c4_diagnostic.py."""
+        root = self.r2 / "eval" / tag / "concept_sets"
+        f = root / f"{flat(*arm)}.json"
+        rows = read_json(f)
+        if source == "october":
+            want = self.locked(tag).get(october_label(*arm))
+            ok = len(rows) == 1 and rows[0]["checkpoint"] == want
+        else:
+            want = f"{tag}/{arm[0]}/g{arm[1]:g}/seed_{arm[2]}"
+            ok = len(rows) == 1 and rows[0]["checkpoint"].rstrip("/").endswith(want)
+        if not ok:
+            sys.exit(f"{f} does not hold exactly the checkpoint {want}")
+        if source == "october" and not read_json(root / "reproduction.json").get("passed"):
+            sys.exit(f"{root / 'reproduction.json'}: the October fields did not reproduce")
         return rows[0], f
 
     def record(self, tag, name, arm, source):
@@ -290,31 +312,33 @@ def load_model(tag, src):
         except Missing as e:
             missing.append(str(e))
 
-    # C4 concept sets (M(A), observed share on the training distribution): not in the
-    # round-2 evaluation pass; used only if every new arm of this model has been scored.
-    new = [a for a in arms if a[3] == "round2"]
-    have = [a for a in new if (src.r2 / "eval" / tag / "concept_sets" / f"{flat(*a[:3])}.json").is_file()]
-    if not have:
-        notes.append(f"{tag}: C4 concept-set metrics not scored for the round-2 arms; omitted")
+    # C4 training-distribution diagnostic (protocol §0): written by c4_diagnostic.py for every
+    # arm, October ones re-scored; once any file of this model exists, every arm is required.
+    # Items are slots, clustered by C4 sequence (row) in the bootstrap.
+    if not any((src.r2 / "eval" / tag / "concept_sets" / f"{flat(*a[:3])}.json").is_file() for a in arms):
+        notes.append(f"{tag}: C4 diagnostic (c4_diagnostic.py) not run yet; omitted")
     else:
         for objective, gamma, seed, source in arms:
             arm = (objective, gamma, seed)
             try:
-                rec, f = src.record(tag, "concept_sets", arm, source)
+                rec, f = src.concept_sets(tag, arm, source)
             except Missing as e:
                 missing.append(str(e))
                 continue
             files[("c4_concept_sets", arm)] = f, source
-            slots = rec["per_slot"]
+            for m in ("set_mass", "alternative_balance_kl"):
+                check_aggregate([s[m] for s in rec["per_slot"]], rec[m], f"{f} {m}")
+            # All four over the slots with at least one alternative, where each is defined
+            # (with |A| = 0 the observed share is 1 in every arm).
+            slots = [s for s in rec["per_slot"] if s["alternative_nll"] is not None]
             key = lambda s: ("", str(s["row_id"]), str(s["slot_id"]))
-            for m in ("set_nll", "alternative_nll"):
-                vals = {key(s): s[m] for s in slots}
-                check_aggregate(list(vals.values()), rec[m], f"{f} {m}")
-                put("c4_concept_sets", "", m, arm, vals)
+            put("c4_concept_sets", "", "alternative_mass", arm,
+                {key(s): math.exp(-s["alternative_nll"]) for s in slots})
+            put("c4_concept_sets", "", "set_mass", arm, {key(s): s["set_mass"] for s in slots})
             put("c4_concept_sets", "", "observed_share", arm,
-                {key(s): (math.exp(s["set_nll"] - s["observed_target_nll"])
-                          if s["set_nll"] is not None and s["observed_target_nll"] is not None else None)
-                 for s in slots})
+                {key(s): math.exp(s["set_nll"] - s["observed_target_nll"]) for s in slots})
+            put("c4_concept_sets", "", "alternative_balance_kl", arm,
+                {key(s): s["alternative_balance_kl"] for s in slots})
     return data, files, missing, notes
 
 
@@ -550,7 +574,7 @@ def report(path, cells, effects, missing, notes, harness_check, partial, reps):
         cols = ALL_ARMS if any(c["objective"] == WHOLESET and c["gamma"] == gamma for c in cells) else CELL_ORDER
         L.append(f"\n## Cell means, γ = {gamma} (headline metrics; all metrics in cells.csv)\n")
         L += ["| benchmark | model | " + " | ".join(C.DISPLAY[c] for c in cols) + " |", "|---|---|" + "---|" * len(cols)]
-        for b, s, m in HEADLINE:
+        for b, s, m in HEADLINE + DIAGNOSTIC:
             for tag in C.FAMILIES:
                 cm = {c["objective"]: c for c in cells if (c["model"], c["benchmark"], c["scorer"], c["metric"], c["gamma"]) == (tag, b, s, m, gamma)}
                 if cm:
@@ -565,7 +589,7 @@ def report(path, cells, effects, missing, notes, harness_check, partial, reps):
                 continue
             L.append(f"\n### Family {family[1:]} ({FAMILY_NAMES[family]}), γ = {gamma}\n")
             L += ["| benchmark | model | " + " | ".join(n[2] for n in names) + " |", "|---|---|" + "---|" * len(names)]
-            for b, s, m in HEADLINE:
+            for b, s, m in HEADLINE + DIAGNOSTIC:
                 for tag in C.FAMILIES:
                     ef = {e["contrast"]: e for e in effects if e["family"] == family and
                           (e["model"], e["benchmark"], e["scorer"], e["metric"], e["gamma"]) == (tag, b, s, m, gamma)}
@@ -581,7 +605,11 @@ def report(path, cells, effects, missing, notes, harness_check, partial, reps):
     L.append("\n## Not in this report\n")
     L.append("- Family 4 (Member-wise, Iyer et al.): not in the experiment list (§0). The sealed holdout: "
              "scored once at the end, by its own evaluator, not here (§8).")
-    L.append("- KL(u‖q) on C4 and open-vocabulary Hit@50: no evaluator in the round-2 test pass writes them.")
+    L.append("- Open-vocabulary Hit@50: dropped in protocol version 3 (no evaluator; not in the experiment list).")
+    L.append("- C4 diagnostic rows (M(A), M(C), observed share, KL(u_A‖q_A)) describe the training "
+             "distribution: held-out C4 slots, alternatives extracted automatically, not judged by people. "
+             "All four are means over the slots with |A| ≥ 1; M(A) and M(C) are probabilities, and KL is 0 "
+             "when |A| = 1.")
     L.append("- Observed share on lexsub is p(target) / (p(target) + M(accepted alternatives)), from the "
              "evaluator's per-target gold and inclusive NLLs.")
     L += [f"- {n}" for n in notes]
