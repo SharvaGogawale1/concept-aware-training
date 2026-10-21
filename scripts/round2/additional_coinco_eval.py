@@ -15,7 +15,8 @@ Gates (plan §9 step 2).  The plan gates apply to score only; preflight reads no
 additional set, so it may run before the plan is approved.  check reports both groups.
   - plan gates: ROUND2_PROTOCOL.md committed, clean and approved (evaluate_round2.protocol_ok), with
     a line "Analysis plan SHA-256: <hex>"; sealed/EVALUATION_PLAN.md committed, clean, equal to that
-    hash, and both approval lines in its section 11 ticked and dated;
+    hash, and Sharva Gogawale's approval line in its section 11 ticked and dated (plan revision 4:
+    that approval authorizes execution; Chen Shani's was not requested and is not read);
   - the ID file, the evaluation file and eval_swords.py equal their pinned SHA-256;
   - all 15 checkpoints present, every round-2 run marked ok;
   - no completion record for this model, unless --correction names a committed correction note
@@ -66,7 +67,7 @@ MODES = ("left", "full")
 MAX_ATTEMPTS = 3                          # one attempt and at most two retries
 PREFLIGHT_ARM = ("concept", None, 42)
 CONFIGS = ("concept", "alt_mass", "alt_balance", "alt_mass_balance", A.WHOLESET)
-APPROVERS = ("Sharva Gogawale", "Chen Shani")
+APPROVERS = ("Sharva Gogawale",)          # plan revision 4: the approval that authorizes execution
 PLAN_HASH_LINE = re.compile(r"Analysis plan SHA-256:\s*`?([0-9a-f]{64})`?")
 CORRECTION_NOTE = re.compile(r"correction_\d{4}-\d{2}-\d{2}_[A-Za-z0-9_-]+\.md")
 

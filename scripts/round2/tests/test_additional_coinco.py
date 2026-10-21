@@ -269,24 +269,22 @@ PLAN_TEMPLATE = """# plan
 
 ## 11. Approval
 
-Each line is filled in only after that person has approved this revision.
-
 - [{a}] Sharva Gogawale, date:{da}
-- [{b}] Chen Shani, date:{db}
+- Chen Shani: not requested; not required for execution.
 """
 
 
-def plan_text(a=" ", da="", b=" ", db=""):
-    return PLAN_TEMPLATE.format(a=a, da=da, b=b, db=db)
+def plan_text(a=" ", da=""):
+    return PLAN_TEMPLATE.format(a=a, da=da)
 
 
 def test_approvals_need_a_tick_and_a_date():
-    assert R.approvals(plan_text()) == {"Sharva Gogawale": None, "Chen Shani": None}
-    assert R.approvals(plan_text("x", " 2026-10-22")) == {"Sharva Gogawale": "2026-10-22", "Chen Shani": None}
-    assert R.approvals(plan_text("x", "", "x", "")) == {"Sharva Gogawale": None, "Chen Shani": None}
-    assert R.approvals(plan_text(" ", " 2026-10-22", " ", " 2026-10-22"))["Chen Shani"] is None
-    assert R.approvals(plan_text("x", " 2026-10-22", "X", " 2026-10-23"))["Chen Shani"] == "2026-10-23"
-    assert R.approvals("no approval section") == {"Sharva Gogawale": None, "Chen Shani": None}
+    assert R.approvals(plan_text()) == {"Sharva Gogawale": None}
+    assert R.approvals(plan_text("x", " 2026-10-22")) == {"Sharva Gogawale": "2026-10-22"}
+    assert R.approvals(plan_text("X", " 2026-10-22, approved revision 4")) == {"Sharva Gogawale": "2026-10-22"}
+    assert R.approvals(plan_text("x", "")) == {"Sharva Gogawale": None}
+    assert R.approvals(plan_text(" ", " 2026-10-22")) == {"Sharva Gogawale": None}
+    assert R.approvals("no approval section") == {"Sharva Gogawale": None}
 
 
 def git(repo, *args):
@@ -308,15 +306,15 @@ def test_plan_gate_follows_commit_approval_and_pinned_hash(tmp_path):
     git(repo, "add", ".")
     git(repo, "commit", "-qm", "draft")
     problems = check()
-    assert any("Sharva Gogawale" in p for p in problems) and any("Chen Shani" in p for p in problems)
+    assert any("Sharva Gogawale" in p for p in problems)
+    assert not any("Chen Shani" in p for p in problems)      # not requested, not required (revision 4)
     assert any("does not record the plan's SHA-256" in p for p in problems)
-    plan.write_text(plan_text("x", " 2026-10-22"))           # one author only
     protocol.write_text(f"Analysis plan SHA-256: {C.sha256(plan)}\n")
-    git(repo, "commit", "-qam", "one approval")
-    assert check() == ["the plan's approval line for Chen Shani is not ticked and dated"]
-    plan.write_text(plan_text("x", " 2026-10-22", "x", " 2026-10-23"))
+    git(repo, "commit", "-qam", "pinned, not approved")
+    assert check() == ["the plan's approval line for Sharva Gogawale is not ticked and dated"]
+    plan.write_text(plan_text("x", " 2026-10-22"))
     protocol.write_text(f"- Analysis plan SHA-256: `{C.sha256(plan)}`\n")
-    git(repo, "commit", "-qam", "both approvals")
+    git(repo, "commit", "-qam", "approved")
     assert check() == []
     plan.write_text(plan.read_text() + "\nedit\n")
     assert check() == ["the plan has uncommitted edits",
@@ -326,13 +324,16 @@ def test_plan_gate_follows_commit_approval_and_pinned_hash(tmp_path):
     assert R.plan_problems(plan, protocol, repo, lambda: ["not approved"])[-1] == "ROUND2_PROTOCOL.md not approved"
 
 
-def test_real_plan_has_both_approval_lines():
-    """Whatever their state, the plan's approval lines are in the form the gate reads."""
+def test_real_plan_approval_lines():
+    """The required approval line is in the form the gate reads.  Chen Shani's line records that her
+    approval was not requested, and is never a ticked approval."""
     if not R.PLAN.is_file():
         pytest.skip("no plan in this checkout")
     body = R.PLAN.read_text().split("## 11. Approval", 1)[1]
     for name in R.APPROVERS:
         assert re.search(rf"^- \[[ xX]\] {re.escape(name)}, date:", body, re.M), name
+    assert re.search(r"^- Chen Shani: not requested", body, re.M)
+    assert not re.search(r"^- \[[xX]\] Chen Shani", body, re.M)
 
 
 def test_preflight_needs_no_plan_approval_but_score_does(monkeypatch):
